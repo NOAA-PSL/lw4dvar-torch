@@ -1,0 +1,185 @@
+exp:
+  # model_backend selects which forecast model backs the 4D-Var solver:
+  # 'aifs' (ECMWF AIFS-single-2.0, backends/aifs/) or 'fcn3' (NVIDIA
+  # FourCastNet3, backends/fcn3/). Required -- load_config() raises if this
+  # is missing or not one of these two values. This one key also picks
+  # which conda env the job must run under (aifs2 vs fcstnet3 -- see
+  # run_aifs.sh / run_fcn3.sh); the two envs are NOT co-installed (see
+  # CLAUDE.md), so the backend NOT selected here doesn't need to be
+  # importable at all in the env you actually run with.
+  model_backend: fcn3  # or: aifs
+
+  # get_input() always builds the very first initial condition from an
+  # ERA5 forecast `nhrs_back` hours before `sdate`, fetched via CDS -- see
+  # backends/{aifs,fcn3}/*_ic.py.
+  nhrs_back: 48 # initialize with a forecast this many hours before from sdate
+  #restart: True # restart from a previous experiment
+  restart: False
+  rpath: './output/<previous_exp_name>/' # only read if restart: True -- the previous experiment's output dir
+  obspath: './psobs' # path to ps observation text files
+  nobs_max: 15000
+  ic_suffix: '96h_100it' # pkl file info for restart
+  sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
+  n_init: 24 # number of DA cycles
+  dt_init: 12 # assimilation cycling interval in hours (must be a multiple of the model's fixed 6h step)
+  # for longer forecast (if not present, long forecast not run)
+# dt_forecast: 24 # long forecast output interval in hours
+# n_forecast: 10 # long forecast length in steps of length dt_forecast
+# save initial and final trajectory output on these isobaric levels (set to "all" for all levels)
+  #save_levs = 'all'
+  save_levs: [1000, 850, 500, 250, 50]
+  cycle: True # cycling data assimilation
+  exp_name: 'test_v1' # data is saved in this subdirectory
+
+  # --- path_model / model_backend-specific checkpoint keys ---
+  # AIFS: path_model is the DIRECTORY containing the checkpoint; the
+  # checkpoint's own filename is given separately via model_name.
+  #   path_model: './backends/aifs/aifs-single-2.0/'
+  #   model_name: 'aifs-single-mse-2.0.ckpt'
+  #   aifs_config: 'backends/aifs/aifs_inference.yaml' # static anemoi-inference config (pre/post-processors, typed_variables)
+  # FCN3: path_model IS the vendored HF checkpoint clone directory itself
+  # (config.json, checkpoint, orography.nc, land_mask.nc, ...) -- no
+  # separate model_name key.
+  #   path_model: './backends/fcn3/fourcastnet3/'
+  path_model: './backends/fcn3/fourcastnet3/'
+
+  device: 'cuda'
+  path_output: './output/' # where to write output named by subdirectory exp_name
+  # ERA5 initial-condition/verification fetches (backends/{aifs,fcn3}/*_ic.py)
+  # are cached here. The fetch itself needs internet (CDS) -- warm this
+  # cache from a login node before submitting the (offline) H100 job (see
+  # fcn3_prefetch_ic.py / aifs_prefetch_ic.py in the source repos).
+  ic_cache: './ic_cache/'
+  print_every: 10
+  # optionally increase ob error linearly through window to give more weight to
+  # loss at beginning of window (crude treatment of model error).
+  oberrstart: 1.0 # ob error at start of window (-1 to use values in obs file)
+  oberrdeltaperday: 0.25 # ob error increase (per day) within window.
+
+  # The 4D-Var control variable is a one-time latent-space increment
+  # injected at the first rollout step -- NOT a physical-space
+  # perturbation. Its shape/meaning is backend-specific:
+  #   AIFS: AIFSModel.latent_shape -- 40320 O96 hidden-mesh nodes x 1024
+  #     channels (an earlier physical-space path with per-variable
+  #     `state_scales` preconditioning was retired once latent control was
+  #     confirmed to out-converge it with no per-variable tuning needed).
+  #   FCN3: FCN3Model.latent_shape -- (641, 360, 720): 13 atmospheric
+  #     pressure-level groups x 45 channels + 56 surface channels, on the
+  #     downsampled 360x720 hidden grid.
+  # Either way, because the decoder produces the NEXT state as a fresh
+  # function of the (perturbed) latent rather than reconstructing the
+  # current one, the analysis this produces is only ever valid at
+  # `window_start + dt_verif`, never `window_start` itself --
+  # compute_optimal returns a state carrying that date, and downstream code
+  # (the cycling loop, save_trajectory_diagnostics, printz500err) is built
+  # around it. Judge convergence quality from the run's loss-history JSON
+  # (`*_loss_latent_*.json`).
+  #latent_scale: 1.0 # optional global preconditioner divided into the
+  #   latent increment inside the differentiable forward pass (rarely
+  #   needed -- tune learn_rate first)
+
+  # control_variables: decode-time mask (list of model variable/family base
+  # names) -- at the injection step, packed-state columns NOT named here
+  # are overwritten with the uncorrected first-step forecast, zeroing the
+  # increment's *direct* effect on them (they can still respond indirectly,
+  # through model dynamics, to columns that ARE controlled). Omit for
+  # unrestricted (every column controllable), the default. Vocabulary is
+  # backend-specific (validated against model.resolve_columns at run time):
+  #   AIFS example (don't update wave variables or volumetric soil moisture):
+  #     control_variables: [u, v, t, z, q, sp, msl, 2t, 2d, 10u, 10v, tcw, skt, sot]
+  #   FCN3 example (no sp/skt/sot -- FCN3 has none of these):
+  #     control_variables: [u, v, t, z, q]
+  # control_variables: [u, v, t, z, q]
+
+  # loss_variables: which decode_state fields are (time-interpolated, for
+  # dt_obs < dt_verif, and) fed to the ps forward operator. Defaults to
+  # exactly what the active ps_operator reads:
+  #   'logpinterp' (both backends, FCN3's only option): z
+  #   'ps' (AIFS only): t, q, sp
+  # There is no reason to override this for FCN3. Only set this explicitly
+  # for AIFS if you know you need to.
+  # loss_variables: [z]
+
+  # ps_operator: forward operator for the surface-pressure observations.
+  #   'logpinterp' (default, both backends): pressure-level geopotential
+  #     search -- needs only 'z', which both backends have at every level.
+  #   'ps' (AIFS ONLY): native surface-pressure + t700/q700 station-pressure
+  #     reduction. NOT supported for FCN3 (no native 'sp' decode_state
+  #     field at all) -- load_config() raises if model_backend=='fcn3' and
+  #     this is set to 'ps'.
+  #ps_operator: 'ps'
+
+  # reset_skt_ocean: AIFS ONLY. False (default) / unset. True resets `skt`
+  # (skin temperature) at ocean grid points (lsm < skt_ocean_lsm_threshold)
+  # to fresh ERA5 truth at every new analysis time (every DA cycle -- NOT
+  # every window within one cycle), instead of letting the model's own
+  # carried-forward/predicted skt persist there across cycles. AIFS's
+  # checkpoint has no separate SST or sea-ice variable -- skt is its only
+  # surface-temperature-like prognostic field, and ECMWF's own
+  # operational/ERA5 skt is already defined as the SST analysis over open
+  # ocean (blended via the land-sea mask upstream of this whole pipeline).
+  # NOT supported for FCN3 -- FCN3 has no 'skt'/'lsm' decode_state field to
+  # reset at all; load_config() raises if model_backend=='fcn3' and this is
+  # set to True at all, rather than silently ignoring it.
+  #reset_skt_ocean: True
+  #skt_ocean_lsm_threshold: 0.5 # lsm is a land fraction in [0, 1]; grid
+  #   points below this are treated as "ocean" for the reset
+
+  # atmo_chunk_size: FCN3 ONLY (default 2, meaningless for AIFS). How many
+  # of FCN3's 13 atmospheric pressure-level groups are pushed through the
+  # encoder/decoder in one call at a time, instead of all 13 at once -- see
+  # the original long-window-4dvar-fcstnetv3 repo's CLAUDE.md "decode()
+  # memory investigation and fix" section. 2 is the value that sweep found
+  # best (lowest memory, no measurable speed cost); only change this if
+  # re-profiling for a different rollout length/GPU.
+  #atmo_chunk_size: 2
+
+  # grid_interp: FCN3 ONLY (default 'bilinear', meaningless for AIFS --
+  # AIFS's irregular N320 octahedral grid always uses the k-d-tree
+  # approach, no config key needed). How ps-obs are interpolated to/from
+  # FCN3's grid. 'bilinear' (BilinearGridInterpolator, backends/fcn3/fcn3_grid.py)
+  # is exact and ~50x faster per obs slot than 'kdtree' (GridInterpolator,
+  # the k=4 inverse-distance-weighted k-NN approach AIFS always uses) -- see
+  # the original repo's verify_bilinear_grid_interp.py. 'kdtree' is kept
+  # only as an A/B fallback; there is no reason to set this for FCN3's
+  # regular grid.
+  #grid_interp: bilinear
+
+  # checkpoint_stride (default 1, i.e. every step; shared key, both
+  # backends): only every `checkpoint_stride`-th step is wrapped in
+  # torch.utils.checkpoint (trading memory for speed -- a non-checkpointed
+  # step keeps its activations for backward instead of recomputing them).
+  # Set to 0 to disable checkpointing entirely for a memory-rich GPU/short
+  # window; validate with the usual "does AdamW still monotonically reduce
+  # the loss" check before trusting a non-default value on a new window
+  # length. Validated for AIFS across several window lengths; untested for
+  # FCN3 so far.
+  #checkpoint_stride: 0
+
+windows:
+  '4': # window name (days)
+    n_verif: 16 # window length in units of dt_verif (96h window)
+    dt_verif: 6 # spacing between verification times, in hours -- must be a multiple of the model's fixed 6h step
+    #dt_obs: 6 # ps observation sampling interval in hours (default dt_verif;
+    #   must divide both dt_verif and the model's fixed 6h step). Finer
+    #   than 6h obs are matched to a linearly time-interpolated model state
+    #   between the bracketing 6h steps -- validated for AIFS (a known
+    #   unmitigated tidal (S2) representativeness error at off-step slots
+    #   is documented there); untested for FCN3.
+    # learn_rate is NOT shared across backends -- each was tuned
+    # independently and a shared default would silently mistune one of
+    # them:
+    #   AIFS:  learn_rate: 2.0e-3
+    #   FCN3:  learn_rate: 1.0e-2  (single-step converged at 0.01, 0.05
+    #          diverged for a 2-step rollout -- NOT yet tuned for a real
+    #          multi-day window, retune before trusting this)
+    learn_rate: 1.0e-2
+    weight_decay: 1.0e-3 # weight decay regularization
+    max_epoch: 100 # number of epochs
+    warmup_steps: 10 # epochs for linear warmup
+    start_factor: 0.1 # start factor for learning rate at beginning of warmup
+    end_factor: 0.1 # end factor for learning rate at end of cosine decay
+    bg_check: 4. # background check
+    zthresh: 500. # orog diff threshold
+    zconst: 0.003 # factor to boost ob error
+    suffix: ''
