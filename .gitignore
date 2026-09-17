@@ -189,15 +189,13 @@ cython_debug/
 # .idea/
 
 # --- lw4dvar-torch-specific ---
-# Vendored model checkpoints (multi-GB upstream clones) -- never git add,
-# same policy as the aifsv2/fcstnetv3 repos this was merged from. Currently
-# SYMLINKS to those repos' own vendored copies as a bridge until this repo
-# is fully standalone (see CLAUDE.md) -- no trailing slash: a trailing-slash
-# gitignore pattern only matches a real directory, and silently fails to
-# match a symlink (confirmed directly -- `git add -A` staged these as
-# regular tracked files despite the trailing-slash version being present).
-/backends/aifs/aifs-single-2.0
-/backends/fcn3/fourcastnet3
+# Vendored model checkpoints: backends/aifs/aifs-single-2.0 and
+# backends/fcn3/fourcastnet3 are git submodules pointing at the upstream
+# Hugging Face repos (ecmwf/aifs-single-2.0, nvidia/fourcastnet3) -- tracked
+# via .gitmodules/gitlinks, not ignored. `git submodule update --init` (with
+# git-lfs installed) fetches their multi-GB weights; that content itself
+# lives inside the submodules' own .git, never as loose files this repo's
+# own .gitignore needs to name.
 
 # per-experiment config symlink + run artifacts (SLURM logs, cached ICs,
 # per-run output dirs) -- config.yml.template is the tracked, real config

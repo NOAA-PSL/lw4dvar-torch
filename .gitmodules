@@ -1,0 +1,6 @@
+[submodule "backends/aifs/aifs-single-2.0"]
+	path = backends/aifs/aifs-single-2.0
+	url = https://huggingface.co/ecmwf/aifs-single-2.0/
+[submodule "backends/fcn3/fourcastnet3"]
+	path = backends/fcn3/fourcastnet3
+	url = https://huggingface.co/nvidia/fourcastnet3/
