@@ -1,0 +1,223 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with
+code in this repository.
+
+## What this repository is
+
+`lw4dvar-torch` is a **merge** of two sibling repos that each ported the same
+long-window 4D-Var data-assimilation solver to a different forecast-model
+backend:
+
+- `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-aifsv2/` --
+  ECMWF's AIFS Single v2 (PyTorch/anemoi).
+- `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-fcstnetv3/` --
+  NVIDIA's FourCastNet3 (PyTorch/makani).
+
+Both repos' own CLAUDE.md files document the considerable backend-specific
+work that went into each port (grid geometry, IC fetching, checkpoint
+architecture quirks, memory/chunking fixes, etc.) -- that history is not
+duplicated here. This repo's job is narrower: let a user pick **which**
+backend runs a given experiment via one config key
+(`exp.model_backend: aifs|fcn3`), instead of maintaining two nearly-identical
+copies of the solver core in two directories.
+
+The two source repos remain in active use (as of 2026-09-17, both have
+in-flight tuning runs) and are not being retired yet -- this repo is
+validated (see "Smoke test validation" below) but has not yet run a real,
+production-length experiment for either backend. Treat the two source repos
+as the historical reference implementations and this repo as where new
+cross-backend work should land.
+
+## Repository layout
+
+```
+forecast_model.py            # shared LatentForecastModel interface, unchanged
+                              # across backends (confirmed identical modulo
+                              # one type-annotation widening -- see below)
+long_window_4dvar.py          # shared driver, dispatches on model_backend
+long_window_4dvar_utils.py    # shared solver core, dispatches on model_backend
+config.yml.template           # one template, backend-conditional sections
+run_aifs.sh / run_fcn3.sh     # SLURM launchers -- differ only in which
+                               # conda env they activate + job name/logs
+config_test_aifs.yml          # small (12h window, 5 epoch) smoke-test configs
+config_test_fcn3.yml          # for each backend -- see "Smoke test validation"
+
+backends/aifs/
+  aifs_model.py, aifs_grid.py, aifs_ic.py, aifs_inference.yaml
+  aifs-single-2.0/            # git submodule -> huggingface.co/ecmwf/aifs-single-2.0
+backends/fcn3/
+  fcn3_model.py, fcn3_grid.py, fcn3_ic.py
+  fourcastnet3/                # git submodule -> huggingface.co/nvidia/fourcastnet3
+```
+
+`long_window_4dvar_utils.py` is 1526 lines, `long_window_4dvar.py` is 247 --
+both noticeably larger than either source repo's version, because they now
+contain both backends' logic side by side rather than one.
+
+## Conda environments -- NOT merged, and deliberately so
+
+Two environments, unchanged from the source repos:
+
+```
+aifs2:     /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs2      (anemoi / torch-geometric / flash-attn)
+fcstnet3:  /scratch4/BMC/gsienkf/whitaker/conda/envs/fcstnet3   (makani / physicsnemo / torch-harmonics)
+```
+
+Both pin `torch==2.7.1+cu128` (same CUDA/ABI target), but their dependency
+trees have never been jointly resolved (`anemoi-graphs` wants `numpy<2`;
+whatever `makani`/`physicsnemo` want has not been checked against that). A
+real architecture decision was made here, not just inherited: **do not
+attempt to merge these into one environment.** "Choose the backend at
+runtime" means "choose it in `config.yml`, and run with the matching
+env/launcher (`run_aifs.sh` vs `run_fcn3.sh`)" -- not "one process can load
+either." Every place `long_window_4dvar_utils.py` needs a backend-specific
+module (`aifs_model`/`fcn3_model`/`aifs_grid`/`fcn3_grid`/`aifs_ic`/`fcn3_ic`)
+imports it *locally*, inside the function/branch that needs it, behind a
+small `_ensure_backend_on_path(backend)` helper that adds
+`backends/<backend>/` to `sys.path` on demand. This means a process running
+under `aifs2` never needs FCN3's dependencies importable at all, and vice
+versa -- confirmed directly (not assumed): from the `aifs2` env,
+`import fcn3_model` fails with `No module named 'fcn3_model'` unless the
+fcn3 branch has actually run first, and symmetrically for `fcstnet3`.
+
+`run_aifs.sh` and `run_fcn3.sh` both explicitly `module load cuda/12.8.1`
+(matching both envs' `torch==2.7.1+cu128` build) rather than relying on the
+cluster's default module version, which has drifted before (see the
+fcstnetv3 repo's CLAUDE.md for the incident this pin traces back to).
+
+## Backend dispatch design
+
+- **`exp['model_backend']`** (`'aifs'` or `'fcn3'`) is the one required new
+  config key. `load_config()` raises if it's missing or not one of these two
+  values -- there is no silent default.
+- **`get_model` / `get_grid_interpolator` / `get_input` / `get_verif`** each
+  branch on `exp['model_backend']` at the top and call into the matching
+  `backends/<backend>/*_model.py` / `*_grid.py` / `*_ic.py` module. AIFS's
+  irregular N320 octahedral grid always uses `aifs_grid.GridInterpolator`
+  (k-d-tree/k-NN); FCN3's regular grid defaults to
+  `fcn3_grid.BilinearGridInterpolator` (exact, ~50x faster -- see the
+  fcstnetv3 repo's CLAUDE.md), with `grid_interp: 'kdtree'` as an opt-out.
+- **Packed-state layout differs by backend** (AIFS: `(1, multi_step,
+  n_points, n_vars)`, `n_vars` trailing; FCN3: `(1, n_vars, H, W)`, `n_vars`
+  at dim 1) -- generalized via a new `model.state_layout` property
+  (`'channels_last'` for AIFS, `'channels_first'` for FCN3) that
+  `_apply_control_mask`/`_resolve_control_mask` branch on, instead of the
+  FCN3-only hardcoding the pre-merge fcstnetv3 repo had. This is the one
+  piece of genuinely new shared logic this merge introduced, not just a
+  restored/ported branch.
+- **`model.wrap_state(tensor, date)`**: small new factory method on both
+  `AIFSModel`/`FCN3Model` so `compute_loss_4dvar`/`compute_optimal` never
+  need to import/name `AIFSState`/`FCN3State` directly.
+- **`AIFSModel._prime_noise()`**: added as a one-line no-op. FCN3's
+  stochastic-noise re-priming calls (`compute_optimal`, 3 call sites -- see
+  fcstnetv3's CLAUDE.md for why each one matters) now run unconditionally
+  for both backends rather than needing a backend check at every call site.
+- **`reset_skt_over_ocean`** (AIFS-only) and AIFS's native-`sp` `ps_operator:
+  'ps'` path (deleted from the fcstnetv3-only copy this merge started from)
+  are both restored verbatim from the AIFS repo. Neither needs a
+  `model_backend` check at its call site -- `load_config()` already raises if
+  either is set with `model_backend: fcn3`, so they simply never trigger for
+  that backend.
+- **`FCN3Model.pressure_levels`** gained the same `base="z"` default AIFS's
+  version already had (a pure widening -- every current call site already
+  passed `'z'` explicitly).
+
+## Vendored checkpoints: git submodules, not symlinks (2026-09-17)
+
+Originally bridged via symlinks straight into the two source repos' own
+vendored checkpoint directories (fast to set up, but not standalone and not
+what a fresh clone of this repo could reproduce). Replaced with real git
+submodules at the user's request:
+
+```
+backends/aifs/aifs-single-2.0  -> https://huggingface.co/ecmwf/aifs-single-2.0/   @ 08286fc
+backends/fcn3/fourcastnet3     -> https://huggingface.co/nvidia/fourcastnet3/     @ df5d8d0
+```
+
+Both pinned at the exact commit the source repos' own vendored clones were
+already checked out at -- this is a reproduction of the already-validated
+checkpoint, not a new/different version.
+
+**How this was done without re-downloading ~14GB of LFS weights already on
+disk**: `git submodule add` was pointed at the *local* source repo's
+checkout first (`git -c protocol.file.allow=always submodule add
+<local-path> <dest>` -- plain local-path/`file://` clones are blocked by
+this environment's git config by default, hence the one-off
+`protocol.file.allow=always` override, scoped to that single command, not
+persisted anywhere). Because git-lfs resolves a local-path remote's LFS
+objects from that remote's own `.git/lfs/objects` cache directly, this
+pulled the real 994MB/2.8GB checkpoint files in seconds rather than
+re-fetching from Hugging Face. `.gitmodules`' URL was then rewritten to the
+real `huggingface.co` URL and `git submodule sync` run to repoint each
+submodule's `remote.origin.url` to match -- **without** re-fetching, so the
+already-correct local content was left alone. A fresh clone of this repo by
+someone else will correctly pull from the real Hugging Face URLs via `git
+submodule update --init` (needs `git-lfs` installed; confirmed available
+here as `git-lfs/3.6.1`).
+
+Net effect: `git clone --recurse-submodules` (or `git submodule update
+--init` after a plain clone) is now sufficient to get a fully working
+checkout of this repo -- no more manual symlinking into a sibling repo that
+may not exist on another machine.
+
+## Smoke test validation (2026-09-17)
+
+`config_test_aifs.yml` / `config_test_fcn3.yml` (12h window: `n_verif: 2`,
+`dt_verif: 6`; `max_epoch: 5`) were run end-to-end on the H100, through this
+repo's merged driver, against the real submodule-backed checkpoints (not the
+old symlink bridge) -- both completed cleanly (`JOB COMPLETED`, all
+diagnostic/forecast files saved, no errors):
+
+- **FCN3** (job 21627000): `Jtot` 19704 -> 21098 -> 19331 -> 19548 -> 18041
+  over 5 epochs (noisy but net downward -- same shape as the fcstnetv3
+  repo's own small-window runs). `control_variables` resolved to all
+  72/72 packed-state columns. z500 error (GL): bg 6.72 -> before 6.67 ->
+  after 11.20 -- worse post-optimization, the same "untuned learn_rate on a
+  toy window" story documented at length in the fcstnetv3 repo's CLAUDE.md,
+  not a merge regression.
+- **AIFS** (job 21627001): `Jtot` decreased smoothly and monotonically every
+  epoch (29500 -> 29468 -> 29435 -> 29330 -> 29295), `control_variables`
+  correctly resolved via AIFS's own naming convention (`2t`, `10u`, `sp`,
+  ...) to 75/106 columns. z500 error (GL): bg 8.54 -> before 9.37 -> after
+  9.35 -- essentially flat, expected for `lr=1e-4` over only 5 epochs.
+
+Both configs were edited on disk (by the user, directly) while their jobs
+sat pending in the SLURM queue -- `control_variables`, `checkpoint_stride:
+0`, and the `oberrstart`/`oberrdeltaperday` values were all added/changed
+after submission, so the runs above reflect the edited versions (SLURM jobs
+read the config file at actual runtime, not at `sbatch` time). One value
+(`oberrdeltaperday: -1` in the AIFS config, which per the template should be
+a *positive* per-day ob-error growth rate) was flagged as likely backwards
+and has since been corrected by the user directly.
+
+**What this validates**: `model_backend` dispatch, the submodule checkpoints,
+and the `state_layout`/`_apply_control_mask` generalization all work
+end-to-end on real GPU hardware for both backends, not just CPU-only
+construction. **What it does not validate**: production-length windows,
+`restart: True` cycling, `n_init > 1` multi-cycle runs, or a tuned
+`learn_rate` -- none of these have been exercised through this repo yet
+(the user's own currently-running FCN3 learning-rate tuning experiment is in
+the original fcstnetv3 repo, not here).
+
+## Known gaps / next steps
+
+- No production-length (multi-day, many-epoch) run of either backend
+  through this repo yet -- only the two 12h/5-epoch smoke tests above.
+- `restart: True` cycling and `n_init > 1` are unexercised here (they were
+  validated in each source repo separately, but the merge's dispatch logic
+  around them has not been re-checked).
+- The two source repos (`long-window-4dvar-aifsv2`,
+  `long-window-4dvar-fcstnetv3`) are still where active tuning work is
+  happening (as of 2026-09-17) and have not been archived/retired -- don't
+  assume this repo is the only place experiments are running.
+- Whether the latent increment could ever be injected at `t=0` instead of
+  `t+timestep` (a NeuralGCM-style design, raised because FCN3 is
+  self-starting/single-time-level unlike AIFS) was investigated empirically
+  in the fcstnetv3 repo and found not viable with the current FCN3
+  checkpoint (`decode()` was never trained downstream of anything but the
+  processor step; skipping it gives a badly damped/biased reconstruction,
+  ~7-9x worse than a real 6h forecast step). See that repo's CLAUDE.md
+  "Latent-increment injection timing" section for the full writeup and
+  `probe_t0_correction.py` for the measurement -- both backends here still
+  use the `t+timestep` injection point, unchanged.
