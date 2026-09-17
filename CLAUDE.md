@@ -200,6 +200,71 @@ construction. **What it does not validate**: production-length windows,
 (the user's own currently-running FCN3 learning-rate tuning experiment is in
 the original fcstnetv3 repo, not here).
 
+## Backend comparison: FCN3 vs AIFS on a matched 5-day window (2026-09-17)
+
+The smoke-test configs above were extended by the user into a real,
+controlled side-by-side comparison: `n_verif: 20, dt_verif: 6` (5-day
+window), `max_epoch: 100`, `learn_rate: 0.0025`, both backends started from
+the identical `nhrs_back=48` back-date (`2014-12-30T00`) and scored against
+the same real ps observation files -- run directly from this repo via
+`run_fcn3.sh`/`run_aifs.sh config_test_fcn3.yml`/`config_test_aifs.yml`
+(job names `lw4dvar_fcn3`/`lw4dvar_aifs`). This is the first real use of the
+merge for its intended purpose (a fair apples-to-apples cross-backend
+comparison from one driver), not just a validation smoke test.
+
+- **`checkpoint_stride` matters a lot at this window length**: the FCN3 run
+  OOM'd at `checkpoint_stride: 0` (no checkpointing -- every one of the 20
+  steps' activations held simultaneously) and again, only slightly less
+  badly, at `checkpoint_stride: 10` (only 2 of 20 steps checkpointed).
+  Both failures are expected, not bugs -- higher `checkpoint_stride` means
+  checkpointing happens *less* often (`s % checkpoint_stride == 0`), so it
+  trades AWAY memory savings, the opposite of what "increase the stride to
+  fix an OOM" would suggest. `checkpoint_stride: 1` (checkpoint every
+  step, the default) is what actually worked. Because both attempts
+  reused the same config filename and this repo's `run_fcn3.sh` doesn't
+  timestamp its `-o`/`-e` files, `lw4dvar_fcn3.out`/`.err` ended up with
+  all four retries (`0`, `10`, `2`, `1`) concatenated in one file --
+  harmless here since each attempt re-logs its own full config header, but
+  worth using distinct `--output`/`--error` names (as the smoke tests
+  did) for a run meant to be analyzed cleanly afterward.
+- **Per-epoch timing, confirmed with real numbers**: **FCN3 ~94.2s/epoch
+  vs. AIFS ~18.25s/epoch -- a 5.2x ratio**, both very consistent
+  epoch-to-epoch (measured directly from log timestamps, not estimated).
+  This closes out a "worth a profiling pass" note that had been sitting in
+  the fcstnetv3 repo's own CLAUDE.md with no real numbers behind it, and
+  lines up almost exactly with the per-step memory/timing sweep already
+  documented there (~4.5-4.8s per additional FCN3 step for a checkpointed
+  rollout at `atmo_chunk_size=2`: 20 steps x ~4.7s = ~94s). This is a real,
+  structural cost of FCN3's per-step DISCO spherical-convolution
+  encode/decode burst, not something tunable away in this repo's driver
+  code, and not an artifact of the merge.
+- **Loss magnitude differs too, and not uniformly across the window**:
+  epoch-1 `Jtot` was ~18% higher for FCN3 (452874 vs. 384417) on this one
+  IC date, but the per-lead-time breakdown is not "FCN3 uniformly worse":
+  - The **background term (t+0h)** is ~50% higher for FCN3 (8483 vs. 5673)
+    with nearly identical obs-used counts (8903/9112 vs. 8929/9112 -- not a
+    QC-rejection artifact), suggesting FCN3's 48h forecast genuinely
+    disagrees with real ps observations (via the shared `logpinterp`
+    forward operator) more than AIFS's does, right at the window start.
+  - FCN3 has a sharp, backend-specific spike at t+36h (28391 vs. AIFS's
+    12428).
+  - By t+120h the two are comparable, FCN3 even slightly lower (24300 vs.
+    25548).
+  - **This is a single-case (one IC date) comparison, not a statistical
+    claim about general relative skill** -- worth rechecking across more
+    dates before concluding much, but real and reproducible enough (same
+    obs, same forward operator, matched everything else) to be worth
+    tracking, not dismissing.
+- **`learn_rate: 0.0025` diverged for AIFS on this window** ("blew up",
+  the user's own words) -- resubmitted at `2.0e-3`, which matches the low
+  end of the AIFS repo's own previously-logged `learn_rate` history
+  (`1.e-4 -> 1.e-3 -> 2.e-3`) for windows of comparable length. FCN3's
+  `checkpoint_stride: 1` run at the same `0.0025` has not shown divergence
+  through epoch 2 (`Jtot` 452874 -> 439241, decreasing) -- the two
+  backends' stable learning-rate ranges are not assumed to match just
+  because this comparison uses one shared value; re-tune independently if
+  either looks unstable over more epochs.
+
 ## Known gaps / next steps
 
 - No production-length (multi-day, many-epoch) run of either backend
