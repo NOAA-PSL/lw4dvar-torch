@@ -1,18 +1,18 @@
 exp:
   model_backend: fcn3
 
-  nhrs_back: 24
+  nhrs_back: 48
   restart: False
   rpath: './output/<previous_exp_name>/'
   obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
   nobs_max: 15000
-  ic_suffix: '12h_5it'
+  ic_suffix: '120h_100it'
   sdate: '2015-01-01T00'
   n_init: 1
   dt_init: 12
-  save_levs: [500]
+  save_levs: [1000,850,500,250,50]
   cycle: False
-  exp_name: 'smoke_test_fcn3'
+  exp_name: 'test_fcn3_5d_12h_100it'
 
   path_model: './backends/fcn3/fourcastnet3/'
   device: 'cuda'
@@ -20,20 +20,22 @@ exp:
   # reuse the original fcstnetv3 repo's already-warmed ERA5 cache -- avoids
   # needing internet from this (offline) H100 compute node for a smoke test
   ic_cache: '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-fcstnetv3/ic_cache/'
-  print_every: 1
-  oberrstart: 1.0
-  oberrdeltaperday: 0.25
+  print_every: 10
+  oberrstart: -1
+  oberrdeltaperday: 0
+  control_variables: [u, v, t, z, q, msl, t2m, u10m, v10m, u100m, v100m, tcwv]
+  checkpoint_stride: 1
 
 windows:
-  '1':
-    n_verif: 2
+  '5':
+    n_verif: 20
     dt_verif: 6
-    learn_rate: 1.0e-2
+    learn_rate: 2.5e-3
     weight_decay: 1.0e-3
-    max_epoch: 5
-    warmup_steps: 1
-    start_factor: 0.5
-    end_factor: 0.5
+    max_epoch: 100
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 0.1
     bg_check: 4.
     zthresh: 500.
     zconst: 0.003

@@ -27,4 +27,4 @@ conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs2
 # need internet access, which this H100 node does not have -- the
 # ic_cache/ directory must already be warmed from a login node before this
 # job runs.
-python -u long_window_4dvar.py "$@"
+python -u long_window_4dvar.py config_test_aifs.yml

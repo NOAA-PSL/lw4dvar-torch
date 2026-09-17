@@ -27,4 +27,4 @@ conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/fcstnet3
 # need internet access, which this H100 node does not have -- the
 # ic_cache/ directory must already be warmed from a login node before this
 # job runs (see fcn3_prefetch_ic.py).
-python -u long_window_4dvar.py "$@"
+python -u long_window_4dvar.py config_test_fcn3.yml
