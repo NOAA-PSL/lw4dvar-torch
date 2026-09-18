@@ -1,0 +1,38 @@
+exp:
+  model_backend: aurora
+
+  nhrs_back: 48
+  restart: False
+  rpath: './output/<previous_exp_name>/'
+  obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
+  nobs_max: 15000
+  ic_suffix: '120h_100it'
+  sdate: '2015-01-01T00'
+  n_init: 1
+  dt_init: 12
+  save_levs: [1000, 850, 500, 250, 50]
+  cycle: False
+  exp_name: 'test_aurora_5d_48h_100it'
+
+  path_model: './backends/aurora/hf_cache/models--microsoft--aurora/snapshots/a96afd7ee6d65e3bd2d476f3be798a25a56f2296/'
+  device: 'cuda'
+  path_output: './output/'
+  ic_cache: './ic_cache/'
+  print_every: 10
+  oberrstart: 1.0
+  oberrdeltaperday: 0.25
+
+windows:
+  '5':
+    n_verif: 20
+    dt_verif: 6
+    learn_rate: 2.5e-3
+    weight_decay: 1.0e-3
+    max_epoch: 100
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 0.1
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''
