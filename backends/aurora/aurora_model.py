@@ -104,6 +104,12 @@ _SURF_VARS = (
 _OUTPUT_ONLY_SURF_VARS = (
     "i10fg", "blh", "uvb_1h", "ssrd_1h", "ttr_1h", "scaled_tp_1h", "scaled_sf_1h",
 )
+# Static fields ALSO given a constant-in-time packed-state column (beyond
+# the 91 real surf/atmos columns) purely so AIFS-style code that expects a
+# variable to be resolvable/indexable via resolve_columns() works
+# unmodified for Aurora too -- see resolve_columns' construction below and
+# long_window_4dvar_utils.reset_skt_over_ocean.
+_STATIC_PACKED_VARS = ("lsm",)
 # Aurora's own Batch.crop(patch_size=4) drops the LAST latitude row
 # (v[..., :-1, :]) whenever H isn't a multiple of patch_size -- ERA5's
 # native 721 rows isn't (721 % 4 == 1), so Aurora silently crops the
@@ -210,7 +216,25 @@ class AuroraModel(forecast_model.LatentForecastModel):
         for name in _SURF_VARS:
             self._single_by_base[name] = col
             col += 1
-        self._n_vars = col  # 5*13 + 26 = 91
+        # 'lsm' (land-sea mask) is a STATIC field (self._static_vars, not a
+        # real surf_var Aurora predicts) but is also given its own packed-
+        # state column here, constant across both time levels and the whole
+        # rollout -- mirrors AIFSModel exactly (its own 'lsm' is a genuine,
+        # constant-in-time packed-state column too), so
+        # long_window_4dvar_utils.reset_skt_over_ocean (AIFS-only until now)
+        # works unmodified for Aurora: it calls
+        # `model.resolve_columns("lsm")` and indexes the packed tensor
+        # directly, assuming channels_last packing, which Aurora shares
+        # with AIFS. See _STATIC_PACKED_VARS' handling in
+        # prepare_initial_state/_pack_pred for how this column is
+        # populated/kept constant without ever appearing in
+        # pred.surf_vars. `lsm`'s convention (land fraction 0..1, ocean at
+        # low values) is assumed to match AIFS's/ECMWF's own -- not yet
+        # independently verified for Aurora's specific static-field pickle.
+        for name in _STATIC_PACKED_VARS:
+            self._single_by_base[name] = col
+            col += 1
+        self._n_vars = col  # 5*13 + 26 + 1 = 92
 
     # ------------------------------------------------------------------
     # forecast_model.LatentForecastModel properties
@@ -271,7 +295,14 @@ class AuroraModel(forecast_model.LatentForecastModel):
         `Metadata.time` records only the single most recent time even
         though `surf_vars`/`atmos_vars` carry both levels' data)."""
         t = state.reshape(1, 2, _NLAT, _NLON, self._n_vars)
-        surf_vars = {name: t[..., col] for name, col in self._single_by_base.items()}
+        # _STATIC_PACKED_VARS ('lsm') are NOT real Aurora surf_vars -- they
+        # already appear in self._static_vars (passed below), and Aurora's
+        # own encoder asserts surf_vars/static_vars names never collide.
+        surf_vars = {
+            name: t[..., col]
+            for name, col in self._single_by_base.items()
+            if name not in _STATIC_PACKED_VARS
+        }
         atmos_vars = {
             base: torch.stack([t[..., col] for _, col in cols], dim=2)  # (1, 2, L, H, W)
             for base, cols in self._levels_by_base.items()
@@ -298,6 +329,12 @@ class AuroraModel(forecast_model.LatentForecastModel):
         new_state = old_state.reshape(1, 2, _NLAT, _NLON, self._n_vars).clone()
         new_state[:, 0] = new_state[:, 1]
         for name, col in self._single_by_base.items():
+            if name in _STATIC_PACKED_VARS:
+                # Not a real Aurora surf_var -- already correctly carried
+                # forward unchanged by the `new_state[:, 0] = new_state[:, 1]`
+                # roll + the `.clone()` above (constant across the whole
+                # rollout, same guarantee AIFS's own 'lsm' column has).
+                continue
             new_state[:, 1, :, :, col] = pred.surf_vars[name][:, 0]
         for base, cols in self._levels_by_base.items():
             arr = pred.atmos_vars[base][:, 0]  # (1, L, H, W)
@@ -353,14 +390,23 @@ class AuroraModel(forecast_model.LatentForecastModel):
     # ------------------------------------------------------------------
 
     def prepare_initial_state(self, input_state: dict, date: datetime.datetime) -> AuroraState:
-        """`input_state`: `{"fields": {name: (2, 721, 1440) array}}` for
-        every name in `_single_by_base`/`_ATMOS_VARS x _LEVELS` (as
-        `f"{base}{level}"`-keyed... no: atmos fields are keyed by plain
-        base name with a leading (2, len(_LEVELS), 721, 1440) array; see
-        aurora_ic.py). `date` is the LATEST of the two time levels."""
+        """`input_state`: `{"fields": {name: (2, 720, 1440) array}}` for
+        every FETCHABLE name in `_SURF_VARS` (i.e. every name except
+        `_OUTPUT_ONLY_SURF_VARS` -- aurora_ic.py never provides those, and
+        they're left as zeros here, matching exactly what Aurora's own
+        `_pre_encoder_hook` would zero-pad them to regardless of what was
+        fed in), plus `{base: (2, len(_LEVELS), 720, 1440) array}` for
+        every atmos family (see aurora_ic.py). `date` is the LATEST of the
+        two time levels. `_STATIC_PACKED_VARS` (`lsm`) is populated from
+        the checkpoint-bundled static pickle, not from `input_state`."""
         fields = input_state["fields"]
         t = torch.zeros(1, 2, _NLAT, _NLON, self._n_vars, device=self._device)
         for name, col in self._single_by_base.items():
+            if name in _STATIC_PACKED_VARS:
+                t[..., col] = self._static_vars[name]  # (H, W) broadcasts over (1, 2, H, W)
+                continue
+            if name in _OUTPUT_ONLY_SURF_VARS:
+                continue  # left as zeros -- never a real ERA5 fetch target
             t[..., col] = torch.as_tensor(fields[name], dtype=torch.float32, device=self._device)
         for base, cols in self._levels_by_base.items():
             arr = torch.as_tensor(fields[base], dtype=torch.float32, device=self._device)  # (2, L, H, W)
