@@ -103,6 +103,20 @@ _SFC_RENAME = {
 # tcc, sp, lcc, mcc, hcc, skt, stl1, swvl1 -- Aurora's own names already
 # match ERA5's shortnames for these).
 
+# ERA5's own surface geopotential ("orography"), fetched as an EXTRA field
+# purely for the ps-obs forward operator's station-elevation QC -- the same
+# role FCN3's own _OROGRAPHY_PARAMID plays (see fcn3_ic.py's docstring).
+# Unlike AIFS (whose checkpoint has a real per-date-fetched orography INPUT
+# column, so its own get_verif reads real ERA5 'z' for free as part of the
+# normal fetch) or FCN3 (whose checkpoint-bundled orography.nc is entirely
+# separate from ERA5 and never exposed to decode_state at all), Aurora's
+# static 'z' field IS exposed via decode_state (aurora_model.py) but is
+# NOT independently verified to equal real ERA5 orography -- rather than
+# rely on that unverified assumption for a QC computation that specifically
+# needs ERA5 TRUTH, get_verif's aurora branch uses this fresh fetch instead,
+# matching FCN3's safer pattern.
+_OROGRAPHY_PARAMID = "129.128"
+
 
 def _cache_paths(cache_dir, date):
     tag = date.strftime("%Y%m%dT%H")
@@ -161,7 +175,7 @@ def fetch_era5(date, cache_dir):
             request = dict(
                 base,
                 levtype="sfc",
-                param="/".join(_SFC_PARAMIDS.values()),
+                param="/".join(list(_SFC_PARAMIDS.values()) + [_OROGRAPHY_PARAMID]),
             )
             _retrieve(client, request, sfc_path)
     else:
@@ -190,7 +204,12 @@ def read_single_date_fields(date, cache_dir):
             fields[base] = np.asarray(arr[:, :-1, :], dtype=np.float32)  # crop -> (13, 720, 1440)
     with xr.open_dataset(sfc_path) as ds_sfc:
         for name in ds_sfc.data_vars:
-            out_name = _SFC_RENAME.get(name, name)
+            # ERA5's surface geopotential (orography) shares the shortname
+            # "z" with the pressure-level geopotential family (standard
+            # ECMWF convention: shortName tracks the parameter, not the
+            # level type) -- rename to avoid colliding with fields["z"]
+            # (the atmos family) above, same fix fcn3_ic.py uses.
+            out_name = "geopotential_at_surface" if name == "z" else _SFC_RENAME.get(name, name)
             arr = ds_sfc[name].isel(valid_time=0).values  # (721, 1440)
             # 'siconc' (-> 'ci') comes back NaN over land (ERA5's own
             # convention -- sea-ice concentration is undefined there) --
@@ -217,4 +236,15 @@ def build_input_state(date, cache_dir):
     timestep = datetime.timedelta(hours=6)
     fields_lo = read_single_date_fields(date - timestep, cache_dir)
     fields_hi = read_single_date_fields(date, cache_dir)
-    return {"fields": {k: np.stack([fields_lo[k], fields_hi[k]], axis=0) for k in fields_lo}}
+    # 'geopotential_at_surface' is QC-only (get_verif), not one of Aurora's
+    # real input channels -- drop it, matching fcn3_ic.build_input_state's
+    # own convention (AuroraModel.prepare_initial_state would just ignore
+    # it either way, since it's not in _single_by_base, but dropping it
+    # here avoids a pointless stack of a field never used).
+    return {
+        "fields": {
+            k: np.stack([fields_lo[k], fields_hi[k]], axis=0)
+            for k in fields_lo
+            if k != "geopotential_at_surface"
+        }
+    }

@@ -219,15 +219,16 @@ def load_config(config_path='config.yml'):
     exp['path_output'] = exp['path_output'] + exp['exp_name'] + '/'
 
     backend = exp.get('model_backend')
-    if backend not in ('aifs', 'fcn3'):
+    if backend not in ('aifs', 'fcn3', 'aurora'):
         raise ValueError(
-            f"exp.model_backend must be 'aifs' or 'fcn3', got {backend!r} -- "
+            f"exp.model_backend must be 'aifs', 'fcn3', or 'aurora', got {backend!r} -- "
             "this key is required (see config.yml.template)"
         )
-    # reset_skt_ocean (AIFS-only -- see reset_skt_over_ocean) has no FCN3
-    # equivalent: FCN3 has no 'skt' or 'lsm' decode_state field at all --
-    # fail loudly here rather than silently ignore a config key that looks
-    # like it should do something.
+    # reset_skt_ocean: AIFS and Aurora both have 'skt'/'lsm' packed-state
+    # columns (Aurora's 'lsm' added specifically to support this -- see
+    # aurora_model.py), so reset_skt_over_ocean works unmodified for either.
+    # FCN3 has no equivalent at all -- fail loudly here rather than
+    # silently ignore a config key that looks like it should do something.
     if backend == 'fcn3' and exp.get('reset_skt_ocean', False):
         raise ValueError(
             "reset_skt_ocean is not supported for the FCN3 backend -- FCN3 has no "
@@ -238,6 +239,18 @@ def load_config(config_path='config.yml'):
             "ps_operator='ps' is not supported for the FCN3 backend -- FCN3 has no "
             "native surface-pressure ('sp') decode_state field; use the default "
             "'logpinterp' instead (see CLAUDE.md)."
+        )
+    # Aurora DOES have a native 'sp' field (unlike FCN3), so 'ps' might work
+    # here in principle -- but _compute_ps_observation_diagnostics_at_time's
+    # 'ps' branch has only ever been exercised for AIFS. Block it for Aurora
+    # too until it's actually been tested, rather than silently claim
+    # support that hasn't been verified.
+    if backend == 'aurora' and exp.get('ps_operator', 'logpinterp') == 'ps':
+        raise ValueError(
+            "ps_operator='ps' is not yet supported for the Aurora backend -- Aurora "
+            "has a native 'sp' field so this may work in principle, but the 'ps' "
+            "forward-operator path has only been tested for AIFS so far. Use the "
+            "default 'logpinterp' instead (see CLAUDE.md)."
         )
     return exp, windows
 
@@ -320,7 +333,14 @@ def get_model(exp):
             device=exp.get('device', 'cuda'),
             atmo_chunk_size=exp.get('atmo_chunk_size', 2),
         )
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs' or 'fcn3')")
+    elif backend == 'aurora':
+        _ensure_backend_on_path('aurora')
+        import aurora_model
+        return aurora_model.AuroraModel(
+            package_root=exp['path_model'],
+            device=exp.get('device', 'cuda'),
+        )
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
 
 
 def get_grid_interpolator(model, exp):
@@ -337,7 +357,15 @@ def get_grid_interpolator(model, exp):
         _ensure_backend_on_path('aifs')
         import aifs_grid
         return aifs_grid.GridInterpolator(model.lons, model.lats)
-    elif backend == 'fcn3':
+    elif backend in ('fcn3', 'aurora'):
+        # Aurora shares FCN3's regular-grid machinery directly (same 0.25deg
+        # ERA5 grid, just 720 rather than 721 rows -- fcn3_grid.py's classes
+        # derive nlat/nlon from the data itself). Deliberately imports from
+        # backends/fcn3/ even when backend=='aurora' -- the one intentional
+        # exception to "each backend's imports stay in its own directory":
+        # fcn3_grid.py's own dependencies (numpy/torch/scipy) are already
+        # present in both envs, so this carries none of the cross-backend
+        # dependency risk _ensure_backend_on_path exists to avoid.
         _ensure_backend_on_path('fcn3')
         import fcn3_grid
         kind = exp.get('grid_interp', 'bilinear')
@@ -346,7 +374,7 @@ def get_grid_interpolator(model, exp):
         if kind == 'kdtree':
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs' or 'fcn3')")
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
 
 
 # ---------------------------------------------------------------------------
@@ -388,8 +416,12 @@ def get_input(exp, model, logger):
             _ensure_backend_on_path('fcn3')
             import fcn3_ic
             input_state = fcn3_ic.build_input_state(back_dt, cache_dir)
+        elif backend == 'aurora':
+            _ensure_backend_on_path('aurora')
+            import aurora_ic
+            input_state = aurora_ic.build_input_state(back_dt, cache_dir)
         else:
-            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs' or 'fcn3')")
+            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
         input_encoded = model.prepare_initial_state(input_state, back_dt)
         dt_hours = exp['nhrs_back']
         logger.info('generating input state from a forecast...')
@@ -460,8 +492,33 @@ def get_verif(exp, model, logger, date_override=None):
         # field specifically to give the ps-obs QC code a
         # 'geopotential_at_surface' to compare station elevations against.
         verif_ic['geopotential_at_surface'] = raw['geopotential_at_surface']
+    elif backend == 'aurora':
+        _ensure_backend_on_path('aurora')
+        import aurora_ic
+        raw_fields = aurora_ic.read_single_date_fields(date_dt, cache_dir)
+        # aurora_ic.py already returns atmos fields pre-stacked per family
+        # (13, 720, 1440), in the same descending-level order as
+        # model._levels_by_base -- no per-level key assembly needed here,
+        # unlike AIFS/FCN3's flat per-level keys.
+        for base in model._levels_by_base:
+            if base in raw_fields:
+                arr = torch.as_tensor(raw_fields[base], dtype=torch.float32, device=model.device)
+                verif_ic[base] = arr.reshape(arr.shape[0], -1)  # (13, n_points)
+        for name in model._single_by_base:
+            if name in raw_fields:
+                verif_ic[name] = torch.as_tensor(
+                    raw_fields[name], dtype=torch.float32, device=model.device
+                ).reshape(-1)
+        # Like FCN3 (and unlike AIFS), Aurora's own checkpoint-bundled
+        # orography is static, not a per-date fetch -- aurora_ic.py fetches
+        # ERA5's own surface geopotential fresh, as an extra field, rather
+        # than relying on the unverified assumption that Aurora's static
+        # 'z' equals real ERA5 orography (see aurora_ic.py's docstring).
+        verif_ic['geopotential_at_surface'] = torch.as_tensor(
+            raw_fields['geopotential_at_surface'], dtype=torch.float32, device=model.device
+        ).reshape(-1)
     else:
-        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs' or 'fcn3')")
+        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
 
     if "z" in verif_ic:
         verif_ic["geopotential"] = verif_ic["z"]
