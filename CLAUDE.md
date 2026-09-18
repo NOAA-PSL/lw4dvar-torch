@@ -304,6 +304,99 @@ comparison from one driver), not just a validation smoke test.
     longer-term whether averaging a few fixed-noise realizations closes
     the gap, before treating this as settled.
 
+## Third backend: Microsoft Aurora (in progress, 2026-09-18)
+
+Adding a third backend, `aurora` (`AuroraV1p5`, `microsoft/aurora`'s
+`aurora-0.25-v1.5.ckpt`), at the user's request -- same phased approach as
+the AIFS/FCN3 merge, and (so far) noticeably smoother than either: no CUDA
+extension build was needed, no torch.no_grad() workaround, no stochastic
+noise handling.
+
+- **New conda env** `.../envs/aurora`: `torch==2.7.1+cu128`,
+  `torchvision==0.22.1+cu128`, `triton==3.3.1`, `microsoft-aurora==2.0.1`.
+  Hit the same unpinned-torch resolver trap already documented for
+  `torch-harmonics`: `pip install microsoft-aurora` silently pulled
+  `torch==2.14.0+cu13` via `timm`->`torchvision`; fixed by
+  force-reinstalling the pinned torch/torchvision/triton with `--no-deps`.
+- **Checkpoint NOT vendored as a git submodule**, unlike AIFS/FCN3:
+  `microsoft/aurora` on HF is a shared monorepo of many unrelated
+  checkpoint variants (0.1, several 0.25 variants, wave, air-pollution,
+  ensemble...) -- a submodule would force pulling everything (tens of GB).
+  `backends/aurora/aurora_prefetch_checkpoint.py` fetches just the ~4.9GB
+  needed (`aurora-0.25-v1.5.ckpt` + `-static.pickle`) via
+  `huggingface_hub.hf_hub_download` (the same mechanism the `aurora`
+  package itself uses internally), revision-pinned, into a gitignored
+  local cache -- must run from a login node (compute nodes have no
+  internet, same constraint as ERA5 IC fetching).
+- **Architecture, confirmed by reading the real source and testing
+  directly, not assumed**: `AuroraV1p5.forward()` has the same
+  encoder -> backbone -> decoder split as AIFS/FCN3, but is simpler than
+  both -- no hardcoded `torch.no_grad()` (AIFS's `predict_step` has one)
+  and no stochastic noise at all (FCN3's diffusion-noise re-priming has no
+  analog here; noise/ensemble is a wholly separate class+checkpoint,
+  `AuroraV1p5Ensemble`, not used). Control injection uses a
+  `register_forward_pre_hook` on `model.decoder` rather than manually
+  unrolling `forward()` -- sufficient specifically because neither of the
+  other two backends' reasons for a manual unroll apply here.
+  `latent_shape` (backbone output == decoder input), determined
+  empirically (`probe_aurora_latent.py`): `(259200, 1024)`, a flat
+  Swin-transformer token sequence, a third distinct convention (AIFS:
+  `(n_hidden, channels)`; FCN3: `(channels, H, W)`).
+- **Needs two lagged time levels like AIFS** (`max_history_size=2`), not
+  self-starting like FCN3 -- so `aurora_model.py`'s packed state follows
+  AIFS's `(1, 2, n_points, n_vars)` channels-last convention exactly,
+  reusing `state_layout='channels_last'` and `_apply_control_mask`'s
+  existing branch with zero new shared-driver code.
+- **Grid: 720x1440, not 721x1440** -- a real, non-obvious finding, not an
+  assumption. Aurora's own `Batch.crop(patch_size=4)` silently drops
+  ERA5's 721st latitude row (721 % 4 == 1) before every real forward call,
+  so the model's own output is always 720 rows. A first attempt carrying
+  a 721-row state failed with a shape mismatch when packing the model's
+  720-row prediction back in; fixed by making this backend's native grid
+  720x1440 throughout, matching exactly what the checkpoint computes
+  (dropping the South Pole row) rather than silently carrying a stale,
+  never-updated row. `fcn3_grid.BilinearGridInterpolator` needs no changes
+  for this -- it derives `nlat`/`nlon` from the data itself.
+- **Real, non-obvious fp16-autocast pitfall found and root-caused (not
+  just patched around)**: `AuroraV1p5` runs encoder/backbone/decoder under
+  `torch.autocast(dtype=torch.float16)` by default. Three probe attempts
+  (raw zeros, realistic-but-spatially-uniform fields, then
+  spatially-varying fields) all produced a NaN `increment.grad` with a
+  naive loss computed on Aurora's raw UNNORMALISED output (physical units,
+  e.g. `msl` ~1e5 Pa) -- ruled out degenerate input as the cause (spatial
+  variation didn't fix it) before finding the real cause: gradients of
+  that scale overflow fp16's dynamic range during the autocast-region
+  backward. Re-normalising the prediction before computing the loss gave
+  a finite gradient. Real lesson for any future loss/diagnostic code
+  touching Aurora's decoded output: stay scale-aware (the real ps-obs loss
+  already is, via innovation/oberr normalization, so this isn't expected
+  to bite the actual solver -- but a naive diagnostic could reintroduce
+  it).
+- **26 surface variables** (richer than FCN3's 7 or AIFS's set), including
+  a native `sp` (surface pressure) field unlike FCN3 (so AIFS's
+  `ps_operator: 'ps'` might work for Aurora too, though unwired/untested),
+  7 of which are output-only (`i10fg, blh, uvb_1h, ssrd_1h, ttr_1h,
+  scaled_tp_1h, scaled_sf_1h` -- predicted but never present in real ERA5
+  input; Aurora's own `_pre_encoder_hook` unconditionally zero-pads these
+  before every encoder call, so the roll-forward step needs no special
+  casing for them). `insolation` similarly needs no special roll-forward
+  handling -- Aurora's own `_post_unnorm_hook` overwrites the model's
+  predicted value with the true recomputed one after every step.
+- **Validated** (`smoke_test_aurora.py`, same bar as AIFSModel/FCN3Model's
+  own smoke tests): `decode_state` round-trips correctly; a real
+  differentiable `advance()`+`backward()` gives a finite, nonzero
+  gradient; AdamW measurably reduces a real (scale-aware) loss over 15
+  epochs, with the same cold-start overshoot-then-partial-recovery shape
+  already documented for FCN3's own untuned single-step smoke test -- a
+  reassuring consistency signal, not a fluke pass. All checks pass.
+
+**Not yet done**: `aurora_ic.py` (real ERA5 IC fetching -- 26 surface vars
+including several accumulated/scaled fields, richer than either existing
+backend's IC fetcher), wiring `model_backend: aurora` into
+`long_window_4dvar_utils.py`'s dispatch (`get_model`/`get_grid_interpolator`/
+`get_input`/`get_verif`), `config.yml.template` documentation, and any real
+(non-synthetic-IC) end-to-end validation run.
+
 ## Known gaps / next steps
 
 - No production-length (multi-day, many-epoch) run of either backend
