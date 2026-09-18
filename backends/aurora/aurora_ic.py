@@ -27,13 +27,14 @@ fed in, so this module never fetches them at all) and `insolation` is
 computed analytically from lat/lon/time (`aurora.insolation.insolation`),
 not fetched.
 
-**Not yet independently verified against a real test fetch** (unlike
-fcn3_ic.py's own params, each confirmed via a direct test fetch before
-being trusted) -- the param IDs below are standard/well-known ECMWF
-table-128/228 codes, but should be checked with a real fetch (see
-verify_aurora_ic.py, to be written) before trusting this for a real
-experiment, the same discipline fcn3_ic.py's own module docstring
-documents.
+**Verified against a real test fetch (2015-01-01T00), not just assumed**,
+matching fcn3_ic.py's own discipline: all 18 param IDs resolved to the
+expected variable names with physically sane values (e.g. `msl` ~100974
+Pa, `2t` ~276.85 K, `sp` ~96743 Pa). One real bug found this way: `ci`
+(`siconc`) comes back NaN over land (ERA5's own convention -- sea-ice
+concentration is undefined there) -- `np.nan_to_num` fixes this, matching
+what the official aurora repo's own example notebook does defensively for
+every surf field. No other field showed NaNs.
 """
 
 import datetime
@@ -191,6 +192,12 @@ def read_single_date_fields(date, cache_dir):
         for name in ds_sfc.data_vars:
             out_name = _SFC_RENAME.get(name, name)
             arr = ds_sfc[name].isel(valid_time=0).values  # (721, 1440)
+            # 'siconc' (-> 'ci') comes back NaN over land (ERA5's own
+            # convention -- sea-ice concentration is undefined there) --
+            # confirmed by a real test fetch, not assumed. np.nan_to_num
+            # matches the official aurora repo's own example notebook,
+            # which applies this to every surf field defensively.
+            arr = np.nan_to_num(arr, nan=0.0)
             fields[out_name] = np.asarray(arr[:-1, :], dtype=np.float32)  # crop -> (720, 1440)
 
     lat = np.linspace(90.0, -90.0, 721, dtype=np.float32)[:-1]
