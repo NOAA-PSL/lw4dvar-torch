@@ -390,12 +390,68 @@ noise handling.
   already documented for FCN3's own untuned single-step smoke test -- a
   reassuring consistency signal, not a fluke pass. All checks pass.
 
-**Not yet done**: `aurora_ic.py` (real ERA5 IC fetching -- 26 surface vars
-including several accumulated/scaled fields, richer than either existing
-backend's IC fetcher), wiring `model_backend: aurora` into
-`long_window_4dvar_utils.py`'s dispatch (`get_model`/`get_grid_interpolator`/
-`get_input`/`get_verif`), `config.yml.template` documentation, and any real
-(non-synthetic-IC) end-to-end validation run.
+**`reset_skt_over_ocean` support added** (2026-09-18, at the user's
+observation that Aurora has both `skt` and `lsm`): `lsm` is now ALSO given
+its own constant-in-time packed-state column (beyond the 91 real
+surf/atmos columns), mirroring exactly how AIFS's own `lsm` is a genuine
+packed-state column, so `reset_skt_over_ocean` (AIFS-only until now) works
+unmodified for Aurora too. One real bug found and fixed along the way:
+`lsm` briefly appeared in both `batch.surf_vars` and `batch.static_vars`
+simultaneously (Aurora's own `patchembed.py` asserts these variable-name
+sets never collide) -- fixed by excluding the extra static-passthrough
+column from the `surf_vars` dict `_unpack` builds.
+
+**`aurora_ic.py` written and verified against a real ERA5 fetch**
+(2015-01-01T00, not just assumed from param tables): fetches the 18
+real-fetchable surface variables (of Aurora's 26 -- 7 are output-only/
+never fetched, `insolation` is computed analytically) plus the 5
+pressure-level families, following `fcn3_ic.py`'s CDS/netCDF approach.
+Two real differences from FCN3: Aurora needs two lagged time levels (like
+AIFS), and needs its own fresh ERA5 orography fetch for `get_verif`'s
+QC (like FCN3, unlike AIFS) -- Aurora's checkpoint-bundled static `z` is
+exposed via `decode_state` but is NOT verified to equal real ERA5
+orography, so the QC-critical path uses a real fetch instead of that
+assumption. One real bug found this way: `ci` (`siconc`) comes back NaN
+over land (ERA5's own convention) -- `np.nan_to_num` fixes it, matching
+what the official aurora repo's own example notebook does defensively.
+
+**Wired into the shared driver dispatch** (`get_model`/
+`get_grid_interpolator`/`get_input`/`get_verif`/`load_config`, all now
+have an `aurora` branch) and `config.yml.template` documents every
+Aurora-specific key. `get_grid_interpolator` reuses
+`fcn3_grid.BilinearGridInterpolator` directly for Aurora (same 0.25deg
+grid, just 720 rows instead of 721 -- the interpolator derives
+`nlat`/`nlon` from the data itself) -- the one deliberate exception to
+"each backend's imports stay in its own directory," since
+`fcn3_grid.py`'s own dependencies carry none of the cross-backend risk
+that isolation exists to avoid. Verified: `AuroraModel` +
+`BilinearGridInterpolator` construct correctly through the real driver
+dispatch (CPU, from the `aurora` env); confirmed no regression for
+FCN3/AIFS (also re-verified through the same shared dispatch code after
+the edits).
+
+**Future enhancement, explicitly deferred, not yet scoped in**: Aurora
+supports `variable_lead_time`/`fine_lead_times` (see
+`aurora/rollout.py`), which can produce real model predictions at
+sub-6h lead times instead of the linear-interpolation approximation
+(`_interp_decoded`) the shared driver currently uses for `dt_obs <
+dt_verif` -- a genuine accuracy win over the AIFS repo's own documented
+S2/tidal representativeness error. Confirmed by reading `rollout.py`
+directly: all sub-lead-time predictions within one 6h window are
+computed independently from the *same* previous-step state (not chained
+autoregressively), each requiring a full separate encoder+backbone+
+decoder forward pass -- a real compute-cost multiplier proportional to
+how many sub-6h observation slots exist in the window, not a free
+capability. Also requires restructuring `latent_increment` injection so
+the control variable's effect is applied consistently across every
+sub-lead-time call within the first main step, not just a small tweak.
+Deliberately not implemented yet -- revisit once the basic Aurora
+backend has a real end-to-end validation run.
+
+**Not yet done**: any real (non-synthetic-IC) end-to-end driver run
+(`long_window_4dvar.py` through `run_aurora.sh`, mirroring the FCN3/AIFS
+smoke tests already done from this repo), and the `fine_lead_times`
+enhancement above.
 
 ## Known gaps / next steps
 
