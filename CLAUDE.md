@@ -264,6 +264,45 @@ comparison from one driver), not just a validation smoke test.
   backends' stable learning-rate ranges are not assumed to match just
   because this comparison uses one shared value; re-tune independently if
   either looks unstable over more epochs.
+- **Final result, both runs completed (100 epochs, 5-day window)**: AIFS
+  (`learn_rate: 2.0e-3`) genuinely improved z500 -- GL/SH/TR all came out
+  *below* the raw background after optimization (GL: bg 8.54 -> after
+  8.30), the first clearly positive ps-obs-only 4D-Var result seen across
+  either repo this session (NH was the one region that got slightly worse,
+  3.71 -> 4.15). FCN3 (`learn_rate: 2.5e-3`, `checkpoint_stride: 1`) did
+  not -- z500 got worse across every region after optimization (GL: bg
+  13.88 -> after 17.36), the same "untuned learn_rate doesn't reliably
+  improve z500 yet" pattern already documented at length in the fcstnetv3
+  repo's own CLAUDE.md, not a new finding by itself.
+- **FCN3's background (t=0, pre-optimization) z500 error is also
+  substantially higher than AIFS's on this case** (GL RMS 10.37 vs. 6.70 m)
+  -- raised as a concern ("something wrong with the way FCN3 is being
+  initialized from ERA5?") and checked directly rather than assumed either
+  way:
+  - **Grid alignment confirmed exact**: AIFS's saved background's
+    `latitude`/`longitude` match the ERA5 GRIB truth's own coordinates to
+    `0.0` max difference (verified via `cfgrib`); FCN3's flat-to-(721,1440)
+    reshape checked out the same way against its own ERA5 netCDF cache.
+    Not a regridding/point-ordering bug on either side.
+  - **Bias/scatter decomposition, global area-weighted, in meters of z500
+    height error**: AIFS bias=1.32, std=6.57, RMS=6.70. FCN3 bias=0.42,
+    std=10.36, RMS=10.37. **FCN3's bias is smaller than AIFS's**, not
+    larger -- if there were a units mistake, a mis-indexed pressure level,
+    a wrong ERA5 field/date, or a bad interpolation, a large systematic
+    bias would be the expected signature, and neither model shows one.
+    The entire RMS gap is in the *scatter* (~58% higher std for FCN3),
+    which is the signature of a real forecast-dispersion difference at a
+    48h lead time on this specific case, not an IC-construction defect.
+  - **Leading hypothesis, not yet confirmed**: FCN3 is a stochastic/
+    ensemble diffusion model (per its own architecture notes above) that
+    this pipeline deliberately runs fully deterministically (one fixed
+    noise realization, by design). NVIDIA presumably trained/evaluated it
+    as part of an ensemble system; forcing a single fixed noise draw could
+    plausibly cost real skill in a way AIFS (genuinely deterministic) has
+    no analog for. Not proven from one case/one seed -- worth checking
+    whether the scatter changes with a different fixed `noise_seed`, or
+    longer-term whether averaging a few fixed-noise realizations closes
+    the gap, before treating this as settled.
 
 ## Known gaps / next steps
 
