@@ -473,6 +473,27 @@ class AuroraModel(forecast_model.LatentForecastModel):
         finally:
             handle.remove()
 
+        # Real bug found the hard way: forward() does NOT clamp any of
+        # `rollout_input_clipping`'s variables (tcwv/tcc/lcc/mcc/hcc/
+        # swvl1/ci/scaled_sd) -- its own docstring says this "is not
+        # called automatically in forward()" specifically so the
+        # unclipped prediction stays available for loss computation, and
+        # leaves it to the CALLER to clip before feeding a prediction back
+        # autoregressively (exactly what aurora.rollout.rollout() does,
+        # and what this method originally omitted). Without it, a full
+        # 20-step differentiable rollout went numerically unstable after
+        # the very first AdamW update (epoch 1 gave a real, varying
+        # Jtot=302843; epochs 2 onward all collapsed to EXACTLY the t=0
+        # background term, unchanged epoch to epoch -- the signature of
+        # every other obs slot being QC-rejected because the corrected
+        # trajectory had gone non-finite by some step downstream of an
+        # un-clipped runaway value compounding autoregressively). None of
+        # the clipped variables are ever read by this solver's own loss
+        # (ps_operator='logpinterp' only ever reads 'z'), so clipping
+        # unconditionally here -- rather than only for the fed-forward
+        # copy, the way rollout() distinguishes them -- costs nothing.
+        pred = self.wrapper.apply_rollout_input_clipping(pred)
+
         return self._pack_pred(pred, state)
 
     def advance(
