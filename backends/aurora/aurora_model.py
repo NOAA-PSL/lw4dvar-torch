@@ -189,6 +189,17 @@ class AuroraModel(forecast_model.LatentForecastModel):
         for p in self.wrapper.parameters():
             p.requires_grad_(False)
 
+        # Aurora's own fine-grained internal activation checkpointing --
+        # its docstring says this "is required in order to compute
+        # gradients without running out of memory," confirmed the hard way
+        # (real end-to-end test OOM'd at 92.86 GiB on a 93 GiB H100, on
+        # just a 2-step window, without this). Wraps every individual
+        # Swin3D transformer block/encoder/decoder layer in its own
+        # activation-checkpoint boundary -- much finer-grained than (and
+        # complementary to, not a replacement for) the outer per-6h-step
+        # torch.utils.checkpoint wrapping _advance_one_step below.
+        self.wrapper.configure_activation_checkpointing()
+
         self._timestep = self.wrapper.timestep
 
         # linspace over the FULL 721-point axis, then drop the last (South
@@ -420,6 +431,19 @@ class AuroraModel(forecast_model.LatentForecastModel):
         Runner cache) -- the packed tensor is self-contained. Returned
         as-is for interface parity with AIFSModel/FCN3Model."""
         return aurora_state
+
+    def _prime_noise(self) -> None:
+        """No-op: Aurora (the AuroraV1p5 checkpoint used here, not
+        AuroraV1p5Ensemble) has no stochastic input to re-prime -- same
+        rationale as AIFSModel._prime_noise. Exists so solver-core code
+        (compute_optimal/compute_loss_4dvar) can call it unconditionally
+        without a backend check."""
+        return None
+
+    def wrap_state(self, state: torch.Tensor, date: datetime.datetime) -> AuroraState:
+        """Construct this backend's state wrapper -- lets solver-core code
+        build a new state without importing/naming AuroraState directly."""
+        return AuroraState(state, date)
 
     # ------------------------------------------------------------------
     # Differentiable rollout
