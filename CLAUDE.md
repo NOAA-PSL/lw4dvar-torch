@@ -304,7 +304,7 @@ comparison from one driver), not just a validation smoke test.
     longer-term whether averaging a few fixed-noise realizations closes
     the gap, before treating this as settled.
 
-## Third backend: Microsoft Aurora (in progress, 2026-09-18)
+## Third backend: Microsoft Aurora (validated end-to-end, 2026-09-18)
 
 Adding a third backend, `aurora` (`AuroraV1p5`, `microsoft/aurora`'s
 `aurora-0.25-v1.5.ckpt`), at the user's request -- same phased approach as
@@ -448,10 +448,56 @@ sub-lead-time call within the first main step, not just a small tweak.
 Deliberately not implemented yet -- revisit once the basic Aurora
 backend has a real end-to-end validation run.
 
-**Not yet done**: any real (non-synthetic-IC) end-to-end driver run
-(`long_window_4dvar.py` through `run_aurora.sh`, mirroring the FCN3/AIFS
-smoke tests already done from this repo), and the `fine_lead_times`
-enhancement above.
+**Real end-to-end validation run completed** (`config_test_aurora.yml`:
+`n_init: 1`, single 12h window, `n_verif: 2`/`dt_verif: 6`, `max_epoch:
+5`, real ERA5 IC + real ps observations). Took three real bug fixes to get
+a clean run, each found by the run itself, not by inspection:
+
+- `AuroraModel` was missing `_prime_noise()` (a no-op -- Aurora has no
+  stochastic state) and `wrap_state()`, both required by
+  `compute_optimal`/`compute_loss_4dvar` but never exercised by
+  `smoke_test_aurora.py` (which calls `advance()`/`decode_state()`
+  directly, not through the full solver loop). `__abstractmethods__ ==
+  frozenset()` being empty didn't mean the interface was complete -- these
+  are concrete AIFSModel/FCN3Model conveniences the shared driver actually
+  calls, not `forecast_model.LatentForecastModel` abstract requirements.
+- `get_verif` hit a stale-cache `KeyError` on `geopotential_at_surface` --
+  the `2015-01-01T00` sfc file cached during earlier `aurora_ic.py`
+  verification predated the orography-fetch fix. Fixed by deleting and
+  re-fetching just that one file.
+- **Real memory bug**: the run got through a full epoch 1 with a
+  physically plausible loss (`Jtot=17084` on real data) before OOMing at
+  92.86 GiB (of 93 GiB) on epoch 2. Root cause: `AuroraModel.__init__`
+  never called `self.wrapper.configure_activation_checkpointing()` --
+  Aurora's own docstring says this "is required in order to compute
+  gradients without running out of memory." It wraps every individual
+  Swin3D transformer block/encoder/decoder layer in its own activation-
+  checkpoint boundary, complementary to (not a replacement for) the outer
+  per-6h-step `torch.utils.checkpoint` this wrapper already does around
+  `_advance_one_step`. Fixed with one line; re-validated via
+  `smoke_test_aurora.py` (unaffected) before retrying the real run.
+
+After those three fixes, the run completed cleanly end to end: real
+ps observations (8934-9756 obs used per slot, out of 9112-9969 available
+-- realistic counts, matching the other two backends' own validation
+runs), all 5 epochs, `Jtot` trending down overall (17084 -> 16966 ->
+18680 [bump] -> 14601 -> 12682), all diagnostic files saved, and real
+finite z500 numbers: `bg(t0)` GL 3.74, `before` 4.05, `after` 4.45 -- z500
+got slightly worse post-optimization, the same "untuned learn_rate on a
+toy window" story already documented at length for AIFS's and FCN3's own
+early validation runs, not a new or Aurora-specific problem. This
+demonstrates the PIPELINE works end-to-end for Aurora, not that its
+current (default, untuned) `learn_rate`/`max_epoch`/window-length produce
+a good analysis -- same honest framing the other two backends' own
+first validation runs used.
+
+Prefetched ERA5 dates now cached in `ic_cache/`: `2014-12-29T18`,
+`2014-12-30T00`/`T18`, `2014-12-31T00`, `2015-01-01T00`/`T06` -- enough
+for either a 24h or 48h back-forecast IC at `sdate: 2015-01-01T00`.
+
+**Not yet done**: a longer/multi-epoch tuning run (matching the FCN3/AIFS
+`learn_rate` tuning history), `restart`/multi-cycle runs, and the
+`fine_lead_times` enhancement above.
 
 ## Known gaps / next steps
 
