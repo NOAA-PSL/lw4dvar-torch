@@ -197,6 +197,12 @@ cython_debug/
 # lives inside the submodules' own .git, never as loose files this repo's
 # own .gitignore needs to name.
 
+# backends/aurora is NOT a submodule -- microsoft/aurora on HF is a shared
+# monorepo of many unrelated checkpoints, so its ~4.9GB v1.5
+# checkpoint+static-pickle are fetched selectively via huggingface_hub
+# (see aurora_prefetch_checkpoint.py) into this local, gitignored cache.
+backends/aurora/hf_cache/
+
 # per-experiment config symlink + run artifacts (SLURM logs, cached ICs,
 # per-run output dirs) -- config.yml.template is the tracked, real config
 config.yml
