@@ -1261,6 +1261,22 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
 
         loss.backward()
 
+        # A finite loss does not guarantee a finite gradient -- confirmed
+        # 2026-09-18 (Aurora, 16-step window): a NaN gradient w.r.t.
+        # `increment` survives `clip_grad_norm_` unchanged (NaN propagates
+        # through the norm computation, so the rescale factor is NaN too),
+        # `optimizer.step()` then corrupts `increment` to NaN, and the
+        # corrupted increment's downstream obs terms are correctly QC-
+        # rejected as non-finite (`interpolation_failed`) rather than
+        # producing a NaN loss -- so the *loss* itself looks deceptively
+        # finite and lower than before, and the corrupted increment gets
+        # saved as "new best" rather than caught here. See CLAUDE.md
+        # "Aurora 16-step divergence" for the full root-cause writeup.
+        if not torch.isfinite(increment.grad).all():
+            logger.warning(f'epoch={epoch}: non-finite gradient, skipping this optimizer step')
+            optimizer.zero_grad()
+            continue
+
         history.append({
             'time': time.ctime(),
             'epoch': epoch,

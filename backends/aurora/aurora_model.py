@@ -152,7 +152,8 @@ class AuroraModel(forecast_model.LatentForecastModel):
     `FCN3Model.wrapper`.
     """
 
-    def __init__(self, package_root: str, device: str = "cuda"):
+    def __init__(self, package_root: str, device: str = "cuda",
+                 autocast_dtype: torch.dtype = torch.bfloat16):
         """
         Parameters
         ----------
@@ -163,6 +164,22 @@ class AuroraModel(forecast_model.LatentForecastModel):
             into, analogous to FCN3Model's `package_root` (a directory IS
             the package here, unlike AIFS's separate checkpoint_path/
             config_path).
+        autocast_dtype : torch.dtype
+            `AuroraV1p5`'s own default is `autocast=True,
+            autocast_dtype=torch.float16` (applied to its encoder,
+            backbone, AND decoder -- more aggressive than the base
+            `Aurora` class, whose own default is `torch.bfloat16`, and
+            only autocasts the backbone). fp16's narrow dynamic range
+            (~+-65504) is fine for a pure forward pass (confirmed clean,
+            no NaN/Inf, in a zero-increment background rollout at any
+            length tested) but was confirmed (2026-09-18, see CLAUDE.md
+            "Aurora 16-step divergence") to produce a NaN/Inf gradient
+            w.r.t. `latent_increment` when backpropagating through a
+            16-step chained rollout -- deterministically, independent of
+            the increment's value, since it happens starting from the
+            all-zero initial increment every time. `torch.bfloat16` has
+            fp32's exponent range (~+-3.4e38), eliminating the overflow
+            without losing the memory/speed benefit of reduced precision.
         """
         if device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -178,7 +195,7 @@ class AuroraModel(forecast_model.LatentForecastModel):
             k: torch.from_numpy(v[:-1, :]).to(self._device) for k, v in static_raw.items()
         }
 
-        self.wrapper = AuroraV1p5()
+        self.wrapper = AuroraV1p5(autocast_dtype=autocast_dtype)
         self.wrapper.load_checkpoint_local(f"{package_root}/{_CHECKPOINT_NAME}")
         self.wrapper = self.wrapper.to(self._device)
         self.wrapper.eval()

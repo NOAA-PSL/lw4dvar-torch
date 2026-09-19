@@ -499,6 +499,128 @@ for either a 24h or 48h back-forecast IC at `sdate: 2015-01-01T00`.
 `learn_rate` tuning history), `restart`/multi-cycle runs, and the
 `fine_lead_times` enhancement above.
 
+## Aurora 16-step divergence: root cause and fix (2026-09-19)
+
+Following up on the 5-day/100-epoch single-cycle test requested above: that
+run (48h back-forecast, `n_verif: 20`, `max_epoch: 100`) diverged --
+starting at epoch 2, every observation past `t=0` was rejected by QC, and
+the loss froze at exactly the background (t=0) term for every subsequent
+epoch. Root-caused via systematic bisection and a targeted forward-only
+probe, not guessed at.
+
+- **Bisection** (`n_verif` in {4, 8, 12, 16}, `learn_rate=1e-4`, all other
+  settings fixed): 4/8/12-step windows optimize cleanly; 16-step windows
+  collapse **immediately** at the very first corrected observation
+  (oind1, t+6h), not gradually.
+- **Two magnitude-based mitigations both failed identically**, ruling out
+  "the injected correction is too large" as the cause: a `latent_scale:
+  100.0` config knob (divides the injected perturbation by 100x before
+  adding it to the model, independent of AdamW's own per-element step
+  normalization) produced the exact same frozen-loss signature. Disabling
+  the outer per-step `torch.utils.checkpoint` wrapping entirely
+  (`checkpoint_stride: 0`, ruling out an interaction with Aurora's own
+  internal `configure_activation_checkpointing()`) also made no
+  difference. Restricting `control_variables` to `[u, v, z, t, q, sp]`
+  (confining the increment's *direct* effect at the injection step to only
+  the core prognostic fields, per `_apply_control_mask` -- see
+  `long_window_4dvar_utils.py`'s docstring) also made no difference --
+  ruling out "the increment is corrupting an unclipped output-only
+  diagnostic channel" as the mechanism.
+- **Decisive probe** (`probe_aurora_nan.py`, forward-only, no gradients):
+  loaded the actual "best" increment saved by the diverged run and found
+  it was **already NaN** (`torch.load` -> `norm=nan, max_abs=nan`) --
+  the corruption happened during the optimizer's OWN update, not from
+  injecting a small-but-nonzero perturbation into an already-fragile
+  forward pass. Injecting that NaN increment into a otherwise-clean
+  background rollout (step 0 itself has zero NaN/Inf in any decoded
+  field, at any field, real physical values throughout) immediately
+  produces 100%-NaN decoded fields at step 1 -- every element of every
+  variable, both core prognostic and the unclipped output-only surface
+  diagnostics (`i10fg`, `blh`, `uvb_1h`, `ssrd_1h`, `ttr_1h`,
+  `scaled_tp_1h`, `scaled_sf_1h`) -- consistent with a NaN value anywhere
+  in a transformer's latent tokens propagating globally through
+  attention's all-to-all mixing.
+- **Root cause, confirmed by reading both the optimizer loop and the
+  `aurora` package source**:
+  - `compute_optimal`'s AdamW loop (`long_window_4dvar_utils.py`) checks
+    `torch.isfinite(loss)` before `.backward()`, but had no equivalent
+    check on `increment.grad` afterward. `torch.nn.utils.clip_grad_norm_`
+    does **not** sanitize a NaN gradient -- a NaN element makes the
+    computed norm NaN, so the rescale factor (`max_norm / (total_norm +
+    eps)`) is also NaN, and NaN survives the "clip" unchanged.
+    `optimizer.step()` then applies the NaN gradient, corrupting
+    `increment` itself to NaN.
+  - Because `increment` starts at all-zeros, this NaN gradient occurs
+    **deterministically from epoch 1** for a 16-step window -- the same
+    computation, run from the same starting point, fails the same way
+    every time. This is exactly why every increment-*magnitude* lever
+    (`latent_scale`, `control_variables`) failed identically: none of them
+    touch the actual cause, which lives entirely upstream, in
+    backpropagating through the model itself.
+  - The corrupted (NaN) increment then gets misjudged as "new best":
+    `_compute_ps_observation_diagnostics_at_time`'s `interpolation_failed
+    = ~torch.isfinite(...)` check (correctly) marks every downstream obs
+    as unusable rather than producing a NaN loss -- so the *loss* itself
+    stays finite and looks artificially LOWER (only the t=0 background
+    term remains) than the real, honest epoch-1 loss, and gets saved as
+    the run's best result.
+  - **Trigger, found in the installed `aurora` package's own source**
+    (`aurora/model/aurora.py`): `AuroraV1p5.__init__` defaults to
+    `autocast=True, autocast_dtype=torch.float16`, applied to its
+    encoder, backbone, AND decoder (more aggressive than the base
+    `Aurora` class, whose own default is `autocast_dtype=torch.bfloat16`
+    and only autocasts the backbone). fp16's narrow dynamic range
+    (~+-65504) is fine for a pure forward pass (confirmed: the
+    zero-increment background rollout has zero NaN/Inf at any step,
+    any field, any window length tested) but overflows when
+    backpropagating gradients through a long (16-step) chained rollout --
+    a known fp16-vs-bf16 tradeoff (fp16 has more mantissa precision but
+    only fp16 exponent range; bf16 trades precision for fp32's exponent
+    range), and precisely the kind of instability mixed-precision
+    *training* guards against with a `GradScaler` -- a concern that
+    doesn't arise for Aurora's typical inference-only use case (no
+    backward pass at all), which is presumably why `AuroraV1p5` felt safe
+    defaulting more aggressively into fp16 than its own base class.
+- **Fix, two parts**:
+  1. `backends/aurora/aurora_model.py`: `AuroraModel.__init__` gained an
+     `autocast_dtype` parameter, defaulting to `torch.bfloat16` (was
+     implicitly `torch.float16` via `AuroraV1p5()`'s own default), passed
+     through to `AuroraV1p5(autocast_dtype=autocast_dtype)`. bf16 has
+     fp32's exponent range, eliminating the overflow, at the same
+     memory/speed class as fp16 (unlike falling back to full fp32
+     autocast, which would cost real memory headroom this checkpoint
+     doesn't have to spare -- see `configure_activation_checkpointing()`
+     already being load-bearing just to fit in memory at all).
+  2. `long_window_4dvar_utils.py`'s `compute_optimal`: added a symmetric
+     `torch.isfinite(increment.grad).all()` check right after
+     `loss.backward()`, alongside the existing `torch.isfinite(loss)`
+     check before it -- skips that epoch's `optimizer.step()` (via
+     `continue`, after `optimizer.zero_grad()`) rather than silently
+     applying/saving a corrupted update, as a defense-in-depth backstop
+     independent of whichever backend or dtype choice is in play.
+- **Verified, not just reasoned about**: re-ran the exact 16-step
+  bisection config (`config_aurora_bisect_16.yml`, `learn_rate=1e-4`,
+  `max_epoch=3`) with only the `bfloat16` default changed. Epoch 2 (the
+  epoch that previously collapsed to 0 obs used at every oind past t=0)
+  now shows real, smoothly-varying obs-used counts at every oind (e.g.
+  oind10: 9659 -> 9673 obs used) and per-oind `J` trending down
+  individually (e.g. oind10: 14975.9 -> 14728.3). `Jtot` decreases
+  monotonically across all 3 epochs (212710.1 -> 209731.9 -> 205469.9) --
+  a genuine, healthy optimization trajectory, not a collapse. The
+  gradient-finiteness guard was never triggered during this run (the
+  primary bf16 fix was sufficient on its own), consistent with it being a
+  backstop rather than the actual fix.
+- **Not yet done**: the real 5-day/100-epoch single-cycle test this
+  investigation was blocking (`config_aurora_5day_100it.yml`) has not
+  been re-run with the fix yet -- the 3-epoch/16-step bisection config
+  above is a targeted confirmation that the specific failure mode is
+  gone, not a full validation of that longer run's `learn_rate`/epoch
+  count. Diagnostic configs from this investigation
+  (`config_aurora_bisect_{4,8,12,16}.yml`, `_16_scale.yml`, `_16_nocp.yml`,
+  `_16_ctrlvars.yml`, `_16_bf16` reuses the plain `_16.yml`) and
+  `probe_aurora_nan.py` are left uncommitted/untracked for now, pending a
+  decision on whether to keep any as regression checks.
+
 ## Known gaps / next steps
 
 - No production-length (multi-day, many-epoch) run of either backend
