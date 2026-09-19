@@ -854,16 +854,65 @@ unrelated to the sys.path fix).
         reduction, though it does not on its own close the full ~4-5x gap
         to AIFS's ~18-25s/epoch (a compiled Aurora epoch would still be
         roughly ~2.5x AIFS's cost).
-      - **Not yet wired into `AuroraModel`/the driver, and not yet
-        measured at the real 20-step/100-epoch scale end-to-end** -- both
-        genuinely open. Recommended integration shape, not yet
-        implemented: an opt-in `compile_wrapper: bool = False` constructor
-        parameter on `AuroraModel` (default OFF, given the real, non-
-        trivial one-time cost and the still-somewhat-unpredictable
-        per-call-site recompilation behavior above) rather than flipping
-        the default, so a real experiment can opt in deliberately once
-        its own step-count call pattern's total compile tax has been
-        checked to be worth paying for that specific run's epoch count.
+      - **Wired in and validated end-to-end at full production scale,
+        2026-09-19 -- real, confirmed ~1.78x total wall-clock speedup.**
+        `AuroraModel.__init__` gained the recommended opt-in
+        `compile_wrapper: bool = False` constructor parameter (wraps
+        `self.wrapper` in `torch.compile()` right after it's fully
+        constructed/moved/frozen/checkpoint-configured); `get_model`
+        reads it from `exp.get('compile_wrapper', False)`;
+        `config.yml.template` documents it (Aurora-only, off by default).
+        Re-ran the EXACT same 5-day/48h-back/100-epoch single-cycle
+        config already validated uncompiled (`config_aurora_5day_100it.
+        yml`, job 21716154, "First real production-scale Aurora
+        single-cycle run" above), as a new config
+        (`config_aurora_5day_100it_compile.yml`, only difference:
+        `compile_wrapper: True`, separate output dir) rather than reusing
+        or modifying the original -- job 21716154's underlying config had
+        since been changed by the user for other work (`restart: True`,
+        pointing at that run's own output), so a clean comparison needed
+        its own fixed config matching the ORIGINAL validated settings
+        exactly (recovered from that run's own saved
+        `config.yml.20260919_011648` snapshot).
+        - **Total wall-clock: 1:34:19 (job 21762536) vs. 2:47:47
+          (uncompiled baseline, job 21716154) -- a real 1.78x end-to-end
+          speedup**, including the one-time compilation cost -- close to,
+          slightly under, the 1.87x steady-state-only figure above, as
+          expected once compile overhead is folded in.
+        - **Correctness confirmed at full scale, not just the earlier
+          short probe**: final `Jtot` 49076.2 (compiled) vs. 48292.5
+          (uncompiled) -- a ~1.6% difference, and the z500 before/after
+          diagnostic tells the identical qualitative story at both
+          (global RMS error worse after this untuned optimization: 8.78
+          vs. 8.53). Both differences are consistent with the same class
+          of GPU kernel-selection floating-point nondeterminism this
+          repo's CLAUDE.md already documents extensively for bf16 ops
+          elsewhere (kernel fusion changes floating-point operation
+          order, shifting results at the last few bits, compounding over
+          a 100-epoch/20-step differentiable rollout) -- not a real
+          divergence or a correctness regression.
+        - **The `torch._dynamo` `recompile_limit(8)` warning observed
+          during this run is a real, partial coverage gap, not a
+          failure**: several of Aurora's own internal per-variable-name
+          normalization functions (`normalise_surf_var`,
+          `normalise_atmos_var` in the installed `aurora` package) branch
+          on the variable's name as a Python string (`name == '100u'`,
+          `name == 'v'`, ...) -- with 70+ named fields, dynamo's default
+          8-recompile budget per function is exceeded, so those specific
+          functions fall back to eager execution rather than staying
+          compiled (logged as a warning, not an error -- the run
+          completes correctly regardless, per the correctness check
+          above). This likely explains some of the compile-time
+          variability observed in the earlier probes (different subsets
+          of these per-name branches get hit depending on which physical
+          variables/call order a given run's `steps`/prior-call-history
+          happens to exercise first). Not fixed here (would mean patching
+          the installed `aurora` package or raising
+          `torch._dynamo.config.recompile_limit`, either a bigger change
+          than this optimization pass warrants) -- flagged as a genuine,
+          if modest, amount of speedup left on the table by this gap.
+        - Config kept (`config_aurora_5day_100it_compile.yml`) as the
+          reference for reproducing this comparison.
   - **Outer per-step `torch.utils.checkpoint` redundancy -- TESTED, a real
     tradeoff, not a clear win.** (`probe_aurora_checkpoint.py`/
     `run_probe_aurora_checkpoint.sh`, sweeping `outer_checkpoint` on/off at

@@ -149,6 +149,20 @@ exp:
   # re-profiling for a different rollout length/GPU.
   #atmo_chunk_size: 2
 
+  # compile_wrapper: Aurora ONLY (default False, meaningless for AIFS/FCN3).
+  # Wraps the Aurora model in torch.compile() -- a real, confirmed ~1.87x
+  # steady-state speedup (see CLAUDE.md "Aurora per-epoch runtime
+  # optimization"), correctness-verified, but at a real one-time
+  # compilation cost (130-270s, not fixed, paid separately for each
+  # distinct (steps, use_checkpoint) combination the run actually
+  # exercises -- the main loop, ref_state1, diagnostics, and forecasts
+  # calls all differ). Worth enabling for a run with enough epochs at the
+  # same window length for the speedup to amortize past that tax (a
+  # 100-epoch run comfortably clears this; a 3-5 epoch smoke test likely
+  # does not) -- default is off since the cost/benefit depends on epoch
+  # count, not something safe to assume for every run.
+  #compile_wrapper: True
+
   # grid_interp: FCN3 and Aurora only (default 'bilinear', meaningless for
   # AIFS -- AIFS's irregular N320 octahedral grid always uses the k-d-tree
   # approach, no config key needed). How ps-obs are interpolated to/from

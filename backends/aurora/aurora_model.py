@@ -154,7 +154,8 @@ class AuroraModel(forecast_model.LatentForecastModel):
 
     def __init__(self, package_root: str, device: str = "cuda",
                  autocast_dtype: torch.dtype = torch.bfloat16,
-                 use_fp16_safe_attention: bool = True):
+                 use_fp16_safe_attention: bool = True,
+                 compile_wrapper: bool = False):
         """
         Parameters
         ----------
@@ -206,6 +207,28 @@ class AuroraModel(forecast_model.LatentForecastModel):
             (`True`) here; do not flip this without first confirming
             whichever PyTorch/CUDA version is in use has a working fused
             SDPA backward for this exact shape pattern.
+        compile_wrapper : bool
+            Wrap `self.wrapper` in `torch.compile()` after it's fully
+            constructed/moved/frozen/checkpoint-configured. **Tested and
+            confirmed real, 2026-09-19** (see CLAUDE.md "Aurora per-epoch
+            runtime optimization"): a genuine ~1.87x steady-state speedup
+            (17.85s -> 9.55s per differentiable step at the production
+            steps=4/checkpoint-on setting), correctness-verified
+            (`increment.grad.norm()` matches exactly between compiled and
+            uncompiled runs). Defaults to `False`, not because it's
+            unsafe, but because the one-time compilation cost is real and
+            NOT fixed (observed 130-270s depending on the exact
+            `(steps, use_checkpoint, prior call history)` combination
+            dynamo first encounters it with), and a real experiment calls
+            `advance()` at several different `steps` values across one
+            run (main loop, `ref_state1`, diagnostics, forecasts) --
+            each is a separate thing dynamo may need to compile, so the
+            real one-time tax is the sum across however many distinct
+            combinations that run actually exercises. Worth enabling for
+            any run with enough epochs at the SAME window length for the
+            steady-state speedup to amortize past that tax (a 100-epoch
+            run comfortably clears this; a 3-5 epoch smoke test likely
+            does not).
         """
         if device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -246,6 +269,9 @@ class AuroraModel(forecast_model.LatentForecastModel):
         # complementary to, not a replacement for) the outer per-6h-step
         # torch.utils.checkpoint wrapping _advance_one_step below.
         self.wrapper.configure_activation_checkpointing()
+
+        if compile_wrapper:
+            self.wrapper = torch.compile(self.wrapper)
 
         self._timestep = self.wrapper.timestep
 

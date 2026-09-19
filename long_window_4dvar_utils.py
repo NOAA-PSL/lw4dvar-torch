@@ -369,6 +369,7 @@ def get_model(exp):
         return aurora_model.AuroraModel(
             package_root=exp['path_model'],
             device=exp.get('device', 'cuda'),
+            compile_wrapper=exp.get('compile_wrapper', False),
         )
     raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
 
