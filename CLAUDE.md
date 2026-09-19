@@ -784,7 +784,86 @@ unrelated to the sys.path fix).
       plausibly try to lower to a similarly problematic kernel, though
       compiling the already-in-use manual fallback path (rather than the
       native SDPA call) is a meaningfully different and probably safer
-      starting point. Not yet attempted.
+      starting point.
+    - **Attempted 2026-09-19, real and confirmed working: a genuine
+      ~1.87x steady-state speedup, correctness-verified, at a real
+      one-time compilation cost.** `torch.compile(model.wrapper)`
+      (`probe_aurora_compile.py`, staged: forward-only -> +backward ->
+      +outer checkpoint -> +4 steps, each independently try/excepted so
+      one stage's failure wouldn't block learning from others) ran
+      cleanly through every stage -- no crash, unlike the native-SDPA
+      attempt, consistent with compiling the manual attention fallback
+      path (already in use, since `use_fp16_safe_attention=True`) being a
+      safer target than the native kernel would have been.
+      - **Correctness**: `increment.grad.norm()` matched EXACTLY between
+        compiled and uncompiled runs at the same setting (3.061e+07 both,
+        steps=1) -- compilation changes speed, not the numerical result.
+      - **Clean apples-to-apples confirmation**
+        (`probe_aurora_compile_confirm.py`, same script/loaded-model
+        instance for both arms, avoiding the pitfall below): at the
+        production-matching setting (steps=4, outer checkpoint on),
+        uncompiled steady-state (calls 2-3 of 3, after the cold-start
+        effect) = **17.85s**, compiled steady-state = **9.55s** -- a real
+        **1.87x** speedup. (An earlier same-day cross-script comparison
+        against `probe_aurora_checkpoint.py`'s single-cold-call number,
+        58.32s, suggested a much larger ~6x speedup -- that number is
+        WRONG, an artifact of comparing a cold single call in one script
+        against a warmed-up call in another; flagged as unconfirmed and
+        deliberately not reported as fact before this same-script
+        re-test caught it. Even the UNCOMPILED baseline shows a large
+        cold-start effect on its own: 58.81s (call 1) -> 17.79s (call 2)
+        -> 17.90s (call 3), matching that old 58.32s number almost
+        exactly and confirming it was a cold-start artifact, not a real
+        steady-state number, all along.)
+      - **Compilation itself is expensive and its cost is NOT fixed** --
+        136s (steps=1, no checkpoint) vs. 180s (steps=4, with checkpoint,
+        different model instance/call history) vs. 272s (steps=4, with
+        checkpoint, on a model instance that had already run 3 UNCOMPILED
+        calls at that same setting first) for what should nominally be
+        compiling the same single-6h-step forward graph each time
+        (`self.wrapper.forward` is called once per step inside
+        `advance()`'s loop, and `torch.compile(model.wrapper)` compiles
+        that one call, not the whole multi-step loop) -- the exact cause
+        of this scaling isn't nailed down (candidates: the dynamic
+        `register_forward_pre_hook`/`remove()` pattern this wrapper uses
+        for latent injection, done fresh on every call, interacting with
+        dynamo's guards; and/or `torch.utils.checkpoint`'s backward-time
+        recompute being traced/compiled somewhat independently per
+        checkpoint region) -- but the practical number to plan around is
+        "a few hundred seconds per distinct (steps, checkpoint-on/off,
+        prior-call-history) combination encountered," not a fixed cost.
+      - **A real experiment pays this cost more than once, not just at
+        startup**: `long_window_4dvar_utils.py`/`long_window_4dvar.py`
+        call `model.advance()` at several different `steps` values across
+        one run (the main optimization loop's `n_steps`; `ref_state1`'s
+        `steps=1`; `compute_ps_observation_hx`'s `steps_per_verif`;
+        `make_forecasts`'s `steps_per_output`; the driver's own
+        `bg_shifted`/restart-forecast advances) -- each distinct `steps`
+        value (and use_checkpoint on/off) is a separate thing dynamo may
+        need to compile, so a full experiment's real one-time compile tax
+        is the sum across however many distinct combinations it actually
+        exercises, not a single flat cost paid once.
+      - **Net estimate for a real 100-epoch/20-step run** (extrapolating,
+        not yet measured directly at that exact scale): a ~1.87x
+        steady-state speedup on the dominant main-loop cost (currently
+        ~100s/epoch) would bring it to ~54s/epoch; even after several
+        hundred seconds of one-time compilation tax across the various
+        call sites above, total wall-clock for a full 100-epoch run should
+        drop meaningfully (rough math: ~10000s uncompiled -> ~5500-6500s
+        compiled including compile overhead) -- a genuine, worthwhile
+        reduction, though it does not on its own close the full ~4-5x gap
+        to AIFS's ~18-25s/epoch (a compiled Aurora epoch would still be
+        roughly ~2.5x AIFS's cost).
+      - **Not yet wired into `AuroraModel`/the driver, and not yet
+        measured at the real 20-step/100-epoch scale end-to-end** -- both
+        genuinely open. Recommended integration shape, not yet
+        implemented: an opt-in `compile_wrapper: bool = False` constructor
+        parameter on `AuroraModel` (default OFF, given the real, non-
+        trivial one-time cost and the still-somewhat-unpredictable
+        per-call-site recompilation behavior above) rather than flipping
+        the default, so a real experiment can opt in deliberately once
+        its own step-count call pattern's total compile tax has been
+        checked to be worth paying for that specific run's epoch count.
   - **Outer per-step `torch.utils.checkpoint` redundancy -- TESTED, a real
     tradeoff, not a clear win.** (`probe_aurora_checkpoint.py`/
     `run_probe_aurora_checkpoint.sh`, sweeping `outer_checkpoint` on/off at
