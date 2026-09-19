@@ -2,8 +2,9 @@
 this version is a prototype 4dvar solver.
 
 compute optimal initial conditions for the configured forecast model
-(AIFS-single-2.0 or FourCastNet3 -- see `exp['model_backend']`), optionally
-using expanding optimization time windows.
+(AIFS-single-2.0, FourCastNet3, or Microsoft Aurora -- see
+`exp['model_backend']`), optionally using expanding optimization time
+windows.
 
 Originator: Greg Hakim
             University of Washington
@@ -16,8 +17,9 @@ Jeff Whitaker added mods for real surface pressure observations (June-Aug 2026)
 Merged (September 2026) from two independent single-backend ports of this
 driver: `long-window-4dvar-aifsv2` (NeuralGCM/JAX -> AIFS-single-2.0/PyTorch)
 and `long-window-4dvar-fcstnetv3` (AIFS-single-2.0/PyTorch ->
-FourCastNet3/PyTorch) -- see long_window_4dvar_utils.py's module docstring
-for the structural differences between the two backends this merge is built
+FourCastNet3/PyTorch), then extended with a third backend, Microsoft Aurora
+(AuroraV1p5) -- see long_window_4dvar_utils.py's module docstring for the
+structural differences between the three backends this merge is built
 around.
 
 Control is latent-only (see long_window_4dvar_utils.py's docstring): the
@@ -79,7 +81,7 @@ grid_interp = utils.get_grid_interpolator(model, exp_config)
 
 plevs = model.pressure_levels('z')
 nlev500 = int(np.argwhere(plevs == 500)[0].item())
-nlev700 = int(np.argwhere(plevs == 700)[0].item())  # used by the ps forward operator only if ps_operator='ps' (AIFS only -- unsupported for FCN3, no native sp)
+nlev700 = int(np.argwhere(plevs == 700)[0].item())  # used by the ps forward operator only if ps_operator='ps' (AIFS-only in practice -- unsupported for FCN3, no native sp; currently blocked for Aurora too pending testing, see long_window_4dvar_utils.py)
 exp_config['nlev500'] = nlev500
 exp_config['nlev700'] = nlev700
 
@@ -197,9 +199,9 @@ for k in range(exp_config['n_init']):
         # get verification at start of window (including ERA5 orography)
         verif_ic = utils.get_verif(exp_config, model, logger)
         logger.info('get verif_ic...')
-        # reset_skt_ocean is AIFS-only (see reset_skt_over_ocean's docstring)
-        # -- load_config() already rejects this key for model_backend='fcn3',
-        # so this branch is simply never taken there.
+        # reset_skt_ocean is AIFS/Aurora-only (see reset_skt_over_ocean's
+        # docstring) -- load_config() already rejects this key for
+        # model_backend='fcn3', so this branch is simply never taken there.
         if is_new_analysis_time and exp_config.get('reset_skt_ocean', False):
             logger.info('resetting skt over ocean from ERA5 (reset_skt_ocean)...')
             input_encoded = utils.reset_skt_over_ocean(

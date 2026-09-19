@@ -10,60 +10,71 @@ Jeff Whitaker modified to assimilate real surface pressure obs June-August 2026
 Merged (September 2026) from two independent single-backend ports of this
 same long-window 4D-Var solver: `long-window-4dvar-aifsv2` (NeuralGCM/JAX ->
 AIFS-single-2.0/PyTorch, August 2026) and `long-window-4dvar-fcstnetv3`
-(AIFS-single-2.0/PyTorch -> FourCastNet3/PyTorch, September 2026). A single
-top-level `exp['model_backend']` config key ('aifs' or 'fcn3') now selects
-the forecast model at runtime; `backends/aifs/`/`backends/fcn3/` hold each
-backend's model/grid/IC-fetching modules, imported LAZILY (inside the
-function that needs them, never at this module's top level) so that a
-process running with only one backend's conda env active (`aifs2` vs
-`fcstnet3` -- see CLAUDE.md; the two envs are not co-installed) never needs
-the other backend's dependencies importable at all.
+(AIFS-single-2.0/PyTorch -> FourCastNet3/PyTorch, September 2026), then
+extended with a third backend, Microsoft Aurora (AuroraV1p5, also September
+2026). A single top-level `exp['model_backend']` config key ('aifs', 'fcn3',
+or 'aurora') now selects the forecast model at runtime;
+`backends/aifs/`/`backends/fcn3/`/`backends/aurora/` hold each backend's
+model/grid/IC-fetching modules, imported LAZILY (inside the function that
+needs them, never at this module's top level) so that a process running
+with only one backend's conda env active (`aifs2` vs `fcstnet3` vs `aurora`
+-- see CLAUDE.md; the three envs are not co-installed) never needs the
+other backends' dependencies importable at all.
 
-Both backends implement `forecast_model.LatentForecastModel` with no
+All three backends implement `forecast_model.LatentForecastModel` with no
 interface violations (see forecast_model.py) and share almost all of this
 file unchanged -- `get_psobs`, `get_surface_pressure`, `preduce`,
 `_interp_decoded`, `save_trajectory_diagnostics`, `save_xr_trajectory`,
 `save_inputs_pkl`/`_nc`, `make_forecasts` are all backend-agnostic, built
 entirely on `model.advance`/`model.decode_state`/`model.n_points`/
 `model.lats`/`model.lons`/`model._levels_by_base`/`model._single_by_base`/
-`model.wrap_state`, which both backends implement with the same names/
-shapes. The control variable in both is a one-time LATENT-space increment
-injected as a forcing at the first rollout step (see
+`model.wrap_state`, which all three backends implement with the same
+names/shapes. The control variable in all three is a one-time LATENT-space
+increment injected as a forcing at the first rollout step (see
 `compute_loss_4dvar`'s docstring) -- never a physical-space perturbation --
 so `compute_optimal` always returns a state dated `window_start +
-dt_verif`, never `window_start` itself, for either backend.
+dt_verif`, never `window_start` itself, for any backend.
 
-Where the two backends genuinely differ, and how this file handles it:
+Where the three backends genuinely differ, and how this file handles it:
 
-  - **Packed-state tensor layout.** AIFS packs `(1, multi_step, n_points,
-    n_vars)` (`n_vars` trailing -- `model.state_layout == 'channels_last'`);
-    FCN3 packs `(1, n_vars, H, W)` (`n_vars` at dim 1 --
-    `model.state_layout == 'channels_first'`, since FCN3 has no history to
-    pack, `n_history == 0` is hard-enforced by the checkpoint). Anywhere
-    this file needs to broadcast a per-variable-column mask against the
-    packed state directly (`control_variables`, via `_resolve_control_mask`
-    / `_apply_control_mask`), it branches on `model.state_layout` rather
-    than assuming either packing.
+  - **Packed-state tensor layout.** AIFS and Aurora both pack
+    `(1, multi_step, n_points, n_vars)` (`n_vars` trailing --
+    `model.state_layout == 'channels_last'`; Aurora's `multi_step` is 2
+    lagged time levels, same convention as AIFS, just a different
+    `n_points`/`n_vars` count). FCN3 packs `(1, n_vars, H, W)` (`n_vars` at
+    dim 1 -- `model.state_layout == 'channels_first'`, since FCN3 has no
+    history to pack, `n_history == 0` is hard-enforced by the checkpoint).
+    Anywhere this file needs to broadcast a per-variable-column mask
+    against the packed state directly (`control_variables`, via
+    `_resolve_control_mask` / `_apply_control_mask`), it branches on
+    `model.state_layout` rather than assuming any one packing.
   - **Grid regularity.** AIFS's grid is an irregular N320 octahedral mesh,
     interpolated via a k-d-tree/inverse-distance scheme
-    (`aifs_grid.GridInterpolator`) with no alternative. FCN3's grid is a
-    regular 0.25 deg equiangular 721x1440 lat/lon grid, which additionally
-    supports an exact, ~50x-faster closed-form bilinear interpolator
-    (`fcn3_grid.BilinearGridInterpolator`, the default, selected via the
-    FCN3-only `grid_interp` config key).
+    (`aifs_grid.GridInterpolator`) with no alternative. FCN3's and Aurora's
+    grids are both regular 0.25 deg equiangular lat/lon grids (FCN3:
+    721x1440, including both poles; Aurora: 720x1440, `Batch.crop()` drops
+    the South Pole row), so both additionally support an exact,
+    ~50x-faster closed-form bilinear interpolator
+    (`fcn3_grid.BilinearGridInterpolator`, the default for either, selected
+    via the `grid_interp` config key -- Aurora deliberately reuses FCN3's
+    grid module rather than duplicating it, see `get_grid_interpolator`).
   - **`ps_operator`.** `'logpinterp'` (pressure-level geopotential search,
-    needing only 'z') works identically for both and is the default.
+    needing only 'z') works identically for all three and is the default.
     `'ps'` (native surface-pressure + t700/q700 station-pressure reduction)
-    is AIFS-only -- FCN3 has no native surface-pressure ('sp') channel at
-    all; `load_config` raises up front if `ps_operator: 'ps'` is set while
-    `model_backend: 'fcn3'`, rather than let it reach a deep `KeyError` on
-    a missing `decode_state` field.
-  - **`reset_skt_ocean`.** AIFS-only (`reset_skt_over_ocean`, below) --
-    FCN3 has no `skt`/`lsm` decode_state field at all (no
-    sea-surface-temperature-like prognostic channel, and its land-sea mask
-    is a static preprocessor input, not something `resolve_columns` can
-    find). `load_config` raises if this is set at all under
-    `model_backend: 'fcn3'`.
+    is currently AIFS-only in practice: FCN3 has no native surface-pressure
+    ('sp') decode_state field at all, so `load_config` raises up front if
+    `ps_operator: 'ps'` is set under `model_backend: 'fcn3'`. Aurora DOES
+    have a native 'sp' field (unlike FCN3) and this path may work for it in
+    principle, but it has only ever been exercised for AIFS -- `load_config`
+    raises for `model_backend: 'aurora'` too, until it's actually been
+    tested, rather than silently claim support that hasn't been verified.
+  - **`reset_skt_ocean`.** Supported for AIFS and Aurora (both have
+    `skt`/`lsm` decode_state fields -- Aurora's `lsm` was added to its
+    packed state specifically to support this). FCN3 has no equivalent at
+    all (no sea-surface-temperature-like prognostic channel, and its
+    land-sea mask is a static preprocessor input, not something
+    `resolve_columns` can find); `load_config` raises if this is set at all
+    under `model_backend: 'fcn3'`.
   - **FCN3's stochastic noise.** FCN3 is a stochastic/ensemble model run
     deterministically by design: a fixed noise realization must be
     RE-PRIMED (reset) before every independent rollout a later comparison
@@ -71,17 +82,32 @@ Where the two backends genuinely differ, and how this file handles it:
     epoch inside `compute_optimal`'s AdamW loop (confirmed necessary, not
     just tidy, by the FCN3 model-backend smoke test: without it, every
     epoch sees a different, uncorrelated noise draw and AdamW chases a
-    moving target instead of optimizing a well-defined loss surface). AIFS
-    has no stochastic input; `AIFSModel._prime_noise()` is a no-op so every
-    `model._prime_noise()` call site in this file (three: before
-    `ref_state1`, the top of each AdamW epoch, before the final analysis
-    materialization) needs no backend conditional at all. **Not every
-    forward-pass call site re-primes** -- only ones that directly affect
-    optimization well-definedness or the reported "best" state.
-    Diagnostic/forecast call sites (`compute_ps_observation_hx`,
-    `make_forecasts`, the driver's z500 before/after check) do not, and
-    (for FCN3) their exact run-to-run noise reproducibility has not been
-    separately audited.
+    moving target instead of optimizing a well-defined loss surface).
+    Neither AIFS nor Aurora has any stochastic input; both models'
+    `_prime_noise()` is a no-op, so every `model._prime_noise()` call site
+    in this file (three: before `ref_state1`, the top of each AdamW epoch,
+    before the final analysis materialization) needs no backend
+    conditional at all. **Not every forward-pass call site re-primes** --
+    only ones that directly affect optimization well-definedness or the
+    reported "best" state. Diagnostic/forecast call sites
+    (`compute_ps_observation_hx`, `make_forecasts`, the driver's z500
+    before/after check) do not, and (for FCN3) their exact run-to-run
+    noise reproducibility has not been separately audited.
+  - **Aurora's fp16-vs-bf16 autocast.** Aurora's `AuroraV1p5` runs its
+    encoder/backbone/decoder under `torch.autocast`; its own default dtype
+    (`float16`) was confirmed (2026-09-18) to produce a NaN gradient w.r.t.
+    `latent_increment` when backpropagating through a 16+ step chained
+    rollout, deterministically, from the all-zero initial increment --
+    `backends/aurora/aurora_model.py` now defaults to `bfloat16` instead
+    (see CLAUDE.md "Aurora 16-step divergence: root cause and fix"). Purely
+    an internal Aurora backend concern, invisible to this file, EXCEPT that
+    this file's own `torch.isfinite(loss)` check (before `.backward()`) is
+    not sufficient to catch this failure mode by itself -- a finite loss
+    does not guarantee a finite gradient, since a corrupted increment's
+    downstream obs terms get correctly QC-rejected as non-finite rather
+    than producing a NaN loss. `compute_optimal` also checks
+    `torch.isfinite(increment.grad)` right after `.backward()`, for any
+    backend, as a defense-in-depth backstop.
 
 Observations may be sampled finer than the model's 6h rollout step via a
 per-window `dt_obs` config key (hours, default `dt_verif`; must divide both
@@ -114,21 +140,22 @@ _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
 def _ensure_backend_on_path(backend):
     """Add `backends/<backend>/` to sys.path so that module's flat
-    `import forecast_model` / `import {aifs,fcn3}_grid` / etc. resolve --
-    idempotent, and never touches the OTHER backend's directory, so a
-    process that only ever calls the 'aifs' branch never needs 'fcn3's
-    dependencies importable (and vice versa)."""
+    `import forecast_model` / `import {aifs,fcn3,aurora}_grid` / etc.
+    resolve -- idempotent, and never touches any OTHER backend's
+    directory, so a process that only ever calls one backend's branch
+    never needs the other backends' dependencies importable."""
     d = os.path.join(_REPO_ROOT, 'backends', backend)
     if d not in sys.path:
         sys.path.insert(0, d)
 
 
 # decode_state produces both a base-name key and a NeuralGCM/AIFS-style alias
-# for a few families (see {AIFS,FCN3}Model.decode_state). `loss_variables` is
-# given in base names; the forward operator reads the aliases -- so a
-# time-interpolated field must be stored under both. 'sp' is AIFS-only (FCN3
-# has no native surface-pressure channel) but harmless to list unconditionally
-# here -- it's simply never populated in FCN3's decode_state output.
+# for a few families (see {AIFS,FCN3,Aurora}Model.decode_state).
+# `loss_variables` is given in base names; the forward operator reads the
+# aliases -- so a time-interpolated field must be stored under both. 'sp' is
+# AIFS/Aurora-only (FCN3 has no native surface-pressure channel) but
+# harmless to list unconditionally here -- it's simply never populated in
+# FCN3's decode_state output.
 _DECODE_ALIASES = {
     "z": ["geopotential"],
     "t": ["temperature"],
@@ -141,9 +168,12 @@ _DECODE_ALIASES = {
 # shared QC/setup in _compute_ps_observation_diagnostics_at_time reads it
 # unconditionally (`.device`, and the `interpolation_failed` finiteness
 # check on the obs-space geopotential) -- so 'ps', whose operator only needs
-# t/q/sp, is not listed with 'z' here. 'ps' is AIFS-only -- FCN3 has no
-# native surface-pressure channel; load_config() rejects
-# `model_backend: 'fcn3'` + `ps_operator: 'ps'` up front.
+# t/q/sp, is not listed with 'z' here. 'ps' is only exercised for AIFS in
+# practice -- FCN3 has no native surface-pressure channel at all, so
+# load_config() rejects `model_backend: 'fcn3'` + `ps_operator: 'ps'` up
+# front; Aurora DOES have a native 'sp' field but this path hasn't been
+# tested for it yet, so load_config() rejects
+# `model_backend: 'aurora'` + `ps_operator: 'ps'` too, for now.
 _PS_OPERATOR_REQUIRES = {
     "logpinterp": {"z"},
     "ps": {"t", "q", "sp"},
@@ -265,8 +295,8 @@ def get_window(exp, window, windows):
     exp['n_verif'] = windows[window]['n_verif']
     # dt_obs: observation sampling interval in hours. Defaults to dt_verif
     # (one obs time per 6h model step). Must divide both dt_verif and the
-    # model's 6h timestep (both backends' checkpoints use the same 6h step)
-    # so an obs is always bracketed by two adjacent 6h model states.
+    # model's 6h timestep (all three backends' checkpoints use the same 6h
+    # step) so an obs is always bracketed by two adjacent 6h model states.
     dt_obs = windows[window].get('dt_obs', dt_verif)
     if dt_verif % dt_obs != 0 or 6 % dt_obs != 0:
         raise ValueError(
@@ -345,13 +375,14 @@ def get_model(exp):
 
 def get_grid_interpolator(model, exp):
     """AIFS's irregular N320 octahedral grid always uses the k-d-tree/k-NN
-    approach (no alternative exists). FCN3's regular grid defaults to the
-    exact, ~50x-faster BilinearGridInterpolator -- see fcn3_grid.py's
-    module docstring and verify_bilinear_grid_interp.py (in the original
-    long-window-4dvar-fcstnetv3 repo) for the ported-from-NeuralGCM math and
-    the correctness/speed checks. `grid_interp: 'kdtree'` in the config
-    falls back to the k-d-tree implementation for FCN3 too (kept as an A/B
-    check; there's no reason to use it for FCN3's regular grid)."""
+    approach (no alternative exists). FCN3's and Aurora's regular grids both
+    default to the exact, ~50x-faster BilinearGridInterpolator -- see
+    fcn3_grid.py's module docstring and verify_bilinear_grid_interp.py (in
+    the original long-window-4dvar-fcstnetv3 repo) for the
+    ported-from-NeuralGCM math and the correctness/speed checks.
+    `grid_interp: 'kdtree'` in the config falls back to the k-d-tree
+    implementation for either regular-grid backend too (kept as an A/B
+    check; there's no reason to use it for a regular grid)."""
     backend = exp['model_backend']
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
@@ -532,7 +563,7 @@ def get_verif(exp, model, logger, date_override=None):
 
 
 def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5):
-    """AIFS ONLY -- never called for FCN3 (load_config rejects
+    """AIFS and Aurora only -- never called for FCN3 (load_config rejects
     `reset_skt_ocean: True` under `model_backend: 'fcn3'` up front, since
     FCN3 has no `skt`/`lsm` decode_state field at all).
 
@@ -557,8 +588,10 @@ def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5):
     levels and across the whole rollout), so no extra fetch is needed for
     the mask -- only `skt`'s replacement values come from `verif_ic`.
 
-    Indexes AIFS's `(1, multi_step, n_points, n_vars)` ('channels_last')
-    packing directly -- this function is only ever reachable for AIFS, so it
+    Indexes the `(1, multi_step, n_points, n_vars)` ('channels_last')
+    packing directly -- this function is only ever reachable for AIFS or
+    Aurora (both use this same layout, just with different `n_points`/
+    `n_vars` counts; see this module's docstring), never FCN3, so it
     doesn't need to branch on `model.state_layout` the way backend-agnostic
     code in this file does.
     """
@@ -780,8 +813,10 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
 
     ps_operator = exp.get('ps_operator', 'logpinterp')
     if ps_operator == 'ps':
-        # AIFS ONLY -- unreachable for FCN3 (load_config rejects this
-        # combination up front; see module docstring).
+        # AIFS ONLY in practice -- unreachable for FCN3 (no native 'sp' at
+        # all) and currently also blocked for Aurora (has a native 'sp',
+        # but this path hasn't been tested for it yet); load_config()
+        # rejects both combinations up front, see module docstring.
         nlev700 = exp['nlev700']
         plevs = torch.as_tensor(model.pressure_levels('z'), device=device)
         tpress = plevs[nlev700]
@@ -1047,8 +1082,9 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     effect -- and hence its gradient -- is confined to the controlled
     variables. Non-controlled variables still evolve freely on steps 2..N.
     Broadcast against the packed state via `_apply_control_mask`, which
-    branches on `model.state_layout` (FCN3 and AIFS pack `n_vars` at
-    different tensor dims).
+    branches on `model.state_layout` (FCN3 packs `n_vars` at a different
+    tensor dim than AIFS/Aurora, which share the same 'channels_last'
+    layout -- see module docstring).
 
     Sub-6h obs: the rollout is one 6h model step at a time (`n_steps` total).
     Obs slot `j` is bracketed by steps `step_lo[j]` and `step_lo[j]+1` with
@@ -1145,12 +1181,23 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
 def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger):
     """Optimize a latent-space increment against the ps obs.
 
-    Neither backend's encoder/decoder can produce a corrected t=0 physical
-    state from a latent-space increment -- it is only ever injected as a
-    one-time forcing at the model's first forward step, so the earliest a
-    corrected physical state exists is `input_encoded.date + dt_verif
-    hours`. This therefore returns a state dated at `input_encoded.date +
-    dt_verif`, NOT at `input_encoded.date` -- callers
+    No backend's encoder/decoder is used to produce a corrected t=0
+    physical state from a latent-space increment -- it is only ever
+    injected as a one-time forcing at the model's first forward step, so
+    the earliest a corrected physical state exists is
+    `input_encoded.date + dt_verif hours`. (AIFS and FCN3 were both
+    checked directly for whether an earlier injection point could exist at
+    all -- AIFS's decoder structurally cannot, since it only ever produces
+    a residual onto the most recent input state, never a t=0
+    reconstruction; FCN3's t=0 reconstruction path was tested empirically
+    and found badly damped/biased, ~7-9x worse than a real 6h step, since
+    `decode()` was never trained downstream of anything but the processor
+    step -- see CLAUDE.md. Aurora has not been separately investigated;
+    the same `t+timestep` injection point is used uniformly for all three
+    backends by design, not because it has been confirmed to be the only
+    option for each one.) This therefore returns a state dated at
+    `input_encoded.date + dt_verif`, NOT at `input_encoded.date` --
+    callers
     (`save_trajectory_diagnostics`, the driver's cycling loop,
     `printz500err`) all use its `.date` rather than assuming it matches the
     background's. Also saves `*_latent_increment_*.pt` for offline
@@ -1176,8 +1223,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     # compute_loss_4dvar). `ref_state1` -- the detached uncorrected first-step
     # forecast the masked-out columns revert to -- is built once here.
     # n_vars's position in the packed state depends on model.state_layout
-    # (dim 1 for FCN3's 'channels_first', the trailing dim for AIFS's
-    # 'channels_last').
+    # (dim 1 for FCN3's 'channels_first', the trailing dim for AIFS's and
+    # Aurora's shared 'channels_last').
     n_vars = (input_encoded.state.shape[1] if model.state_layout == 'channels_first'
               else input_encoded.state.shape[-1])
     keep_mask = _resolve_control_mask(model, exp, n_vars, device)

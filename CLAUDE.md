@@ -610,21 +610,112 @@ probe, not guessed at.
   gradient-finiteness guard was never triggered during this run (the
   primary bf16 fix was sufficient on its own), consistent with it being a
   backstop rather than the actual fix.
-- **Not yet done**: the real 5-day/100-epoch single-cycle test this
-  investigation was blocking (`config_aurora_5day_100it.yml`) has not
-  been re-run with the fix yet -- the 3-epoch/16-step bisection config
-  above is a targeted confirmation that the specific failure mode is
-  gone, not a full validation of that longer run's `learn_rate`/epoch
-  count. Diagnostic configs from this investigation
+- Diagnostic configs from this investigation
   (`config_aurora_bisect_{4,8,12,16}.yml`, `_16_scale.yml`, `_16_nocp.yml`,
   `_16_ctrlvars.yml`, `_16_bf16` reuses the plain `_16.yml`) and
   `probe_aurora_nan.py` are left uncommitted/untracked for now, pending a
   decision on whether to keep any as regression checks.
 
+## First real production-scale Aurora single-cycle run (2026-09-19)
+
+With the bf16 fix in place, re-ran the real 5-day/100-epoch single-cycle
+test this whole investigation was blocking (`config_aurora_5day_100it.yml`
+-- 48h back-forecast, `n_verif: 20`/`dt_verif: 6` = a 5-day/21-slot window,
+`learn_rate: 2.5e-3`, `max_epoch: 100`, job 21716154). Completed cleanly,
+`sacct` exit code `0:0`, no errors, no collapse at any point.
+
+- **Optimization**: `Jtot` decreased smoothly and substantially across all
+  100 epochs -- 303113 -> 143514 (epoch 10) -> 98332 (epoch 20) -> 64169
+  (epoch 40) -> 54856 (epoch 60) -> 50000 (epoch 80) -> 48292 (epoch 100),
+  an 84% reduction overall, with the normal AdamW cold-start-then-flatten
+  shape (occasional small uphill wobbles near convergence, never a
+  collapse). Real, varying, sensible obs-used counts at every one of the
+  21 six-hourly slots throughout the entire run (e.g. final epoch: 8922 -
+  10211 obs used per slot out of 9112-10428 available).
+- **z500 diagnostic** (NH/tropics/SH/global RMS error, m^2/s^2 / GRAV):
+  ```
+  bg(t0)  2015-01-01T00:  7.89  3.42  8.11  6.78
+  before  2015-01-01T06:  9.00  3.07  9.59  7.74
+  after   2015-01-01T06:  9.30  5.39 10.24  8.53
+  ```
+  The analysis is slightly WORSE than the uncorrected background in every
+  region (global 7.74 -> 8.53) after this real, fully-converged 100-epoch
+  optimization -- not a pipeline bug (the ps-obs cost function itself
+  converged correctly and substantially), but the same "ps-obs-only 4D-Var
+  doesn't automatically improve z500, especially with an untuned
+  learn_rate" finding already documented at length for both AIFS's and
+  FCN3's own early tuning passes (see FCN3's `config_test.yml` run above
+  and the AIFS repo's own CLAUDE.md `learn_rate` history). This is the
+  first real (non-toy, fully-converged) result for Aurora specifically --
+  worth reporting honestly, not the pipeline's fault, but a real open
+  tuning question, same as for the other two backends.
+- All diagnostic files saved without error in
+  `output/test_aurora_5d_48h_100it/`: `*_latent_increment_120h_100it.pt`
+  (1.06GB -- matches the `(259200, 1024)` latent shape's byte count
+  exactly), `*_loss_latent_120h_100it.json`,
+  `*_observation_diagnostics_120h_100it.nc`,
+  `*_control_forecast_120h_100it.nc`/`*_optimal_forecast_120h_100it.nc`
+  (~4.3-4.6GB each -- the full 21-step decoded trajectory at Aurora's
+  native 720x1440 resolution), `*_control_inputs_120h_100it.nc`/`.pkl` and
+  `*_optimal_inputs_120h_100it.nc`/`.pkl`, `*_loss_120h_100it.txt`.
+- **Not yet done**: `learn_rate`/`max_epoch`/window-length tuning for
+  Aurora specifically (this run used the same untuned values carried over
+  from the earlier smoke test), `restart`/multi-cycle runs, and a
+  profiling pass to look for speedups (Aurora's ~100s/epoch for this
+  20-step window is noticeably slower than AIFS's own ~18-25s/epoch for a
+  matched window -- see "Known gaps" below for the planned optimization
+  experiments).
+
 ## Known gaps / next steps
 
-- No production-length (multi-day, many-epoch) run of either backend
-  through this repo yet -- only the two 12h/5-epoch smoke tests above.
+- **Aurora per-epoch runtime optimization (planned, not yet run)**: Aurora's
+  ~100s/epoch for the 20-step/5-day window above is ~4-5x AIFS's own
+  ~18-25s/epoch for a matched window -- a similar ratio to FCN3's own
+  already-investigated (and found largely structural) 5.2x gap. Concrete,
+  evidence-based candidates to test, in priority order:
+  1. **Profile first** (`torch.profiler` on a short 2-4 step differentiable
+     rollout, same methodology as FCN3's `profile_fcn3_rollout.py`) --
+     get an operator-level breakdown before assuming anything.
+  2. **Disable `use_fp16_safe_attention`** (pass
+     `use_fp16_safe_attention=False` to `AuroraV1p5()` in
+     `aurora_model.py`). `AuroraV1p5` defaults this to `True`, which
+     replaces PyTorch's fast fused/flash `scaled_dot_product_attention`
+     kernel with a manual, non-fused matmul-based fallback
+     (`fp16_safe_scaled_dot_product_attention` in `aurora/model/util.py`)
+     whose only purpose is clamping attention weights to prevent fp16
+     overflow -- gated explicitly on `attn_weight.dtype == torch.float16`
+     (confirmed by reading the source). Now that the backend runs under
+     `bfloat16` (see "Aurora 16-step divergence" above), that clamp never
+     fires, so this flag is currently paying for a slower attention path
+     for zero benefit.
+  3. **Re-test removing the outer per-step `torch.utils.checkpoint`**
+     (`checkpoint_stride: 0`). Before the bf16 fix this test was
+     confounded by the NaN collapse (identical signature regardless of
+     the setting, see "Aurora 16-step divergence" above), so its
+     memory/timing effect was never actually measured. Aurora's own
+     internal `configure_activation_checkpointing()` (per-Swin3D-block)
+     is already required for memory -- the wrapper's *additional* outer
+     per-step checkpoint may be redundant double-checkpointing on top of
+     that. Worth checking whether the internal one alone fits in memory
+     without the outer one, now that a real test isn't confounded by the
+     unrelated NaN bug.
+  4. **Set `torch.backends.cudnn.benchmark = True`** in `AuroraModel.__init__`
+     -- cheap, standard win given identical shapes are run repeatedly
+     across ~2000+ forward/backward calls (100 epochs x 20 steps) in a
+     typical experiment; not currently set anywhere in `aurora_model.py`.
+  5. **`torch.compile`** as a stretch goal -- higher payoff potential given
+     the huge repeat-call count, but real integration risk with
+     checkpointing and the forward-hook used for latent injection; worth
+     a dedicated, isolated experiment rather than bundling with the above.
+  Honest caveat: Aurora is a full-resolution (721x1440, ~2x AIFS's mesh
+  point count) transformer, while AIFS is a sparser graph-based
+  encoder/processor/decoder -- some of the gap is likely structural
+  rather than tuning, the same conclusion already reached for FCN3's own
+  DISCO-conv cost. Treat "close most of the gap" as the realistic goal.
+- No production-length (multi-day, many-epoch) run of AIFS or FCN3 through
+  this repo yet -- only the two 12h/5-epoch smoke tests above (Aurora now
+  has one, see "First real production-scale Aurora single-cycle run"
+  above).
 - `restart: True` cycling and `n_init > 1` are unexercised here (they were
   validated in each source repo separately, but the merge's dispatch logic
   around them has not been re-checked).
