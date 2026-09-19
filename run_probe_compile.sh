@@ -26,4 +26,4 @@ conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/aurora
 # ic_cache/ directory must already be warmed from a login node before this
 # job runs (see backends/aurora/aurora_prefetch_checkpoint.py for the
 # separate checkpoint-fetch step, also login-node-only).
-python -u probe_aurora_compile.py
+python -u backends/aurora/probe_aurora_compile.py

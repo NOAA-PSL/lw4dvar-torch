@@ -28,13 +28,18 @@ and the script moves on to see if later increments behave differently
 to map out exactly where it breaks, if it does).
 """
 import datetime
+import os
 import sys
 import time
 import traceback
 
 import torch
 
-sys.path.insert(0, "backends/aurora")
+# aurora_model.py itself does `import forecast_model`, a repo-root module
+# -- needs the repo root on sys.path (aurora_ic/aurora_model themselves
+# resolve fine via sys.path[0], this script's own directory).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
 import aurora_ic
 import aurora_model
 

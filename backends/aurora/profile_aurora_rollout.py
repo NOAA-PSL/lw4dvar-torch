@@ -12,12 +12,16 @@ Runs on GPU, in the `aurora` conda env. Uses a real ERA5-derived IC
 (non-degenerate) input. steps=4 (enough to see steady-state per-step cost
 without paying for a full 20-step run).
 """
-import sys
-sys.path.insert(0, ".")
-sys.path.insert(0, "backends/aurora")
-
 import datetime
+import os
+import sys
+
 import torch
+
+# aurora_model.py itself does `import forecast_model`, a repo-root module
+# -- needs the repo root on sys.path (aurora_ic/aurora_model themselves
+# resolve fine via sys.path[0], this script's own directory).
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 import aurora_ic
 import aurora_model
