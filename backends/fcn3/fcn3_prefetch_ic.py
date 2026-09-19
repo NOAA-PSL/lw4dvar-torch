@@ -1,0 +1,104 @@
+"""
+Warm the ERA5 IC/verification cache (fcn3_ic.py) for a planned
+long_window_4dvar.py run, BEFORE submitting the job to the (offline) H100
+partition via run_long_window_4d.sh.
+
+get_input()/get_verif() fetch from CDS (needs internet); the H100 compute
+nodes have none. Run this from a login node first:
+
+    conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/fcstnet3
+    python -u fcn3_prefetch_ic.py
+    sbatch run_long_window_4d.sh
+
+Fetches, in order:
+  - (non-restart only) the initial "nhrs_back"-hours-before-sdate state
+    (only needed once, for k=0's get_input() -- subsequent cycles advance the
+    previous analysis forward with the model instead of fetching a new IC)
+  - one single-date verification state per DA cycle (get_verif() is called
+    for every cycle/window, always at that cycle's `date`)
+Both are written to `ic_cache/` (or `exp.ic_cache`, if set), matching exactly
+what long_window_4dvar.py will look for -- a warm cache means the actual job
+never touches the network.
+
+For a restart run (`restart: True`) the driver reads the analysis pkl named
+`<sdate>_optimal_inputs_*` and then advances `date` by `dt_init` *before* its
+first get_verif() -- so the verification states it needs run from
+`sdate + dt_init` through `sdate + n_init*dt_init`, not from `sdate`. This
+script mirrors that shift; no initial IC is fetched (restart doesn't build one).
+
+For the latent-space update the driver also scores its z500 before/after
+diagnostic at `cycle_date + dt_verif` (where the latent analysis is actually
+valid), so this script additionally fetches ERA5 truth there for every cycle
+and window `dt_verif`. When `dt_verif == dt_init` these coincide with the next
+cycle's date -- only the trailing one past the last cycle is genuinely new.
+
+Ported unchanged in structure from the AIFS repo's aifs_prefetch_ic.py --
+only the module-level fetch call (fcn3_ic.read_single_date_fields, keyed by
+date alone, no `lagged` flag -- FCN3 has no lagged time levels to fetch a
+different shape for) differs.
+"""
+
+import os
+import sys
+from datetime import datetime, timezone
+
+# This script lives in backends/fcn3/, but long_window_4dvar_utils.py
+# lives at the repo root -- running it as `python backends/fcn3/
+# fcn3_prefetch_ic.py` sets sys.path[0] to backends/fcn3/ (Python's
+# standard behavior: the script's OWN directory, never the caller's cwd),
+# so the repo root needs to be added explicitly or `import
+# long_window_4dvar_utils` fails with ModuleNotFoundError (confirmed by
+# direct test, 2026-09-19 -- see CLAUDE.md "Login-node ERA5 prefetch
+# scripts, and a sys.path bug they share"). Didn't exist in the original
+# single-backend repo, where this script lived at the repo root alongside
+# long_window_4dvar_utils.py itself.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+
+import fcn3_ic
+import long_window_4dvar_utils as utils
+
+logger = utils.get_logger()
+
+exp_config, windows = utils.load_config()
+cache_dir = exp_config.get('ic_cache', exp_config['path_output'] + 'ic_cache/')
+
+logger.info('loading FCN3 checkpoint (device=cpu; only used for its variable/grid metadata here)...')
+exp_config_cpu = dict(exp_config)
+exp_config_cpu['device'] = 'cpu'
+model = utils.get_model(exp_config_cpu)
+nhrs_back = exp_config['nhrs_back']
+if len(sys.argv) > 1:
+    date = sys.argv[1]
+    n_init = int(sys.argv[2])
+else:
+    date = exp_config['sdate']
+    n_init = exp_config['n_init']
+
+if not exp_config['restart']:
+    back_date = utils.add_hours(date, -nhrs_back)
+    logger.info(f'prefetching initial condition: {back_date}')
+    back_dt = datetime.strptime(back_date, '%Y-%m-%dT%H').replace(tzinfo=timezone.utc)
+    fcn3_ic.read_single_date_fields(back_dt, cache_dir)
+else:
+    # driver's restart branch advances `date` by dt_init before its first
+    # get_verif() -- match that so the fetched verif dates line up.
+    date = utils.add_hours(date, exp_config['dt_init'])
+    logger.info(f'restart: verification states run from {date} '
+                f'(sdate + dt_init) through {utils.add_hours(date, (n_init - 1) * exp_config["dt_init"])}')
+
+# latent-space update needs ERA5 truth at cycle_date + dt_verif for each
+# window (its z500 before/after diagnostic is scored there).
+dt_verifs = sorted({w['dt_verif'] for w in windows.values()})
+
+for k in range(n_init):
+    logger.info(f'prefetching verification state {k + 1}/{n_init}: {date}')
+    date_dt = datetime.strptime(date, '%Y-%m-%dT%H').replace(tzinfo=timezone.utc)
+    fcn3_ic.read_single_date_fields(date_dt, cache_dir)
+    for dv in dt_verifs:
+        shifted = utils.add_hours(date, dv)
+        logger.info(f'  + z500-diagnostic truth: {shifted} (cycle date + dt_verif {dv}h)')
+        shifted_dt = datetime.strptime(shifted, '%Y-%m-%dT%H').replace(tzinfo=timezone.utc)
+        fcn3_ic.read_single_date_fields(shifted_dt, cache_dir)
+    date = utils.add_hours(date, exp_config['dt_init'])
+
+logger.info('prefetch complete.')

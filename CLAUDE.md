@@ -666,51 +666,155 @@ test this whole investigation was blocking (`config_aurora_5day_100it.yml`
   matched window -- see "Known gaps" below for the planned optimization
   experiments).
 
+## Login-node ERA5 prefetch scripts, and a sys.path bug they share (2026-09-19)
+
+`aifs_prefetch_ic.py`/`fcn3_prefetch_ic.py` were copied in from their
+single-backend source repos into `backends/{aifs,fcn3}/`; added
+`backends/aurora/aurora_prefetch_ic.py` as the analogous third script
+(same structure, differing only in the initial-IC fetch:
+`aurora_ic.build_input_state`, which fetches TWO lagged dates the same way
+`aifs_ic.fetch_era5_grib(..., lagged=True)` does, vs. FCN3's single
+time-level fetch). Verified end-to-end against `config_test_aurora.yml`
+(temporarily symlinked to `config.yml`, its own driver-default lookup
+convention) -- correctly fetched the lagged initial-condition pair, the
+verification state, and the z500-diagnostic-truth date, all served from
+cache with no network hit.
+
+**Found a real bug in this process, not specific to Aurora**: all three
+scripts do `import long_window_4dvar_utils as utils` at the top, but
+`long_window_4dvar_utils.py` lives at the repo ROOT while these scripts now
+live in `backends/<name>/`. Running a script as `python backends/fcn3/
+fcn3_prefetch_ic.py` sets `sys.path[0]` to the script's OWN directory
+(`backends/fcn3/`) -- Python's standard behavior, independent of the
+caller's current working directory -- so `import long_window_4dvar_utils`
+fails with `ModuleNotFoundError`, confirmed by direct test. This didn't
+exist in the original single-backend repos, where these scripts lived at
+the repo root alongside `long_window_4dvar_utils.py` itself. Fixed in
+`aurora_prefetch_ic.py`, and then applied the identical one-line fix to
+`aifs_prefetch_ic.py`/`fcn3_prefetch_ic.py` at the user's request:
+`sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__),
+'..', '..')))` before the `long_window_4dvar_utils`/backend-module imports,
+in all three scripts. **All three verified end-to-end** (real runs, not
+just import checks): FCN3 (`config_test_fcn3.yml`, non-restart branch) and
+Aurora (`config_test_aurora.yml`, non-restart branch) both ran cleanly
+against the shared `ic_cache/`; AIFS (`config_test_aifs.yml`, which
+happened to have `restart: True`) also ran cleanly, exercising the
+restart-branch date-shift logic as a bonus, against its own
+`long-window-4dvar-aifsv2/ic_cache/` (that config's own `ic_cache` setting,
+unrelated to the sys.path fix).
+
 ## Known gaps / next steps
 
-- **Aurora per-epoch runtime optimization (planned, not yet run)**: Aurora's
-  ~100s/epoch for the 20-step/5-day window above is ~4-5x AIFS's own
-  ~18-25s/epoch for a matched window -- a similar ratio to FCN3's own
-  already-investigated (and found largely structural) 5.2x gap. Concrete,
-  evidence-based candidates to test, in priority order:
-  1. **Profile first** (`torch.profiler` on a short 2-4 step differentiable
-     rollout, same methodology as FCN3's `profile_fcn3_rollout.py`) --
-     get an operator-level breakdown before assuming anything.
-  2. **Disable `use_fp16_safe_attention`** (pass
-     `use_fp16_safe_attention=False` to `AuroraV1p5()` in
-     `aurora_model.py`). `AuroraV1p5` defaults this to `True`, which
-     replaces PyTorch's fast fused/flash `scaled_dot_product_attention`
-     kernel with a manual, non-fused matmul-based fallback
-     (`fp16_safe_scaled_dot_product_attention` in `aurora/model/util.py`)
-     whose only purpose is clamping attention weights to prevent fp16
-     overflow -- gated explicitly on `attn_weight.dtype == torch.float16`
-     (confirmed by reading the source). Now that the backend runs under
-     `bfloat16` (see "Aurora 16-step divergence" above), that clamp never
-     fires, so this flag is currently paying for a slower attention path
-     for zero benefit.
-  3. **Re-test removing the outer per-step `torch.utils.checkpoint`**
-     (`checkpoint_stride: 0`). Before the bf16 fix this test was
-     confounded by the NaN collapse (identical signature regardless of
-     the setting, see "Aurora 16-step divergence" above), so its
-     memory/timing effect was never actually measured. Aurora's own
-     internal `configure_activation_checkpointing()` (per-Swin3D-block)
-     is already required for memory -- the wrapper's *additional* outer
-     per-step checkpoint may be redundant double-checkpointing on top of
-     that. Worth checking whether the internal one alone fits in memory
-     without the outer one, now that a real test isn't confounded by the
-     unrelated NaN bug.
-  4. **Set `torch.backends.cudnn.benchmark = True`** in `AuroraModel.__init__`
-     -- cheap, standard win given identical shapes are run repeatedly
-     across ~2000+ forward/backward calls (100 epochs x 20 steps) in a
-     typical experiment; not currently set anywhere in `aurora_model.py`.
-  5. **`torch.compile`** as a stretch goal -- higher payoff potential given
-     the huge repeat-call count, but real integration risk with
-     checkpointing and the forward-hook used for latent injection; worth
-     a dedicated, isolated experiment rather than bundling with the above.
-  Honest caveat: Aurora is a full-resolution (721x1440, ~2x AIFS's mesh
-  point count) transformer, while AIFS is a sparser graph-based
-  encoder/processor/decoder -- some of the gap is likely structural
-  rather than tuning, the same conclusion already reached for FCN3's own
+- **Aurora per-epoch runtime optimization (in progress, 2026-09-19)**:
+  Aurora's ~100s/epoch for the 20-step/5-day window above is ~4-5x AIFS's
+  own ~18-25s/epoch for a matched window -- a similar ratio to FCN3's own
+  already-investigated (and found largely structural) 5.2x gap. Status of
+  each candidate:
+  - **`use_fp16_safe_attention=False` -- TESTED, REJECTED (real crash, not
+    just a non-improvement).** The hypothesis (disabling `AuroraV1p5`'s
+    default fp16-overflow-safe manual attention fallback in favor of
+    PyTorch's fast fused/flash `scaled_dot_product_attention`, now that
+    `autocast_dtype=bfloat16` makes the fp16-only clamp a no-op) looked
+    sound on paper but is **not safe on this stack**: setting it produces
+    a deterministic `CUDA error: an illegal memory access was encountered`
+    during `.backward()`, reproduced independently on two separate GPUs at
+    `steps=4` (not a flaky node -- both `profile_aurora_rollout.py` and
+    `probe_aurora_checkpoint.py` hit it identically). Reverting only this
+    flag back to `True` (keeping `autocast_dtype=bfloat16` and
+    `cudnn.benchmark=True`) fixed it immediately (`probe_aurora_checkpoint.py
+    --steps 4`: `OK peak=39.05GiB time=53.73s`). Most likely cause: Swin3D's
+    unusual windowed-attention tensor shapes hit an edge case in the
+    installed PyTorch/CUDA build's fused-attention backward kernel,
+    independent of dtype -- this is a real kernel-compatibility bug, not a
+    numerical-safety tradeoff. **Left at the upstream default (`True`) in
+    `aurora_model.py`.** Do not re-attempt without first confirming a
+    working fused SDPA backward for this exact shape/PyTorch/CUDA
+    combination.
+  - **`torch.backends.cudnn.benchmark = True`** -- applied in
+    `AuroraModel.__init__` (device=='cuda' branch, alongside the existing
+    `allow_tf32` settings). Confirmed NOT implicated in the crash above
+    (the fix-isolation test kept this `True` and succeeded), so it stays
+    on. Not yet separately verified to give a measurable speedup on its
+    own (Aurora's Swin3D architecture is attention/matmul-heavy, less
+    conv-bound than FCN3's DISCO kernels, so the benefit may be small) --
+    a real profiling run will show whether it matters.
+  - **Profiling -- DONE, points at kernel-launch overhead, not raw
+    compute.** (`torch.profiler` on a 4-step differentiable rollout via
+    `profile_aurora_rollout.py`, same methodology as FCN3's
+    `profile_fcn3_rollout.py`.) Self CUDA time total: 17.43s of GPU-busy
+    time against ~50s of wall clock for the same 4 steps (see the
+    checkpoint-redundancy table above) -- a large gap, and the profiler's
+    own CPU-side numbers point at why: **"Command Buffer Full" (a
+    GPU-command-queue-backpressure marker, not a real kernel) consumes
+    31.6% of total CPU time (9.9s)**, meaning the CPU spends a third of
+    its time simply blocked waiting for queue space to submit more work --
+    the classic symptom of issuing too many small kernel launches rather
+    than being compute-bound. Consistent with this: `aten::copy_` alone
+    (30502 calls, just for 4 steps) is the single largest NAMED op by self
+    CUDA time (27.4%), and `aten::roll` (Swin's window-shift for windowed
+    attention, pure data movement, zero FLOPs) is another 7.8% at 4650
+    calls -- copy/roll/reshape/clone/dtype-cast bookkeeping together are a
+    large fraction of total GPU time, not the matmul/attention compute
+    itself (`aten::addmm` -- real Linear-layer compute -- is "only" 17.0%,
+    `aten::bmm` -- attention's core QK^T/AV matmuls -- is 9.6%).
+    - **This session's own coarse auto-categorization undercounted
+      attention specifically** -- worth noting as a methodology gap, not
+      just a result: it bucketed by op-name substrings including
+      `"attention"`/`"sdpa"`/`"flash"`, but Aurora runs with
+      `use_fp16_safe_attention=True` (see above -- the fused/flash kernel
+      crashes on this stack), so attention is computed via the manual
+      fallback (`fp16_safe_scaled_dot_product_attention`), which
+      decomposes into plain `bmm`/`mul`/`clamp`/elementwise ops with no
+      "attention" in their names -- these landed in the auto-categorizer's
+      57.6% "other" bucket along with backward-pass ops
+      (`ClampBackward1`/`MulBackward0`) and the `full_rollout_fwd`
+      record_function marker's own 21.2%-self-CUDA entry (itself likely a
+      profiler accounting artifact of the region boundary, not a discrete
+      kernel -- not meaningful as a standalone cost). Don't trust the
+      auto-categorizer's percentages as attention-vs-everything-else; read
+      the raw top-25-by-name table instead, as done above.
+    - **Practical implication**: this reframes `torch.compile` from a
+      speculative stretch goal to the best-targeted remaining lever --
+      kernel fusion (fewer, larger kernel launches) directly attacks the
+      "Command Buffer Full" stall and the copy/roll/reshape overhead in a
+      way none of the flag-toggle fixes above can. Still genuinely risky
+      given the confirmed fused-SDPA-kernel incompatibility on this exact
+      PyTorch/CUDA stack (`use_fp16_safe_attention=False` section above) --
+      a compiled graph recognizing the same attention pattern could
+      plausibly try to lower to a similarly problematic kernel, though
+      compiling the already-in-use manual fallback path (rather than the
+      native SDPA call) is a meaningfully different and probably safer
+      starting point. Not yet attempted.
+  - **Outer per-step `torch.utils.checkpoint` redundancy -- TESTED, a real
+    tradeoff, not a clear win.** (`probe_aurora_checkpoint.py`/
+    `run_probe_aurora_checkpoint.sh`, sweeping `outer_checkpoint` on/off at
+    steps in {4, 8, 16, 20}, one-shot differentiable advance+backward per
+    trial, fresh process each.) Disabling the wrapper's outer per-step
+    checkpoint (relying solely on Aurora's own internal per-Swin3D-block
+    checkpointing) gives a consistent ~13-14% speedup at every window
+    length tested, but at a real, growing memory cost:
+
+    | steps | outer ON (peak/time) | outer OFF (peak/time) |
+    |---|---|---|
+    | 4  | 39.05 GiB / 58.3s  | 41.10 GiB / 50.1s  |
+    | 8  | 45.81 GiB / 74.4s  | 51.27 GiB / 66.7s  |
+    | 16 | 59.35 GiB / 115.5s | 71.60 GiB / 100.5s |
+    | 20 | 66.12 GiB / 135.5s | 81.76 GiB / 117.2s |
+
+    At the real 20-step production window, disabling it drops headroom
+    before the H100's ~93 GiB ceiling from ~27 GiB to ~11 GiB -- a much
+    thinner margin, and one that would erode further at longer windows
+    (24-28 steps, as flagged for the other two backends' own "known gaps").
+    **Recommendation: keep `checkpoint_stride: 1` (the current default) for
+    production robustness**; `checkpoint_stride: 0` is a real, available
+    opt-in for shorter windows (<=16 steps, where memory stays comfortably
+    under ~72 GiB) where the ~13% speedup is worth the tighter margin --
+    not flipped as the new default here, since the memory cost is real and
+    the speedup alone doesn't come close to closing the ~4-5x gap to AIFS.
+  Honest caveat, unchanged: Aurora is a full-resolution (721x1440, ~2x
+  AIFS's mesh point count) transformer, while AIFS is a sparser graph-based
+  encoder/processor/decoder -- some of the gap is likely structural rather
+  than tuning, the same conclusion already reached for FCN3's own
   DISCO-conv cost. Treat "close most of the gap" as the realistic goal.
 - No production-length (multi-day, many-epoch) run of AIFS or FCN3 through
   this repo yet -- only the two 12h/5-epoch smoke tests above (Aurora now

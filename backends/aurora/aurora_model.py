@@ -153,7 +153,8 @@ class AuroraModel(forecast_model.LatentForecastModel):
     """
 
     def __init__(self, package_root: str, device: str = "cuda",
-                 autocast_dtype: torch.dtype = torch.bfloat16):
+                 autocast_dtype: torch.dtype = torch.bfloat16,
+                 use_fp16_safe_attention: bool = True):
         """
         Parameters
         ----------
@@ -180,10 +181,36 @@ class AuroraModel(forecast_model.LatentForecastModel):
             all-zero initial increment every time. `torch.bfloat16` has
             fp32's exponent range (~+-3.4e38), eliminating the overflow
             without losing the memory/speed benefit of reduced precision.
+        use_fp16_safe_attention : bool
+            `AuroraV1p5`'s own default is `True`, which replaces PyTorch's
+            fused/flash `scaled_dot_product_attention` kernel with a
+            manual, non-fused matmul-based fallback
+            (`fp16_safe_scaled_dot_product_attention` in
+            `aurora/model/util.py`) at every Swin3D attention call. Its
+            *documented* purpose is only clamping attention weights to
+            prevent fp16 overflow (gated explicitly on `attn_weight.dtype
+            == torch.float16`, confirmed by reading the source) -- which
+            looked, on paper, like dead weight now that `autocast_dtype`
+            defaults to `bfloat16` here. **Tested and found NOT safe to
+            disable** (2026-09-19, see CLAUDE.md "Aurora per-epoch runtime
+            optimization"): setting this to `False` produces a
+            deterministic `CUDA error: an illegal memory access was
+            encountered` during `.backward()`, reproduced independently on
+            two separate GPUs at `steps=4` (not a flaky node). PyTorch's
+            native fused SDPA kernel is apparently NOT just numerically
+            unsafe under fp16 for this checkpoint -- it is a genuine
+            crash on this backward path, at any autocast dtype, most
+            likely from Swin3D's unusual windowed-attention tensor shapes
+            hitting an edge case in the installed PyTorch/CUDA build's
+            fused-attention backward kernel. Left at the upstream default
+            (`True`) here; do not flip this without first confirming
+            whichever PyTorch/CUDA version is in use has a working fused
+            SDPA backward for this exact shape pattern.
         """
         if device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
 
         self._device = torch.device(device)
 
@@ -195,7 +222,10 @@ class AuroraModel(forecast_model.LatentForecastModel):
             k: torch.from_numpy(v[:-1, :]).to(self._device) for k, v in static_raw.items()
         }
 
-        self.wrapper = AuroraV1p5(autocast_dtype=autocast_dtype)
+        self.wrapper = AuroraV1p5(
+            autocast_dtype=autocast_dtype,
+            use_fp16_safe_attention=use_fp16_safe_attention,
+        )
         self.wrapper.load_checkpoint_local(f"{package_root}/{_CHECKPOINT_NAME}")
         self.wrapper = self.wrapper.to(self._device)
         self.wrapper.eval()
