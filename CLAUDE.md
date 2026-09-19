@@ -913,6 +913,25 @@ unrelated to the sys.path fix).
           if modest, amount of speedup left on the table by this gap.
         - Config kept (`config_aurora_5day_100it_compile.yml`) as the
           reference for reproducing this comparison.
+      - **Combining `compile_wrapper` with `checkpoint_stride: 0` (the
+        outer-checkpoint-disabled setting below) OOMs at the real 20-step
+        production window -- tested directly, not assumed.**
+        `probe_aurora_checkpoint.py` gained `--compile`/`--n_calls` flags
+        for exactly this combination; at `steps=20,
+        outer_checkpoint=False, compile=True` the very first call OOM'd
+        after 218.51s (`run_probe_checkpoint0_compile.sh`). Consistent
+        with the uncompiled finding below (disabling the outer checkpoint
+        alone already leaves only ~11 GiB of headroom at 20 steps,
+        66->82 GiB) -- compilation's own memory overhead (kernel fusion
+        can increase peak activation memory even as it reduces launch
+        count) pushes this specific combination over the ~93 GiB H100
+        ceiling. **Do not combine these two settings at the full
+        production window length** -- `compile_wrapper: True` is safe and
+        validated with the DEFAULT `checkpoint_stride: 1`; disabling the
+        outer checkpoint is a separate, narrower opt-in (steps <=16, see
+        below) that should not be combined with compilation at 20 steps
+        without first re-checking memory at whatever shorter window it's
+        used for.
   - **Outer per-step `torch.utils.checkpoint` redundancy -- TESTED, a real
     tradeoff, not a clear win.** (`probe_aurora_checkpoint.py`/
     `run_probe_aurora_checkpoint.sh`, sweeping `outer_checkpoint` on/off at
