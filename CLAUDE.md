@@ -932,6 +932,68 @@ unrelated to the sys.path fix).
         below) that should not be combined with compilation at 20 steps
         without first re-checking memory at whatever shorter window it's
         used for.
+      - **Full `checkpoint_stride` sweep (2026-09-19), and a sharper,
+        more surprising version of the finding above: with `compile_
+        wrapper: True`, ANY `checkpoint_stride` other than the default
+        `1` OOMs at the real 20-step window -- not just the fully-disabled
+        extreme.** `backends/aurora/probe_aurora_checkpoint_stride.py`
+        (new -- replicates `compute_loss_4dvar`'s exact per-step
+        `use_ckpt = (checkpoint_stride > 0) and (s % checkpoint_stride ==
+        0)` logic, since `AuroraModel.advance()` itself only takes one
+        `use_checkpoint` flag applied to every step of however many
+        `steps` are requested in one call; the actual per-step
+        alternation lives in the driver's own loop, not the model
+        wrapper) swept `checkpoint_stride` in {1, 2, 4, 5, 10, 20,
+        disabled} x {uncompiled, compiled} at `steps=20`:
+
+        | stride | steps checkpointed | uncompiled peak/time | compiled |
+        |---|---|---|---|
+        | 1 (default) | 20/20 | 66.12 GiB / 135.5s | **works** (1.78x, validated above) |
+        | 2 | 10/20 | 74.83 GiB / 127.1s | **OOM** (212.95s) |
+        | 4 | 5/20 | 79.08 GiB / 122.7s | **OOM** (97.2s) |
+        | 5 | 4/20 | 79.93 GiB / 121.7s | **OOM** (97.6s) |
+        | 10 | 2/20 | 81.62 GiB / 123.6s | **OOM** (96.7s) |
+        | 20 | 1/20 | 82.48 GiB / 119.0s | **OOM** (96.7s) |
+        | disabled | 0/20 | 81.76 GiB / 117.2s | **OOM** (218.5s) |
+
+        - **Uncompiled**: confirms the earlier stride=1/disabled
+          extremes' linear-interpolation estimate was quantitatively
+          accurate (stride=2 predicted ~74 GiB/~126s from the two
+          endpoints; measured 74.83 GiB/127.1s) but the true shape is NOT
+          linear -- it's front-loaded/diminishing-returns (most of the
+          66->82 GiB memory increase and 135.5->117.2s speedup is already
+          captured by stride=2, with stride=4 through disabled clustering
+          close together near the disabled extreme). All fit comfortably
+          under the ~93 GiB ceiling at every stride tested.
+        - **Compiled**: the surprising part. Given stride=2 alone
+          (uncompiled) leaves a comfortable ~18 GiB of margin (74.83 GiB
+          of 93), the working hypothesis going in was that SOME
+          intermediate stride might have enough headroom to survive
+          compilation's added memory cost. It doesn't -- every stride
+          tested above 1 OOMs, including stride=2. This means
+          compilation's own memory overhead at this window length is
+          large enough that it isn't a matter of finding the right
+          partial-checkpointing tradeoff -- **`checkpoint_stride: 1`
+          (full per-step checkpointing) is a hard requirement for using
+          `compile_wrapper: True` at the 20-step production window**, not
+          a spectrum to tune. (The two OOM-timing clusters -- stride=2 at
+          212.95s vs. stride>=4/disabled all around ~97-99s -- suggest
+          stride=2's extra checkpointed steps let it get further into the
+          computation, likely into backward's recompute phase, before
+          exhausting memory, while the others fail earlier; not
+          independently confirmed, a plausible reading of the timing
+          pattern rather than a traced root cause.)
+        - **Practical takeaway**: don't try to combine `compile_wrapper`
+          with a relaxed `checkpoint_stride` at the full production
+          window length -- use the validated combination
+          (`compile_wrapper: True` + default `checkpoint_stride: 1`,
+          1.78x real speedup) or, if the extra ~13% speedup from relaxing
+          `checkpoint_stride` matters more than compilation for some
+          run, use it uncompiled instead. Untested: whether a SHORTER
+          window (<=16 steps, where the uncompiled sweep already showed
+          more memory margin at every stride) would let some intermediate
+          stride survive compilation -- plausible given the mechanism,
+          not measured.
   - **Outer per-step `torch.utils.checkpoint` redundancy -- TESTED, a real
     tradeoff, not a clear win.** (`probe_aurora_checkpoint.py`/
     `run_probe_aurora_checkpoint.sh`, sweeping `outer_checkpoint` on/off at
