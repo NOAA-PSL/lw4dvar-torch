@@ -229,6 +229,23 @@ class AuroraModel(forecast_model.LatentForecastModel):
             steady-state speedup to amortize past that tax (a 100-epoch
             run comfortably clears this; a 3-5 epoch smoke test likely
             does not).
+
+            **Known crash on multi-cycle (`n_init > 1`) runs, 2026-09-20,
+            NOT YET ROOT-CAUSED -- do not use with `n_init > 1` until
+            this is understood.** `get_model()` (and hence this
+            `torch.compile()` call) happens ONCE per process, outside
+            `long_window_4dvar.py`'s `for k in range(n_init)` cycling
+            loop, so a multi-cycle run reuses the SAME compiled model
+            instance across every cycle's independent `compute_optimal`
+            call. A real 12-cycle run crashed during cycle 2's
+            `.backward()` (cycle 1 completed all 50 epochs cleanly) with
+            `RuntimeError: CUDA error: Invalid access of peer GPU memory
+            over nvlink or a hardware error`, raised from inside a
+            torch-inductor-generated kernel, not plain PyTorch/Python
+            code. See CLAUDE.md "Known gaps" for the full writeup and
+            what's still unverified (leading hypothesis: stale
+            inductor-cached buffer references from cycle 1 becoming
+            invalid once cycle 2 allocates fresh tensors, not confirmed).
         """
         if device == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True

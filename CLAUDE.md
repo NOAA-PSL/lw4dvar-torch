@@ -705,6 +705,54 @@ unrelated to the sys.path fix).
 
 ## Known gaps / next steps
 
+- **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
+  (`n_init > 1`) run -- a real bug, not yet root-caused (2026-09-20).**
+  First real multi-cycle Aurora experiment (`config_aurora_5day_50it.yml`,
+  `n_init: 12`, `restart: False`, `compile_wrapper: True`, job 21781560)
+  crashed during cycle 2's `.backward()` (cycle 1 completed all 50 epochs
+  cleanly; cycle 2 got to epoch ~14-15) with:
+  ```
+  RuntimeError: CUDA error: Invalid access of peer GPU memory over nvlink or a hardware error
+  ```
+  raised from inside a torch-inductor-generated kernel
+  (`torch_inductor/.../c3rj5....py:20074, buf911.copy_(...)`), not from
+  plain Python/PyTorch code. Every `compile_wrapper` validation so far
+  (the 1.78x speedup confirmation, the full `checkpoint_stride` sweep) was
+  SINGLE-cycle only -- `get_model()` (and hence the one-time
+  `torch.compile(self.wrapper)` call) happens ONCE, outside
+  `long_window_4dvar.py`'s `for k in range(n_init)` loop, so a multi-cycle
+  run reuses the SAME compiled model instance across every cycle's
+  independent `compute_optimal` call (fresh `increment` tensor, fresh
+  optimizer, fresh backward graph each time) -- this specific reuse
+  pattern was never exercised before this run.
+  - **Points away from a simple node hardware fault**: ran on `u22g14`,
+    the same node that had already completed several other
+    `compile_wrapper` jobs successfully earlier the same day (the
+    checkpoint_stride sweep, the compile-vs-uncompiled confirmation).
+    Not conclusive on its own (hardware faults can be intermittent), but
+    doesn't fit a simple "this node is broken" explanation either.
+  - **Leading hypothesis, not yet verified**: something about
+    torch.compile/inductor's cached kernels or captured buffer references
+    from cycle 1 becomes invalid once cycle 2 allocates fresh tensors
+    (`increment = torch.zeros(...)`, a new `AdamW` optimizer, etc.) --
+    consistent with the crash occurring right as a SECOND independent
+    optimization begins against the same compiled graph, not at any point
+    within cycle 1's own 50 epochs.
+  - **Workaround for now**: disable `compile_wrapper` for multi-cycle
+    (`n_init > 1`) runs -- user resubmitted `config_aurora_5day_50it.yml`
+    with `compile_wrapper: False` to unblock the actual science experiment
+    while this is investigated separately. Uncompiled multi-cycle Aurora
+    behavior is itself still unexercised before this (see the pre-existing
+    "`restart: True` cycling and `n_init > 1` multi-cycle runs are
+    unexercised" gap below), so this resubmission is also the first real
+    test of that, independent of the compile question.
+  - **Not yet done**: root-cause the actual mechanism (does disabling
+    compile only for cycles after the first avoid it? does a fresh
+    `torch.compile()` call per cycle avoid it at the cost of paying the
+    compilation tax every cycle instead of once? is this a known
+    upstream `torch`/`inductor` issue at this PyTorch version worth
+    checking against public bug trackers?) -- deferred, to revisit.
+
 - **Aurora per-epoch runtime optimization (in progress, 2026-09-19)**:
   Aurora's ~100s/epoch for the 20-step/5-day window above is ~4-5x AIFS's
   own ~18-25s/epoch for a matched window -- a similar ratio to FCN3's own
