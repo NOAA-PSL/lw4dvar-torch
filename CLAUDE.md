@@ -57,29 +57,41 @@ contain both backends' logic side by side rather than one.
 
 ## Conda environments -- NOT merged, and deliberately so
 
-Two environments, unchanged from the source repos:
+Four environments, one per checkpoint (not one per backend architecture --
+`aifs1` and `aifs2` both drive AIFS-family checkpoints through the same
+`aifs_model.py`, just at two different anemoi/torch-geometric pin sets):
 
 ```
-aifs2:     /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs2      (anemoi / torch-geometric / flash-attn)
+aifs2:     /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs2      (AIFS-single-2.0: anemoi 0.8-0.9.x / torch-geometric 2.6.1 / flash-attn)
+aifs1:     /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs1      (AIFS-single-1.1: anemoi 0.5-0.6.x / torch-geometric 2.4.0 / flash-attn)
 fcstnet3:  /scratch4/BMC/gsienkf/whitaker/conda/envs/fcstnet3   (makani / physicsnemo / torch-harmonics)
+aurora:    /scratch4/BMC/gsienkf/whitaker/conda/envs/aurora     (microsoft-aurora / torch)
 ```
 
-Both pin `torch==2.7.1+cu128` (same CUDA/ABI target), but their dependency
-trees have never been jointly resolved (`anemoi-graphs` wants `numpy<2`;
-whatever `makani`/`physicsnemo` want has not been checked against that). A
-real architecture decision was made here, not just inherited: **do not
-attempt to merge these into one environment.** "Choose the backend at
-runtime" means "choose it in `config.yml`, and run with the matching
-env/launcher (`run_aifs.sh` vs `run_fcn3.sh`)" -- not "one process can load
-either." Every place `long_window_4dvar_utils.py` needs a backend-specific
-module (`aifs_model`/`fcn3_model`/`aifs_grid`/`fcn3_grid`/`aifs_ic`/`fcn3_ic`)
-imports it *locally*, inside the function/branch that needs it, behind a
-small `_ensure_backend_on_path(backend)` helper that adds
-`backends/<backend>/` to `sys.path` on demand. This means a process running
-under `aifs2` never needs FCN3's dependencies importable at all, and vice
-versa -- confirmed directly (not assumed): from the `aifs2` env,
-`import fcn3_model` fails with `No module named 'fcn3_model'` unless the
-fcn3 branch has actually run first, and symmetrically for `fcstnet3`.
+All four pin `torch==2.7.1+cu128` (same CUDA/ABI target), but their
+dependency trees have never been jointly resolved (`anemoi-graphs` wants
+`numpy<2`; whatever `makani`/`physicsnemo`/`aurora` want has not been
+checked against that, or against each other, or against `aifs1`'s own
+older anemoi pins). A real architecture decision was made here, not just
+inherited: **do not attempt to merge these into one environment.** "Choose
+the backend at runtime" means "choose it in `config.yml`, and run with the
+matching env/launcher (`run_aifs.sh` vs `run_fcn3.sh` vs `run_aurora.sh`)"
+-- not "one process can load any of them." Every place
+`long_window_4dvar_utils.py` needs a backend-specific module
+(`aifs_model`/`fcn3_model`/`aurora_model`/`aifs_grid`/`fcn3_grid`/
+`aifs_ic`/`fcn3_ic`/`aurora_ic`) imports it *locally*, inside the
+function/branch that needs it, behind a small
+`_ensure_backend_on_path(backend)` helper that adds `backends/<backend>/`
+to `sys.path` on demand. This means a process running under `aifs2` never
+needs FCN3's (or Aurora's) dependencies importable at all, and vice versa
+-- confirmed directly (not assumed): from the `aifs2` env, `import
+fcn3_model` fails with `No module named 'fcn3_model'` unless the fcn3
+branch has actually run first, and symmetrically for the other envs.
+`aifs1` and `aifs2` share the SAME `aifs_model.py`/`aifs_grid.py`/
+`aifs_ic.py` (an `AIFSModel(checkpoint_path=..., config_path=...)`
+constructor argument selects which checkpoint/config to load, see
+`config.yml`'s `path_model`/`model_name` keys) -- only the conda
+environment and the checkpoint file itself differ between the two.
 
 `run_aifs.sh` and `run_fcn3.sh` both explicitly `module load cuda/12.8.1`
 (matching both envs' `torch==2.7.1+cu128` build) rather than relying on the
@@ -133,7 +145,19 @@ submodules at the user's request:
 ```
 backends/aifs/aifs-single-2.0  -> https://huggingface.co/ecmwf/aifs-single-2.0/   @ 08286fc
 backends/fcn3/fourcastnet3     -> https://huggingface.co/nvidia/fourcastnet3/     @ df5d8d0
+backends/aifs/aifs-single-1.1  -> https://huggingface.co/ecmwf/aifs-single-1.1    @ 049b9ab
 ```
+
+`aifs-single-1.1` (added 2026-09-20, see "`aifs1` environment" below) was
+the simplest of the three to convert: the user had cloned it directly from
+its real Hugging Face URL already (not copied from a sibling repo's own
+vendored checkout the way the first two were), so `git submodule add
+<the-same-URL> backends/aifs/aifs-single-1.1` just adopted the existing
+local clone in place ("Adding existing repo... to the index") with no
+`protocol.file.allow` workaround and no re-fetch needed -- confirmed via
+`git ls-files --stage` showing the expected `160000` gitlink mode pointing
+at the clone's actual `HEAD`, not the full ~1GB checkpoint tracked as
+regular file content.
 
 Both pinned at the exact commit the source repos' own vendored clones were
 already checked out at -- this is a reproduction of the already-validated
@@ -702,6 +726,91 @@ happened to have `restart: True`) also ran cleanly, exercising the
 restart-branch date-shift logic as a bonus, against its own
 `long-window-4dvar-aifsv2/ic_cache/` (that config's own `ic_cache` setting,
 unrelated to the sys.path fix).
+
+## `aifs1` environment: AIFS-single-1.1 (2026-09-20)
+
+User downloaded `ecmwf/aifs-single-1.1`'s HF repo into
+`backends/aifs/aifs-single-1.1/` (alongside the existing
+`aifs-single-2.0/`) and asked for a conda environment to run it, expecting
+it to differ from `aifs2` -- confirmed correct before building anything,
+not assumed.
+
+- **Confirmed the pin gap first**: `aifs-single-1.1`'s own repo has no
+  `pyproject.toml`/`uv.lock` (unlike `aifs-single-2.0`, whose lock file is
+  what `aifs2`'s own pins were read from -- see "Conda environments"
+  above) -- its `run_AIFS_v1.1.ipynb` notebook's commented `!pip install`
+  cell is the most authoritative pin source available for this
+  checkpoint: `anemoi-inference[huggingface]==0.6.3`,
+  `anemoi-models==0.5.0`, `torch-geometric==2.4.0`,
+  `earthkit-regrid==0.4.0`, `ecmwf-opendata`, `flash_attn` (unpinned).
+  Compared directly against `aifs2`'s installed versions
+  (`anemoi-inference==0.8.3`, `anemoi-models==0.9.3`,
+  `torch-geometric==2.6.1`) -- different enough (especially
+  `anemoi-models` 0.5.0 vs 0.9.3) to justify a separate environment before
+  writing a single line of setup, not just following the user's hunch
+  blindly.
+- **Checked PyPI metadata before installing anything**, to catch a
+  conflict before it happened rather than after: `anemoi-models==0.5.0`
+  requires only `torch>=2.2` and `torch-geometric<2.5,>=2.3` -- both
+  compatible with the already-established `torch==2.7.1+cu128` pin used
+  by every other environment in this repo, no resolver trap expected.
+- **Reused `aifs2`'s exact flash-attn wheel choice** rather than
+  re-deriving it: `flash-attn==2.8.3`, prebuilt for cu12/torch2.7/cp312,
+  from `cathalobrien/get-flash-attn`'s GitHub releases (found the exact
+  asset via the public GitHub API, since `gh` wasn't authenticated in this
+  session -- `flash_attn-2.8.3+cu12torch2.7cxx11abiFALSE-cp312-cp312-
+  linux_x86_64.whl`). Installed with `--no-deps` (matching the discipline
+  used everywhere else in this repo for pinned wheels) so it can't drag in
+  a different torch.
+- **Build order**: `conda create` (Python 3.12, matching `aifs2`) ->
+  `torch==2.7.1+cu128` from the cu128 index -> the flash-attn wheel ->
+  the notebook's pinned anemoi/earthkit stack in one `pip install` call.
+  `pip check` clean, no conflicts, no manual pin-downs needed this time
+  (unlike `aifs2`'s own `mir-python`/`numpy<2` incident -- that conflict
+  was specifically with `anemoi-graphs`, which this inference-only
+  environment doesn't need at all).
+- **`anemoi-inference validate` reported version mismatches -- read
+  carefully rather than treated as pass/fail**: missing
+  `anemoi.datasets==0.5.21`/`anemoi.graphs==0.5.0` (training-only
+  provenance, not inference dependencies) and `anemoi.models`/
+  `anemoi.utils` version mismatches against the checkpoint's OWN recorded
+  training environment (`anemoi.models==0.4.2.post64` with an
+  **uncommitted** local patch, per the checkpoint's own metadata -- even
+  EXACTLY matching versions couldn't fully reproduce the training
+  environment, since it contained an uncommitted change). This looked
+  more alarming on paper than `aifs2`'s own "harmless patch-version
+  differences" validate result, so it was verified functionally rather
+  than trusted at face value.
+- **Real functional verification, not just `validate`'s metadata
+  check**: loaded the actual checkpoint via
+  `anemoi.inference.runners.simple.SimpleRunner` on CPU first (fast
+  iteration) -- confirmed the real attributes `aifs_model.py` actually
+  needs (`checkpoint.timestep` = 6:00:00, matching AIFS-2.0's convention;
+  `checkpoint.number_of_input_features` = 103;
+  `checkpoint.variable_to_input_tensor_index` has 103 real variable
+  names; `checkpoint.latitudes`/`longitudes` are real N320-mesh-sized
+  (542080-point) arrays; the model itself instantiates with 253M
+  parameters) -- confirming the "missing modules" `validate` flagged are
+  genuinely just training-time provenance, not things the checkpoint
+  needs to load.
+- **GPU verification, not just CPU**: a separate real check
+  (`test_scripts/run_verify_aifs1_gpu.sh`) confirmed flash-attn's actual
+  CUDA kernel produces finite, correctly-shaped output (not just that it
+  imports without an ABI error -- the FCN3/torch-harmonics incident
+  elsewhere in this repo's history is exactly the class of "imports fine,
+  silently wrong at runtime" failure this guards against) and that the
+  checkpoint loads cleanly with `device='cuda'` too.
+- `pip freeze` saved to
+  `/scratch4/BMC/gsienkf/whitaker/conda/envs/aifs1-requirements.lock.txt`,
+  matching `aifs2`'s own convention.
+- **Not yet done**: no `aifs_config`/`config.yml` entry wiring
+  `path_model`/`model_name` at this checkpoint specifically has been
+  written or run through the actual 4D-Var driver yet -- this was
+  environment setup and checkpoint-loading verification only, not an
+  end-to-end pipeline validation the way FCN3/Aurora's first real runs
+  were. `aifs_inference.yaml` (the shared AIFS anemoi-inference config)
+  has not been checked for anything v1.1-specific that might differ from
+  v2.0's expectations.
 
 ## Known gaps / next steps
 

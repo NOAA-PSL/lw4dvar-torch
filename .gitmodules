@@ -4,3 +4,6 @@
 [submodule "backends/fcn3/fourcastnet3"]
 	path = backends/fcn3/fourcastnet3
 	url = https://huggingface.co/nvidia/fourcastnet3/
+[submodule "backends/aifs/aifs-single-1.1"]
+	path = backends/aifs/aifs-single-1.1
+	url = https://huggingface.co/ecmwf/aifs-single-1.1
