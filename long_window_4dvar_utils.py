@@ -1320,10 +1320,27 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # finite and lower than before, and the corrupted increment gets
         # saved as "new best" rather than caught here. See CLAUDE.md
         # "Aurora 16-step divergence" for the full root-cause writeup.
+        #
+        # Originally a skip-and-continue (warn, zero the grad, proceed to
+        # the next epoch) rather than fatal -- changed 2026-09-21 after a
+        # real aifs-single-1.1 5-day/100-epoch run hit this on 4+
+        # consecutive epochs: skip-and-continue silently burned through
+        # the rest of the epoch budget (and would have done so again every
+        # subsequent cycle) with zero further progress, then exited 0 as
+        # if the run had succeeded. Every prior occurrence of this guard
+        # firing in this codebase's history (see the Aurora writeup above)
+        # was likewise a persistent, deterministic condition, not a
+        # transient one-off recoverable by skipping a single step -- so
+        # there is no known case where skip-and-continue actually helped.
+        # Raising here makes that failure visible (nonzero exit, full
+        # traceback) instead of silently masking a stalled optimization.
         if not torch.isfinite(increment.grad).all():
-            logger.warning(f'epoch={epoch}: non-finite gradient, skipping this optimizer step')
-            optimizer.zero_grad()
-            continue
+            raise RuntimeError(
+                f'epoch={epoch}: non-finite gradient in increment -- stopping. '
+                f'This indicates a real numerical instability (e.g. an overly '
+                f'aggressive learn_rate/window-length for this backend/checkpoint), '
+                f'not a transient blip -- see the "non-finite gradient" comment above.'
+            )
 
         history.append({
             'time': time.ctime(),
