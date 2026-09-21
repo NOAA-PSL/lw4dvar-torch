@@ -953,6 +953,109 @@ existing `model_backend: aifs` dispatch already treats them as one backend;
   for a future multi-cycle test) -- see "Known gaps" below, `n_init > 1`
   for aifs1 specifically is still unexercised.
 
+## aifs1 non-finite-gradient divergence: root-caused as a pure learn_rate issue, not window-length or a bug (2026-09-21)
+
+First real production-scale comparison run (`config_aifs1_12h_100it_6day.yml`
+vs. `config_aifs2_12h_100it_6day.yml`, both 5-day/24-step windows, 2 cycles,
+100 epochs, otherwise-identical configs, jobs 21875528/21875530) surfaced a
+real, reproducible difference: aifs2 completed cycle 1 cleanly (Jtot 136567,
+z500 improved 8.54->8.43) and reached epoch 28/100 of cycle 2 before hitting
+the SLURM wall-time limit -- healthy throughout, zero non-finite-gradient
+issues. aifs1 diverged partway through cycle 1 every time it was tried.
+
+- **First made the existing skip-and-continue guard fatal.** `compute_optimal`'s
+  `torch.isfinite(increment.grad).all()` check (added for the earlier Aurora
+  divergence, see below) previously warned and skipped the optimizer step,
+  then silently continued -- observed here burning through dozens of
+  further epochs with zero progress before exiting 0 as if the run had
+  succeeded, since every occurrence of this guard firing in this codebase's
+  history turned out to be a persistent, deterministic condition rather
+  than a one-off transient blip. Changed to `raise RuntimeError(...)`
+  instead (`long_window_4dvar_utils.py`, commit 507f367) -- makes a stalled
+  optimization visible (nonzero exit, full traceback) rather than masking
+  it.
+- **Reproduced at 3 different learn_rates, ruling out a specific bad lr
+  value**: 2.5e-3 (original config, failed epoch 18), 1.5e-3 (failed epoch
+  24 on a fresh-code run after an earlier stale-code run of the same lr
+  masked the fatal guard by having started 50s before the fix was
+  committed -- a real gotcha: a long-running job launched just before a
+  code fix lands keeps running the OLD in-memory module, so always confirm
+  a job actually started AFTER a relevant commit before trusting its
+  behavior as validating that commit), and 1e-3 (failed epoch 32). All
+  three failures were on the otherwise-identical 5-day/24-step/
+  `checkpoint_stride: 0` window aifs2 handles cleanly.
+- **Ruled out a precision/autocast mismatch** (the natural first hypothesis,
+  given the near-identical shape to the Aurora 16-step divergence below):
+  checked `checkpoint.precision` directly on both real checkpoints (CPU,
+  `SimpleRunner`) -- both report `"16-mixed"`, resolving to identical
+  `torch.float16` autocast. Not a precision difference between the two
+  checkpoints at all.
+- **Added an opt-in `autocast_dtype` override to `AIFSModel.__init__`**
+  (`aifs_model.py`, commit 9d0b0ca; wired through `get_model()` as
+  `exp['aifs_autocast_dtype']`, string or `torch.dtype`, defaults to the
+  existing checkpoint-derived behavior so aifs2 is unaffected) to test
+  forcing `bfloat16` -- the exact fix that resolved Aurora's own
+  identically-shaped divergence. **Tested and it did NOT fix it**: still
+  failed, at epoch 21 (delayed slightly from fp16's epoch 18 at the same
+  `learn_rate: 2.5e-3`, but same failure mode -- a sudden loss jump at
+  epoch 17, 340955->534954, worse than the epoch-1 starting loss, followed
+  by 3 more elevated-but-finite epochs before finally going non-finite at
+  21). This is a genuinely different mechanism from Aurora's fp16-overflow
+  root cause, not a variant of the same bug. (Also fixed a stale, now-known-
+  incorrect comment in `AIFSModel.__init__` claiming the rollout "already
+  runs under a bf16 torch.autocast" -- it's fp16 by default, on both
+  checkpoints.)
+- **Ruled out a bug in the aifs1 compat shims**: compared
+  `_assemble_input_compat`/`_run_mapper_compat` line-by-line against both
+  anemoi-models versions' real `forward()` source (0.5.0 vs. 0.9.3,
+  `encoder_processor_decoder.py`) -- the older-API fallback paths exactly
+  replicate the real call sequence (2-tuple `_assemble_input`,
+  separately-computed `get_shape_shards`, no sharding kwargs on
+  `_run_mapper`). No discrepancy found. Also confirmed the two configs are
+  otherwise identical (`diff` showed only checkpoint path/`ic_cache`/
+  `learn_rate` differ).
+- **Bisected window length** (`config_aifs1_bisect_{4,8,12,16}.yml`,
+  `run_aifs1_bisect_{4,8,12,16}.sh` -- same methodology that found the
+  real root cause of the Aurora 16-step divergence below: `n_init: 1`,
+  `cycle: False`, `learn_rate: 1e-4` deliberately low to isolate window
+  length as the variable, `max_epoch: 40`, default fp16 autocast): **all
+  four lengths (4/8/12/16 steps) completed all 40 epochs cleanly, zero
+  non-finite gradients.** This looked at first like a length-dependent
+  threshold between 16 and 24 steps -- but critically, none of the 3
+  learn_rates that failed at n_verif=24 (1e-3, 1.5e-3, 2.5e-3) had ever
+  been tested at 1e-4, so a clean bisection result alone couldn't
+  distinguish "shorter windows are stable" from "1e-4 is just low enough
+  to be stable at any length."
+- **Decisive confirmatory test** (`config_aifs1_bisect_24.yml`,
+  `run_aifs1_bisect_24.sh`: n_verif=24, the ORIGINAL full window, at the
+  SAME `learn_rate: 1e-4` as the successful bisection runs): **completed
+  all 40 epochs cleanly**, sailing straight through the epoch 18-34 range
+  that killed every higher-`learn_rate` attempt. **Conclusion: this is a
+  pure `learn_rate`-tuning issue specific to aifs-single-1.1, not a
+  window-length-dependent structural instability, not a compat-shim bug,
+  and not a precision issue.** aifs-single-1.1 simply requires a
+  substantially lower `learn_rate` than aifs-single-2.0 to stay
+  numerically stable over this window/config -- somewhere between 1e-4
+  (confirmed stable) and 1e-3 (fails ~epoch 32). Mechanism not further
+  investigated (older/smaller checkpoint, presumably less well-conditioned
+  gradients through a long chained rollout -- plausible but not verified
+  beyond ruling out the alternatives above).
+- **Caveat**: 1e-4 alone is not a great production setting as-is -- over
+  40 epochs at n_verif=24 loss only moved 514103 -> 488774 (much smaller
+  improvement than the higher-`learn_rate` runs achieved before
+  diverging, e.g. 2.5e-3 had already reached ~300k by epoch 16) -- it
+  would need either many more epochs or an intermediate `learn_rate` that
+  is both stable and reasonably fast, not yet found. **Not yet resolved**:
+  what the fastest stable `learn_rate` actually is (user is running
+  further sweeps as of this writing) -- the 2-cycle/100-epoch aifs1 vs.
+  aifs2 comparison run has not yet been resubmitted with a working
+  `learn_rate`.
+- Diagnostic configs/scripts from this investigation
+  (`config_aifs1_bisect_{4,8,12,16,24}.yml`,
+  `run_aifs1_bisect_{4,8,12,16,24}.sh`) are left uncommitted/untracked,
+  matching this repo's existing convention for one-off diagnostic configs
+  (see the Aurora bisection configs' own note above).
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
@@ -1334,14 +1437,16 @@ existing `model_backend: aifs` dispatch already treats them as one backend;
   `long-window-4dvar-fcstnetv3`) are still where active tuning work is
   happening (as of 2026-09-17) and have not been archived/retired -- don't
   assume this repo is the only place experiments are running.
-- **aifs1 (`aifs-single-1.1`) is only validated on a single 12h/5-epoch/
-  3-obs-slot smoke test so far** (see "AIFS-single-1.1 API compatibility
-  fixes" above) -- `restart: True` cycling and `n_init > 1` multi-cycle
-  runs are unexercised for this checkpoint specifically (`ic_cache_aifs1/`
-  already has 3 extra prefetched dates ready for this), and
-  `learn_rate`/`max_epoch`/window-length are all untuned (the 5-epoch test
-  used the same untuned defaults as the other backends' first smoke
-  tests).
+- **aifs1's fastest STABLE `learn_rate` is not yet known.** See "aifs1
+  non-finite-gradient divergence" above: confirmed 1e-4 is stable but slow
+  (loss 514103->488774 over 40 epochs at n_verif=24) and 1e-3/1.5e-3/2.5e-3
+  all diverge (non-finite gradient, epoch 18-32) on the real 5-day/24-step
+  production window -- the actual fastest-safe value between 1e-4 and 1e-3
+  is unresolved, sweeps in progress. The 2-cycle/100-epoch aifs1 vs. aifs2
+  comparison run has not been resubmitted with a working `learn_rate` yet.
+  `restart: True` cycling and `n_init > 1` multi-cycle runs are also still
+  unexercised for aifs1 specifically (`ic_cache_aifs1/` already has 3 extra
+  prefetched dates ready for this).
 - Whether the latent increment could ever be injected at `t=0` instead of
   `t+timestep` (a NeuralGCM-style design, raised because FCN3 is
   self-starting/single-time-level unlike AIFS) was investigated empirically
