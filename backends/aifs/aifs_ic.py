@@ -62,21 +62,77 @@ _CONST_FIELDS = {
 }
 
 
+def _retrieved_prognostic_variables(runner):
+    """`runner.variables.retrieved_prognostic_variables()` (aifs2's pin,
+    anemoi-inference==0.8.3) doesn't exist on aifs1's older pin (0.6.3) --
+    `DefaultRunner` has no `.variables` attribute at all there. Confirmed
+    directly (2026-09-20) that `checkpoint.prognostic_variables` returns
+    the byte-identical list on the AIFS-single-2.0 checkpoint too (just
+    deprecated there, `UnsupportedWarning: ... Use select_variables
+    instead` -- still functionally correct, not just close), so it's a
+    safe fallback rather than a real behavior change for either
+    checkpoint."""
+    try:
+        return runner.variables.retrieved_prognostic_variables()
+    except AttributeError:
+        return runner.checkpoint.prognostic_variables
+
+
+def _retrieved_constant_forcings_variables(runner):
+    """Same version split as `_retrieved_prognostic_variables`, but there's
+    no direct older-API property equivalent -- derived instead from
+    `checkpoint.variable_categories()` (a `{variable: [tags]}` dict with
+    tags like 'prognostic'/'constant'/'forcing'/'computed'/'diagnostic'/
+    'accumulation'): a RETRIEVED (as opposed to internally computed)
+    constant forcing is exactly a variable tagged BOTH 'constant' AND
+    'forcing' but NOT 'computed' (excludes the lat/lon/time trig features,
+    which are computed on the fly, never fetched from an IC source).
+    Confirmed to produce the exact same list
+    (['lsm', 'sdor', 'slor', 'wmb', 'z']) as
+    `runner.variables.retrieved_constant_forcings_variables()` on the
+    AIFS-single-2.0 checkpoint directly, not just assumed from the tag
+    names."""
+    try:
+        return runner.variables.retrieved_constant_forcings_variables()
+    except AttributeError:
+        cats = runner.checkpoint.variable_categories()
+        return [
+            v for v, tags in cats.items()
+            if "constant" in tags and "forcing" in tags and "computed" not in tags
+        ]
+
+
 def _build_input(runner, config, purpose):
     """Mirrors Runner.create_prognostics_input()/create_constant_coupled_forcings_input(),
     but with an explicit `input:`-style config instead of `runner.config.input`,
     so the same runner can be pointed at CDS for fetching and at a local GRIB
     file for reading back, independent of whatever `aifs_inference.yaml` says.
+
+    Returns `(input_object, variables)` -- callers must pass `variables`
+    explicitly to `input_object.retrieve(variables, dates)` rather than
+    relying on `input_object.variables`. aifs2's pin (anemoi-inference==
+    0.8.3) accepts `variables`/`purpose` as `create_input()` kwargs and
+    populates `.variables` from them; aifs1's older pin (0.6.3) has a
+    plain `create_input(context, config)` with no such kwargs at all
+    (confirmed via its source, not guessed) -- but `.retrieve()` itself
+    always takes an explicit `variables` list regardless of construction,
+    on both versions, so passing it explicitly here sidesteps the
+    incompatibility entirely rather than needing two different
+    construction paths.
     """
     if purpose == "prognostics":
-        variables = runner.variables.retrieved_prognostic_variables()
+        variables = _retrieved_prognostic_variables(runner)
     elif purpose == "constant_forcings":
-        variables = runner.variables.retrieved_constant_forcings_variables()
+        variables = _retrieved_constant_forcings_variables(runner)
     else:
         raise ValueError(purpose)
     if not variables:
         config = "empty"
-    return create_input(runner, config, variables=variables, purpose=purpose)
+    try:
+        input_object = create_input(runner, config, variables=variables, purpose=purpose)
+    except TypeError:
+        input_object = create_input(runner, config)
+    return input_object, variables
 
 
 def _patch_missing_wave_fields(grib_path):
@@ -178,12 +234,12 @@ def fetch_era5_grib(runner, date, cache_dir, lagged=True):
 
     dates = [date + h for h in runner.checkpoint.lagged] if lagged else [date]
 
-    prog = _build_input(runner, {"cds": {"dataset": CDS_DATASET, "class": "ea"}}, "prognostics")
-    fields = prog.retrieve(prog.variables, dates)
+    prog, prog_vars = _build_input(runner, {"cds": {"dataset": CDS_DATASET, "class": "ea"}}, "prognostics")
+    fields = prog.retrieve(prog_vars, dates)
 
-    const = _build_input(runner, {"cds": {"dataset": CDS_DATASET, "class": "ea"}}, "constant_forcings")
+    const, const_vars = _build_input(runner, {"cds": {"dataset": CDS_DATASET, "class": "ea"}}, "constant_forcings")
     if hasattr(const, "retrieve"):
-        fields = fields + const.retrieve(const.variables, [date])
+        fields = fields + const.retrieve(const_vars, [date])
 
     tmp_path = grib_path + ".tmp"
     fields.save(tmp_path)
@@ -204,16 +260,29 @@ def build_input_state(runner, date, cache_dir, lagged=True):
     """
     grib_path = fetch_era5_grib(runner, date, cache_dir, lagged=lagged)
 
-    prog = GribFileInput(runner, path=grib_path, variables=runner.variables.retrieved_prognostic_variables())
-    prognostic_state = prog.create_input_state(date=date)
+    try:
+        prog = GribFileInput(runner, path=grib_path, variables=_retrieved_prognostic_variables(runner))
+        prognostic_state = prog.create_input_state(date=date)
 
-    const_vars = runner.variables.retrieved_constant_forcings_variables()
-    if const_vars:
-        const = GribFileInput(runner, path=grib_path, variables=const_vars)
-        constants_state = const.create_input_state(date=date)
-        input_state = runner._combine_states(prognostic_state, constants_state)
-    else:
-        input_state = prognostic_state
+        const_vars = _retrieved_constant_forcings_variables(runner)
+        if const_vars:
+            const = GribFileInput(runner, path=grib_path, variables=const_vars)
+            constants_state = const.create_input_state(date=date)
+            input_state = runner._combine_states(prognostic_state, constants_state)
+        else:
+            input_state = prognostic_state
+    except TypeError:
+        # aifs1's older pin (anemoi-inference==0.6.3): GribFileInput takes
+        # no `variables` kwarg at all (confirmed via its source -- absorbed
+        # into **kwargs, then rejected by EkdInput.__init__), and its own
+        # create_input_state() unconditionally reads every field present
+        # in the file regardless (no filtering support at this layer at
+        # all in this version). Since fetch_era5_grib already writes
+        # prognostic + constant-forcing fields into the SAME file, one
+        # unfiltered read already returns the fully-combined state we
+        # want -- no second read or `_combine_states` call needed.
+        combined = GribFileInput(runner, path=grib_path)
+        input_state = combined.create_input_state(date=date)
 
     return input_state
 

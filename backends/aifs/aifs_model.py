@@ -37,9 +37,103 @@ import torch
 
 from anemoi.inference.config.run import RunConfiguration
 from anemoi.inference.runners import create_runner
-from anemoi.models.distributed.shapes import get_shard_shapes
+try:
+    # anemoi-models>=0.6ish (aifs2, AIFS-single-2.0's pin) renamed this
+    # from get_shape_shards -- aifs1 (AIFS-single-1.1's pin, anemoi-models
+    # ==0.5.0) still has the old name. Confirmed byte-identical
+    # implementation/signature across both, a pure rename, not a real API
+    # change -- this file is shared between both checkpoints/environments,
+    # so the import needs to tolerate either name rather than picking one.
+    from anemoi.models.distributed.shapes import get_shard_shapes
+except ImportError:
+    from anemoi.models.distributed.shapes import get_shape_shards as get_shard_shapes
 
 import forecast_model
+
+
+def _select_variables_and_masks(checkpoint, include):
+    """`checkpoint.select_variables_and_masks(include=[...])` (aifs2's pin,
+    anemoi-models==0.9.3) doesn't exist on aifs1's older pin (0.5.0) --
+    `Checkpoint` has no such method there at all. Only `include=
+    ["computed+constant"]` is ever used in this file, so this only
+    supports that one case (a single category string combining two tags
+    with `+`), not the general `include`/`exclude` list interface the
+    real method offers.
+
+    Derived from `checkpoint.variable_categories()` (a `{variable:
+    [tags]}` dict, confirmed present and correctly tagged on both
+    versions) plus `checkpoint.variable_to_input_tensor_index` (for the
+    positional mask `select_variables_and_masks` returns -- confirmed,
+    not assumed, to be each selected variable's index into the
+    checkpoint's full input-tensor variable ordering, sorted ascending).
+    Confirmed to produce byte-identical `(vars, mask)` output against the
+    real method on the AIFS-single-2.0 checkpoint directly (2026-09-20):
+    vars=['cos_latitude', 'cos_longitude', 'sin_latitude', 'sin_longitude'],
+    mask=[6, 8, 35, 37]."""
+    try:
+        return checkpoint.select_variables_and_masks(include=include)
+    except AttributeError:
+        if include != ["computed+constant"]:
+            raise NotImplementedError(
+                f"_select_variables_and_masks fallback only supports "
+                f"include=['computed+constant'], got {include!r}"
+            )
+        cats = checkpoint.variable_categories()
+        idx = checkpoint.variable_to_input_tensor_index
+        variables = sorted(
+            (v for v, tags in cats.items() if "computed" in tags and "constant" in tags),
+            key=lambda v: idx[v],
+        )
+        mask = np.array([idx[v] for v in variables], dtype=np.int64)
+        return variables, mask
+
+
+def _assemble_input_compat(m, x, batch_size):
+    """`AnemoiModelEncProcDec._assemble_input` (aifs2's pin, anemoi-models==
+    0.9.3) takes `(x, batch_size, grid_shard_shapes=None,
+    model_comm_group=None)` and returns a 3-tuple
+    `(x_data_latent, x_skip, shard_shapes_data)` -- it computes
+    `shard_shapes_data` itself. aifs1's older pin (0.5.0) takes only
+    `(x, batch_size)` and returns a 2-tuple `(x_data_latent, x_skip)` --
+    the CALLER computes `shard_shapes_data` separately (see that version's
+    own `forward()`: `get_shape_shards(x_data_latent, 0, model_comm_group)`
+    right after calling `_assemble_input`). Confirmed via direct source
+    inspection of both, not guessed. `model_comm_group=None` throughout
+    this file (single-GPU only), so the extra args on the newer signature
+    are always their own defaults -- passing them explicitly (rather than
+    omitting them) is what lets the TypeError on the older signature
+    reliably distinguish "too many positional args" from some unrelated
+    failure inside the call.
+    """
+    try:
+        return m._assemble_input(x, batch_size, None, None)
+    except TypeError:
+        x_data_latent, x_skip = m._assemble_input(x, batch_size)
+        shard_shapes_data = get_shard_shapes(x_data_latent, 0, None)
+        return x_data_latent, x_skip, shard_shapes_data
+
+
+def _run_mapper_compat(m, mapper, data, batch_size, shard_shapes,
+                        x_src_is_sharded=False, x_dst_is_sharded=False, keep_x_dst_sharded=False):
+    """`AnemoiModelEncProcDec._run_mapper` (aifs2's pin, anemoi-models==
+    0.9.3) added `x_src_is_sharded`/`x_dst_is_sharded`/`keep_x_dst_sharded`
+    (plus `**kwargs`) on top of aifs1's older pin (0.5.0), which has none
+    of these and no `**kwargs` to silently absorb them -- confirmed via
+    direct signature inspection of both, not guessed. `model_comm_group`
+    is always `None` in this file (single-GPU only); these three flags
+    only matter for distributed grid/channel sharding (`forward()`'s own
+    v0.9.3 source derives them from `grid_shard_shapes is not None`,
+    always `False` here), so simply omitting them for the older version
+    is the correct equivalent, not an approximation.
+    """
+    try:
+        return m._run_mapper(
+            mapper, data, batch_size=batch_size, shard_shapes=shard_shapes, model_comm_group=None,
+            x_src_is_sharded=x_src_is_sharded, x_dst_is_sharded=x_dst_is_sharded,
+            keep_x_dst_sharded=keep_x_dst_sharded,
+        )
+    except TypeError:
+        return m._run_mapper(mapper, data, batch_size=batch_size, shard_shapes=shard_shapes, model_comm_group=None)
 
 
 class AIFSState:
@@ -126,7 +220,13 @@ class AIFSModel(forecast_model.LatentForecastModel):
             p.requires_grad_(False)
 
         self.checkpoint = self.runner.checkpoint
-        self._device = self.runner.device
+        # aifs2's pin (anemoi-inference==0.8.3): runner.device is already a
+        # real torch.device. aifs1's older pin (0.6.3): it's a plain str
+        # ('cpu'/'cuda') -- confirmed via direct check, not assumed --
+        # which breaks `self.device.type` elsewhere in this file.
+        # torch.device(...) is idempotent on an existing torch.device, so
+        # this normalizes both without needing a version branch.
+        self._device = torch.device(self.runner.device)
         self.interface = self.runner.model  # AnemoiModelInterface
         self.multi_step = self.interface.multi_step
         self._timestep: datetime.timedelta = self.checkpoint.timestep
@@ -250,7 +350,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
         the checkpoint's "computed" category too.
         """
         runner = self.runner
-        computed_vars, computed_mask = self.checkpoint.select_variables_and_masks(include=["computed+constant"])
+        computed_vars, computed_mask = _select_variables_and_masks(self.checkpoint, include=["computed+constant"])
         runner.constant_forcings_inputs = (
             runner.create_constant_computed_forcings(computed_vars, computed_mask) if len(computed_mask) else []
         )
@@ -374,7 +474,17 @@ class AIFSModel(forecast_model.LatentForecastModel):
         xin = x[:, 0 : self.multi_step, None, ...]  # add ensemble dim
         xin = self.interface.pre_processors(xin, in_place=False)
         with torch.autocast(device_type=self.device.type, dtype=self.runner.autocast):
-            y = self.interface.model.forward(xin, model_comm_group=None, grid_shard_shapes=None)
+            # aifs2's pin (anemoi-models==0.9.3) added `grid_shard_shapes`
+            # (distributed grid sharding, irrelevant here -- single-GPU
+            # only, see this class's own docstring) to `forward()`'s
+            # signature; aifs1's older pin (0.5.0) has no such parameter
+            # and no **kwargs to absorb it, confirmed via direct signature
+            # inspection on both. Try the newer call first, fall back to
+            # the older signature on TypeError.
+            try:
+                y = self.interface.model.forward(xin, model_comm_group=None, grid_shard_shapes=None)
+            except TypeError:
+                y = self.interface.model.forward(xin, model_comm_group=None)
         y = self.interface.post_processors(y.float(), in_place=False)
         return torch.squeeze(y, dim=1)  # (batch, n_points, n_vars)
 
@@ -408,16 +518,16 @@ class AIFSModel(forecast_model.LatentForecastModel):
             batch_size = xin.shape[0]
             ensemble_size = xin.shape[2]
 
-            x_data_latent, x_skip, shard_shapes_data = m._assemble_input(xin, batch_size)
+            x_data_latent, x_skip, shard_shapes_data = _assemble_input_compat(m, xin, batch_size)
             x_hidden_latent = m.node_attributes(m._graph_name_hidden, batch_size=batch_size)
             shard_shapes_hidden = get_shard_shapes(x_hidden_latent, 0, None)
 
-            x_data_latent, x_latent = m._run_mapper(
+            x_data_latent, x_latent = _run_mapper_compat(
+                m,
                 m.encoder,
                 (x_data_latent, x_hidden_latent),
                 batch_size=batch_size,
                 shard_shapes=(shard_shapes_data, shard_shapes_hidden),
-                model_comm_group=None,
                 x_src_is_sharded=False,
                 x_dst_is_sharded=False,
                 keep_x_dst_sharded=True,
@@ -430,12 +540,12 @@ class AIFSModel(forecast_model.LatentForecastModel):
             )
             x_latent_proc = x_latent_proc + x_latent  # residual, matches forward()
 
-            x_out = m._run_mapper(
+            x_out = _run_mapper_compat(
+                m,
                 m.decoder,
                 (x_latent_proc, x_data_latent),
                 batch_size=batch_size,
                 shard_shapes=(shard_shapes_hidden, shard_shapes_data),
-                model_comm_group=None,
                 x_src_is_sharded=True,
                 x_dst_is_sharded=False,
                 keep_x_dst_sharded=False,

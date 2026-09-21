@@ -812,6 +812,147 @@ not assumed.
   has not been checked for anything v1.1-specific that might differ from
   v2.0's expectations.
 
+## AIFS-single-1.1 API compatibility fixes and end-to-end validation (2026-09-20/21)
+
+Followed up on the `aifs1` environment build above by actually running
+`long_window_4dvar.py` against the real `aifs-single-1.1` checkpoint through
+this repo's shared (AIFS-generation-agnostic) `aifs_model.py`/`aifs_ic.py`.
+Found and fixed 8 real API incompatibilities between `anemoi-models`/
+`anemoi-inference` 0.5.0/0.6.3 (`aifs1`, this checkpoint's own pin) and
+0.9.3/0.8.3 (`aifs2`, `aifs-single-2.0`'s pin, what these files were
+originally written and validated against) -- **every fix verified by direct
+comparison of both versions' real behavior/source, not guessed**, and all
+kept as `try/except` compatibility shims so `aifs_model.py`/`aifs_ic.py`
+remain the SAME shared files serving both checkpoint generations (the
+existing `model_backend: aifs` dispatch already treats them as one backend;
+`path_model`/`model_name`/`aifs_config` alone select the checkpoint).
+
+- **First, definitively answered whether this whole exercise was even
+  necessary**: could `aifs2`'s newer environment just load the v1.1
+  checkpoint directly? **No** -- confirmed via direct attempt: `torch.load()`
+  fails at the pickle-deserialization level with `ModuleNotFoundError: No
+  module named 'torch_geometric.nn.conv.utils.inspector'`, a
+  `torch_geometric` internal module-layout change between the pinned 2.4.0
+  (aifs1) and 2.6.1 (aifs2) that breaks unpickling a v1.1-era saved graph
+  object outright -- not an API-surface difference fixable with a shim, a
+  hard checkpoint-format incompatibility. Settled the question before
+  spending any further effort assuming the answer either way.
+- **The 8 real incompatibilities found and fixed** (all in `aifs_model.py`
+  unless noted):
+  1. `anemoi.models.distributed.shapes.get_shard_shapes` doesn't exist in
+     aifs1's pin -- renamed from `get_shape_shards` sometime after 0.5.0.
+     Confirmed byte-identical implementation/signature under both names
+     (a pure rename) -- `try: from ... import get_shard_shapes / except
+     ImportError: from ... import get_shape_shards as get_shard_shapes`.
+  2. `Checkpoint.select_variables_and_masks` doesn't exist on aifs1's older
+     `Checkpoint` class. New `_select_variables_and_masks(checkpoint,
+     include)` helper falls back to deriving the same result from
+     `checkpoint.variable_categories()` +
+     `checkpoint.variable_to_input_tensor_index` -- verified byte-identical
+     output against the real method on `aifs-single-2.0`
+     (`vars=['cos_latitude', 'cos_longitude', 'sin_latitude',
+     'sin_longitude']`, `mask=[6, 8, 35, 37]`) before trusting it as a
+     genuine fallback rather than a guess. Only supports the one
+     `include=['computed+constant']` call this codebase actually uses --
+     raises `NotImplementedError` for anything else rather than silently
+     doing the wrong thing.
+  3. `runner.device` is a plain `str` (`'cpu'`/`'cuda'`) on aifs1's older
+     `anemoi-inference`, not already a `torch.device` like on aifs2 --
+     broke `self.device.type` elsewhere in the file. Fixed with
+     `self._device = torch.device(self.runner.device)` --
+     `torch.device(...)` is idempotent on an existing `torch.device`, so
+     this normalizes both versions without a branch.
+  4. `AnemoiModelEncProcDec.forward()` doesn't accept a `grid_shard_shapes`
+     kwarg on aifs1's older model class -- `_predict_step_with_grad` wraps
+     the call in `try: ...forward(xin, model_comm_group=None,
+     grid_shard_shapes=None) / except TypeError: ...forward(xin,
+     model_comm_group=None)`.
+  5. `_assemble_input` returns a 2-tuple `(x_data_latent, x_skip)` on aifs1
+     vs. a 3-tuple `(x_data_latent, x_skip, shard_shapes_data)` on aifs2 --
+     new `_assemble_input_compat(m, x, batch_size)` helper try/excepts the
+     3-arg call, and on `TypeError` calls the 2-arg form and derives the
+     third element itself via `get_shard_shapes(x_data_latent, 0, None)`.
+  6. `_run_mapper` doesn't accept `x_src_is_sharded`/`x_dst_is_sharded`/
+     `keep_x_dst_sharded` kwargs on aifs1's older signature -- new
+     `_run_mapper_compat(...)` try/excepts the full-kwarg call down to the
+     older, shorter one. Both of these compat helpers are used inside
+     `_predict_step_with_grad_latent` (the manually-unrolled encoder ->
+     `+ latent_increment` -> processor -> decoder sequence that's the core
+     4D-Var control-injection point) in place of the direct calls -- this
+     was fixed PROACTIVELY, before ever hitting a live traceback for it,
+     by directly comparing both anemoi-models versions' real `forward()`
+     source ahead of time, since the same class of signature drift found
+     in `_assemble_input`/`_run_mapper` for the encoder/decoder was
+     expected to (and did) apply here too.
+  7. (`aifs_ic.py`) `DefaultRunner` has no `.variables` attribute on aifs1's
+     older `anemoi-inference` -- new `_retrieved_prognostic_variables`/
+     `_retrieved_constant_forcings_variables` helpers fall back to
+     `runner.checkpoint.prognostic_variables` and a `variable_categories()`
+     - derived equivalent (verified exact match,
+     `['lsm', 'sdor', 'slor', 'wmb', 'z']`, against the real newer API on
+     aifs2) respectively.
+  8. (`aifs_ic.py`) `create_input(runner, config, variables=..., purpose=...)`
+     and `GribFileInput(runner, path=..., variables=...)` don't accept a
+     `variables` kwarg on aifs1's older `anemoi-inference` -- `_build_input`
+     now returns `(input_object, variables)` and try/excepts down to the
+     no-`variables` call; `build_input_state` similarly try/excepts down to
+     one unfiltered `GribFileInput` read of the whole GRIB file (safe here
+     specifically because `fetch_era5_grib` already writes prognostic +
+     constant-forcing fields into the SAME file, so one unfiltered read
+     already returns the fully-combined state on the older API -- no
+     second read/`_combine_states` call is needed in that branch).
+- **New minimal `aifs_inference_v1p1.yaml`** (v1.1-specific anemoi-inference
+  config, alongside the existing shared `aifs_inference.yaml`): v1.1's
+  checkpoint has zero wave variables and no `snowc`/`sd` at all (confirmed
+  directly), so the existing config's v2.0-specific wave `typed_variables`/
+  `pre_processors`/`post_processors` fail Pydantic validation
+  (`Extra inputs are not permitted`, referencing `mwd`) when pointed at
+  v1.1 -- needed its own stripped-down config rather than a conditional
+  branch in one shared YAML.
+- **Stale-cache gotcha, found and fixed**: `ic_cache_aifs/` (the existing
+  cache dir used for `aifs-single-2.0` runs) is keyed only by date, not by
+  checkpoint -- reusing it for a v1.1 fetch silently served a cached GRIB
+  file that actually contained v2.0-specific wave variables (confirmed via
+  direct eccodes inspection: 192 messages including `mwd`, `swh`, `wmb`,
+  `cdww`, `mwp`). Fixed by using a separate `ic_cache_aifs1/` directory for
+  all v1.1 fetches (`config_test_aifs1.yml`'s `ic_cache` key) and
+  re-fetching fresh from CDS into it.
+- **End-to-end validation, real GPU job 21837119**
+  (`test_scripts/run_test_aifs1.sh`, `config_test_aifs1.yml`: `n_init: 1`,
+  `restart: False`, single window, `n_verif: 2`/`dt_verif: 6` = a 12h
+  window, `max_epoch: 5`, real `psobs` files, `ic_cache_aifs1/` pre-warmed
+  from the login node so the compute-node run needed no network access at
+  all). **Completed cleanly, exit code 0, ~40s of actual compute** (most of
+  the ~14 minutes of wall clock the job took was SLURM queue wait, not
+  runtime):
+  - Checkpoint loaded, background built from a real ERA5 48h forecast,
+    real ps observations read at all 3 slots (8932/9112, 9479-9485/9691,
+    9559-9737/9969 -- large, realistic QC-passing counts).
+  - 5-epoch AdamW optimization ran to completion: `Jtot` 23114 (epoch 1) ->
+    19967 (epoch 2, new best) -> 20339 -> 28899 -> 32846 -- the epoch
+    3-5 uphill trend is the same untuned-fixed-`lr`-overshoot-past-the-
+    optimum shape this repo's CLAUDE.md already documents repeatedly for
+    other backends' first low-epoch-count smoke tests, not a new failure
+    mode.
+  - All diagnostic files saved without error (`*_latent_increment_*.pt`,
+    `*_observation_diagnostics_*.nc`, `*_control_forecast_*.nc`,
+    `*_optimal_forecast_*.nc`).
+  - z500 diagnostic printed real, finite numbers at every region: `bg(t0)`
+    GL 9.68, `before` GL 10.59, `after` GL 10.26 -- a small improvement
+    from the best-epoch (epoch 2) increment, unlike FCN3's own first smoke
+    test (which got worse) -- a genuinely different, encouraging result,
+    though still just a 3-obs-slot/5-epoch toy window, not yet a tuned
+    real experiment.
+  - This confirms every one of the 8 fixes above works correctly together
+    on real GPU hardware with the real checkpoint, including the
+    `flash_attn` CUDA kernel and the manually-unrolled latent-increment
+    injection path in `_predict_step_with_grad_latent` -- the decisive
+    validation this whole fix chain was working toward.
+- **Also prefetched, not yet used**: `ic_cache_aifs1/` additionally holds
+  2015-01-01T12, 2015-01-02T00, and 2015-01-02T12 (fetched in preparation
+  for a future multi-cycle test) -- see "Known gaps" below, `n_init > 1`
+  for aifs1 specifically is still unexercised.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
@@ -1193,6 +1334,14 @@ not assumed.
   `long-window-4dvar-fcstnetv3`) are still where active tuning work is
   happening (as of 2026-09-17) and have not been archived/retired -- don't
   assume this repo is the only place experiments are running.
+- **aifs1 (`aifs-single-1.1`) is only validated on a single 12h/5-epoch/
+  3-obs-slot smoke test so far** (see "AIFS-single-1.1 API compatibility
+  fixes" above) -- `restart: True` cycling and `n_init > 1` multi-cycle
+  runs are unexercised for this checkpoint specifically (`ic_cache_aifs1/`
+  already has 3 extra prefetched dates ready for this), and
+  `learn_rate`/`max_epoch`/window-length are all untuned (the 5-epoch test
+  used the same untuned defaults as the other backends' first smoke
+  tests).
 - Whether the latent increment could ever be injected at `t=0` instead of
   `t+timestep` (a NeuralGCM-style design, raised because FCN3 is
   self-starting/single-time-level unlike AIFS) was investigated empirically

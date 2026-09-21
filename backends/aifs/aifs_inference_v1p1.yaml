@@ -1,0 +1,38 @@
+description: |
+  Static anemoi-inference config for AIFS-single-1.1 (aifs_model.py), the
+  v1.1-specific counterpart to aifs_inference.yaml. Same rationale as that
+  file (only checkpoint/pre_processors/post_processors/patch_metadata/
+  typed_variables are actually used -- the driver never calls
+  runner.execute()/run(), only the lower-level pieces).
+
+  Why a SEPARATE file rather than reusing aifs_inference.yaml: that file's
+  pre_processors/post_processors/typed_variables are all workarounds for
+  wave variables (mwd, swh) and a snow-cover encoding issue (snowc/sd)
+  that AIFS-single-2.0 has and AIFS-single-1.1 does NOT -- confirmed
+  directly (2026-09-20) by checking v1.1's checkpoint.
+  variable_to_input_tensor_index: no mwd/swh/snowc/sd at all. Reusing that
+  file as-is fails outright for a different reason first: its
+  typed_variables field isn't recognized by anemoi-inference==0.6.3's
+  (aifs1's pin, older than aifs2's 0.8.3) RunConfiguration pydantic schema
+  (`Extra inputs are not permitted`) -- but even papering over that
+  schema error would leave the wave/snow fixes silently targeting
+  variables this checkpoint doesn't have.
+
+  `input`/`output`/`date`/`lead_time` below are placeholders required for
+  the config to load and are never exercised.
+
+checkpoint: backends/aifs/aifs-single-1.1/aifs-single-mse-1.1.ckpt
+
+date: 2015-01-01T00
+lead_time: 6
+input: opendata
+output:
+  grib:
+    path: /dev/null
+
+patch_metadata:
+  dataset:
+    constant_fields: [z, sdor, slor, lsm]
+
+use_grib_paramid: false
+allow_nans: true

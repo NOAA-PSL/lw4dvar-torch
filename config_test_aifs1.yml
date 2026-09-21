@@ -1,0 +1,37 @@
+exp:
+  model_backend: aifs
+  nhrs_back: 48
+  restart: False
+  rpath: './output/<previous_exp_name>/'
+  obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
+  nobs_max: 15000
+  ic_suffix: '12h_5it'
+  sdate: '2015-01-01T00'
+  n_init: 1
+  dt_init: 12
+  save_levs: [500]
+  cycle: False
+  exp_name: 'smoke_test_aifs1'
+
+  model_name: 'aifs-single-mse-1.1.ckpt'
+  path_model: './backends/aifs/aifs-single-1.1/'
+  aifs_config: 'backends/aifs/aifs_inference_v1p1.yaml'
+  device: 'cuda'
+  path_output: './output/'
+  ic_cache: './ic_cache_aifs1/'
+  print_every: 1
+
+windows:
+  '1':
+    n_verif: 2
+    dt_verif: 6
+    learn_rate: 1.0e-2
+    weight_decay: 1.0e-3
+    max_epoch: 5
+    warmup_steps: 1
+    start_factor: 0.5
+    end_factor: 0.5
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''
