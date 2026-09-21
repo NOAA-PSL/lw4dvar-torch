@@ -31,6 +31,7 @@ with no grad-blocking of their own; only `Runner.forecast()`'s outer
 
 import copy
 import datetime
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -168,7 +169,8 @@ class AIFSModel(forecast_model.LatentForecastModel):
     boundary is deliberately left unformalized for now.
     """
 
-    def __init__(self, checkpoint_path: str, config_path: str, device: str = "cuda"):
+    def __init__(self, checkpoint_path: str, config_path: str, device: str = "cuda",
+                 autocast_dtype: Optional[Union[str, torch.dtype]] = None):
         """
         Parameters
         ----------
@@ -183,6 +185,27 @@ class AIFSModel(forecast_model.LatentForecastModel):
             `output:`/`date:`/`lead_time:` in that file are unused
             placeholders), only `runner.model`/`runner.checkpoint` and the
             lower-level tensor-prep methods are used.
+        autocast_dtype : str or torch.dtype, optional
+            Overrides the autocast dtype used in `_predict_step_with_grad`/
+            `_predict_step_with_grad_latent`. By default (`None`) this class
+            uses `self.runner.autocast`, which anemoi-inference derives from
+            the checkpoint's own recorded TRAINING precision (both
+            aifs-single-1.1 and aifs-single-2.0 report `"16-mixed"` ->
+            `torch.float16`) -- appropriate for a plain forward pass, but
+            fp16's narrow dynamic range can overflow when backpropagating
+            through a long (here: 24-step/5-day) chained differentiable
+            rollout, the exact mechanism root-caused for Aurora's own
+            16-step divergence (see CLAUDE.md). Confirmed 2026-09-21:
+            aifs-single-1.1 hits this (non-finite `increment.grad`,
+            reproduced at 3 different learn_rates/epoch counts on an
+            otherwise-identical 5-day-window config that aifs-single-2.0
+            runs cleanly to completion on) -- this override exists to test
+            the same fix that resolved it for Aurora (force `bfloat16`,
+            which has fp32's exponent range at the same memory/speed class
+            as fp16) on aifs-single-1.1 specifically, without changing
+            aifs-single-2.0's already-validated default behavior. Accepts a
+            string (`"bfloat16"`/`"float16"`/`"float32"`, for config.yml)
+            or a `torch.dtype` directly.
         """
         # `device` isn't in aifs_inference.yaml (it has no fixed GPU/CPU
         # assumption baked in) -- pass it as an explicit override so callers
@@ -190,9 +213,12 @@ class AIFSModel(forecast_model.LatentForecastModel):
         # a login node with no GPU) can request device='cpu' without editing
         # the yaml, while the H100 driver gets 'cuda'.
         if device == "cuda":
-            # The forward rollout already runs its heaviest ops under a bf16
-            # torch.autocast (see _predict_step_with_grad*), and this whole
-            # pipeline already tolerates bf16-level numerical noise (see
+            # The forward rollout already runs its heaviest ops under a
+            # reduced-precision torch.autocast (see _predict_step_with_grad*
+            # -- fp16 by default, from the checkpoint's own recorded
+            # training precision, or bf16 if `autocast_dtype` overrides it,
+            # see that param's docstring above), and this whole pipeline
+            # already tolerates that level of numerical noise (see
             # CLAUDE.md's finite-difference-checks note) -- so there's no
             # accuracy reason to force full fp32 matmul precision for
             # whatever falls outside that autocast block (e.g.
@@ -227,6 +253,12 @@ class AIFSModel(forecast_model.LatentForecastModel):
         # torch.device(...) is idempotent on an existing torch.device, so
         # this normalizes both without needing a version branch.
         self._device = torch.device(self.runner.device)
+        if autocast_dtype is None:
+            self._autocast_dtype = self.runner.autocast
+        elif isinstance(autocast_dtype, str):
+            self._autocast_dtype = getattr(torch, autocast_dtype)
+        else:
+            self._autocast_dtype = autocast_dtype
         self.interface = self.runner.model  # AnemoiModelInterface
         self.multi_step = self.interface.multi_step
         self._timestep: datetime.timedelta = self.checkpoint.timestep
@@ -473,7 +505,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
         """
         xin = x[:, 0 : self.multi_step, None, ...]  # add ensemble dim
         xin = self.interface.pre_processors(xin, in_place=False)
-        with torch.autocast(device_type=self.device.type, dtype=self.runner.autocast):
+        with torch.autocast(device_type=self.device.type, dtype=self._autocast_dtype):
             # aifs2's pin (anemoi-models==0.9.3) added `grid_shard_shapes`
             # (distributed grid sharding, irrelevant here -- single-GPU
             # only, see this class's own docstring) to `forward()`'s
@@ -514,7 +546,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
         xin = x[:, 0 : self.multi_step, None, ...]  # add ensemble dim
         xin = self.interface.pre_processors(xin, in_place=False)
         m = self.interface.model  # AnemoiModelEncProcDec
-        with torch.autocast(device_type=self.device.type, dtype=self.runner.autocast):
+        with torch.autocast(device_type=self.device.type, dtype=self._autocast_dtype):
             batch_size = xin.shape[0]
             ensemble_size = xin.shape[2]
 

@@ -354,6 +354,7 @@ def get_model(exp):
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
+            autocast_dtype=exp.get('aifs_autocast_dtype', None),
         )
     elif backend == 'fcn3':
         _ensure_backend_on_path('fcn3')
