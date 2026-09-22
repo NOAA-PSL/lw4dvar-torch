@@ -309,6 +309,8 @@ def get_window(exp, window, windows):
     exp['warmup_steps'] = windows[window]['warmup_steps']
     exp['start_factor'] = windows[window]['start_factor']
     exp['end_factor'] = windows[window]['end_factor']
+    if 'beta1' in windows[window]: exp['beta1'] = windows[window]['beta1']
+    if 'beta2' in windows[window]: exp['beta2'] = windows[window]['beta2']
     exp['window_name'] = str(exp['n_verif'] * dt_verif)
     exp['suffix'] = windows[window]['suffix']
     return exp
@@ -332,6 +334,8 @@ def log_window(exp, logger):
     if 'zconst' in exp: logger.info('   zconst: ' + str(exp['zconst']))
     logger.info('   learn_rate: ' + str(exp['learn_rate']))
     logger.info('   weight_decay: ' + str(exp['weight_decay']))
+    if 'beta1' in exp: logger.info('   beta1: ' + str(exp['beta1']))
+    if 'beta2' in exp: logger.info('   beta2: ' + str(exp['beta2']))
     logger.info('   max_epoch: ' + str(exp['max_epoch']))
     logger.info('   start_factor: ' + str(exp['start_factor']))
     logger.info('   end_factor: ' + str(exp['end_factor']))
@@ -1210,6 +1214,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     wd = exp['weight_decay']
     max_epoch = exp['max_epoch']
     print_every = exp.get('print_every', -1)
+    beta1 = exp.get('beta1',0.9)
+    beta2 = exp.get('beta2',0.99)
     latent_scale = float(exp.get('latent_scale', 1.0))
 
     # Which decoded fields must be time-interpolated for a sub-6h obs slot
@@ -1243,7 +1249,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         with torch.no_grad():
             ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
 
-    optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd)
+    optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd, betas=(beta1,beta2))
 
     # linear warmup/cosine decay
     # (parameters: warmup_steps, start_factor, end_factor)
