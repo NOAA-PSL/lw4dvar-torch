@@ -359,6 +359,7 @@ def get_model(exp):
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
             autocast_dtype=exp.get('aifs_autocast_dtype', None),
+            compile_wrapper=exp.get('compile_wrapper', False),
         )
     elif backend == 'fcn3':
         _ensure_backend_on_path('fcn3')

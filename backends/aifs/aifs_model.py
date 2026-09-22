@@ -170,7 +170,8 @@ class AIFSModel(forecast_model.LatentForecastModel):
     """
 
     def __init__(self, checkpoint_path: str, config_path: str, device: str = "cuda",
-                 autocast_dtype: Optional[Union[str, torch.dtype]] = None):
+                 autocast_dtype: Optional[Union[str, torch.dtype]] = None,
+                 compile_wrapper: bool = False):
         """
         Parameters
         ----------
@@ -206,6 +207,19 @@ class AIFSModel(forecast_model.LatentForecastModel):
             aifs-single-2.0's already-validated default behavior. Accepts a
             string (`"bfloat16"`/`"float16"`/`"float32"`, for config.yml)
             or a `torch.dtype` directly.
+        compile_wrapper : bool
+            Wrap the model's `encoder`/`processor`/`decoder` submodules
+            (not the whole `AnemoiModelEncProcDec` -- see the comment at
+            the call site below for why) in `torch.compile()`, matching
+            the same opt-in speedup lever validated for Aurora (a real,
+            confirmed 1.78x end-to-end speedup there). Never tried for
+            AIFS before 2026-09-22 -- AIFS was always the fast reference
+            backend (~18.25s/epoch on a 20-step window) FCN3/Aurora were
+            compared against and optimized toward closing the gap to, not
+            a target for its own optimization pass. Off by default;
+            correctness/speed not yet validated at real production scale
+            when this param was added -- see CLAUDE.md for whatever the
+            first real test found.
         """
         # `device` isn't in aifs_inference.yaml (it has no fixed GPU/CPU
         # assumption baked in) -- pass it as an explicit override so callers
@@ -260,6 +274,25 @@ class AIFSModel(forecast_model.LatentForecastModel):
         else:
             self._autocast_dtype = autocast_dtype
         self.interface = self.runner.model  # AnemoiModelInterface
+        if compile_wrapper:
+            # `_predict_step_with_grad_latent` (the differentiable-rollout
+            # hot path used by every epoch of the optimization loop) never
+            # calls `AnemoiModelEncProcDec.forward()` directly -- it calls
+            # the encoder/processor/decoder submodules individually (see
+            # that method's docstring for why: manually unrolled so the
+            # latent increment can be injected between encoder and
+            # processor). So, unlike Aurora's `compile_wrapper` (which
+            # wraps the whole model because Aurora's own differentiable
+            # path DOES go through its normal forward()), compiling
+            # `self.interface.model` as a whole would only speed up
+            # `_predict_step_with_grad`'s direct `.forward()` call (used
+            # to build the background forecast, not the analysis loop) --
+            # the three submodules actually on the hot path must be
+            # compiled individually instead.
+            m = self.interface.model
+            m.encoder = torch.compile(m.encoder)
+            m.processor = torch.compile(m.processor)
+            m.decoder = torch.compile(m.decoder)
         self.multi_step = self.interface.multi_step
         self._timestep: datetime.timedelta = self.checkpoint.timestep
 

@@ -1056,6 +1056,81 @@ issues. aifs1 diverged partway through cycle 1 every time it was tried.
   matching this repo's existing convention for one-off diagnostic configs
   (see the Aurora bisection configs' own note above).
 
+## AIFS torch.compile: tested, blocked by a real PyTorch inductor bug (2026-09-22)
+
+AIFS had never been profiled or optimization-tuned in this codebase at all
+-- it was always the fast reference backend (~18.25s/epoch on a 20-step
+window) that FCN3 (5.2x slower) and Aurora (~4-5x slower) were measured
+against and optimized toward, not a target for its own optimization pass.
+`torch.compile` had a real, validated 1.78x payoff for Aurora, so it was
+worth trying for AIFS too, at the user's request.
+
+- **AIFS's differentiable hot path never calls `AnemoiModelEncProcDec
+  .forward()` directly** (`_predict_step_with_grad_latent` manually
+  unrolls encoder -> `+ latent_increment` -> processor -> decoder to
+  inject the control increment -- see that method's docstring). So,
+  unlike Aurora's `compile_wrapper` (which wraps the whole model, since
+  Aurora's own differentiable path DOES go through its normal `forward()`
+  via a hook), `AIFSModel`'s new `compile_wrapper: bool = False`
+  constructor param (`aifs_model.py`, wired through `get_model()` as
+  `exp['compile_wrapper']`, same config key Aurora uses) compiles the
+  `encoder`/`processor`/`decoder` submodules individually right after
+  construction, not the whole model.
+- **`processor` alone crashes `torch.compile`**: `torch._inductor.exc
+  .InductorError: KeyError: 'op5'`, raised deep inside inductor's
+  scheduler (`decide_inplace_update` -> `get_fused_node` -> a missing
+  fused-node name) -- a genuine PyTorch/inductor compiler-internal bug at
+  this installed torch version, not something traceable to this repo's
+  code. Reproduced identically and consistently across 4 independent
+  test runs (`backends/aifs/probe_aifs_compile_isolate.py`, one fresh
+  model instance per case in one job so a crash in one case can't corrupt
+  another's measurement).
+- **`encoder` and `decoder` alone both compile without crashing** -- but
+  getting a clean CORRECTNESS read out of them took 3 iterations on the
+  probe script's own loss function, not the compilation itself:
+  1. First attempt (`out.state.float().pow(2).mean()`, mirroring Aurora's
+     own probe script's loss exactly): produced `grad norm = nan` --
+     but so did the fully UNCOMPILED control at the identical setting,
+     ruling out compilation as the cause before looking further.
+  2. Standardizing that same raw-state loss (`(s - s.mean())/(s.std()+eps)`,
+     to rule out an fp16-autocast-overflow-from-large-raw-magnitude
+     explanation, the same mechanism already root-caused for aifs1's own
+     divergence and for Aurora's original bug): still `nan`, uncompiled
+     included -- ruling that mechanism out too.
+  3. Scoping the loss to `model.decode_state(out, only=['z'])['z']`
+     (a real prognostic field, the same one actual z500 diagnostics
+     read) instead of the raw ~92-channel packed state tensor: finite
+     (`grad norm = 0.0`) for all three of none/encoder/decoder --
+     **identical across all three**, i.e. no evidence compiling
+     introduces a divergence, though the value being exactly `0.0` (not
+     just small) for the UNCOMPILED baseline too means this specific
+     4-step/zero-initialized-increment/single-field probe just isn't a
+     sensitive-enough test to give a strong positive correctness signal
+     either way -- concluded "no discrepancy found" rather than "verified
+     correct to some real tolerance." (The raw `out.state` tensor
+     containing a NaN in some channel no real production loss reads is
+     itself a mildly interesting side-finding -- consistent with an
+     unclipped diagnostic/accumulated-forcing channel, the same class of
+     thing already documented for Aurora -- but not chased further since
+     it's orthogonal to the compile question.)
+- **Conclusion: not pursued further.** `processor` is architecturally
+  almost certainly AIFS's dominant compute cost (the deep repeated
+  message-passing/transformer block stack that does the actual forecast
+  dynamics, vs. encoder/decoder's thin single-layer physical-grid <->
+  hidden-mesh transfers -- the same shape as GraphCast/Pangu-style
+  architectures) -- so an encoder+decoder-only compile, even if it were
+  fully correctness-verified, would likely capture only a small fraction
+  of whatever speedup a full compile could give, and wasn't worth the
+  further GPU time to even measure its timing. `compile_wrapper` is left
+  in `aifs_model.py`/wired through `get_model()` as a real, off-by-default
+  opt-in (compiling all three submodules, matching what a config would
+  naturally request) in case a future PyTorch/inductor version fixes this
+  specific scheduler bug -- not recommended to enable today.
+- Diagnostic scripts (`backends/aifs/probe_aifs_compile.py`,
+  `probe_aifs_compile_isolate.py`, `run_probe_aifs_compile.sh`,
+  `run_probe_aifs_compile_isolate.sh`) left uncommitted/untracked, matching
+  this repo's convention for one-off diagnostic tooling.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
