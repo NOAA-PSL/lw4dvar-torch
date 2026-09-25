@@ -208,6 +208,7 @@ backends/aurora/hf_cache/
 config.yml
 psobs
 ic_cache/
+ic_cache_ace2/
 output/
 *.out
 *.err

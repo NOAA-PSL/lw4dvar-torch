@@ -1,0 +1,40 @@
+exp:
+  model_backend: ace2
+
+  nhrs_back: 48
+  restart: False
+  rpath: './output/<previous_exp_name>/'
+  obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
+  nobs_max: 15000
+  ic_suffix: '12h_5it'
+  sdate: '2015-01-01T00'
+  n_init: 1
+  dt_init: 12
+  save_levs: [1000, 850, 500, 250, 50]
+  cycle: False
+  exp_name: 'smoke_test_ace2'
+
+  path_model: './backends/ace2/ACE2-ERA5/'
+  model_name: 'ace2_era5_ckpt.tar'
+  device: 'cuda'
+  path_output: './output/'
+  ic_cache: './ic_cache_ace2/'
+  print_every: 1
+  oberrstart: 1.0
+  oberrdeltaperday: 0.25
+  # ps_operator defaults to 'ps_native' for ACE2
+
+windows:
+  '1':
+    n_verif: 2
+    dt_verif: 6
+    learn_rate: 2.5e-3
+    weight_decay: 1.0e-3
+    max_epoch: 5
+    warmup_steps: 1
+    start_factor: 0.5
+    end_factor: 0.5
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''
