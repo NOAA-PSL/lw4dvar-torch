@@ -49,6 +49,10 @@ backends/aifs/
 backends/fcn3/
   fcn3_model.py, fcn3_grid.py, fcn3_ic.py
   fourcastnet3/                # git submodule -> huggingface.co/nvidia/fourcastnet3
+backends/ace2/
+  ace2_model.py, ace2_grid.py, ace2_ic.py, ace2_prefetch_checkpoint.py
+  ACE2-ERA5/                   # git submodule -> huggingface.co/allenai/ACE2-ERA5
+                               # (POINTER-ONLY, selective LFS -- see ACE2 section)
 ```
 
 `long_window_4dvar_utils.py` is 1526 lines, `long_window_4dvar.py` is 247 --
@@ -66,6 +70,8 @@ aifs2:     /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs2      (AIFS-single-2.0
 aifs1:     /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs1      (AIFS-single-1.1: anemoi 0.5-0.6.x / torch-geometric 2.4.0 / flash-attn)
 fcstnet3:  /scratch4/BMC/gsienkf/whitaker/conda/envs/fcstnet3   (makani / physicsnemo / torch-harmonics)
 aurora:    /scratch4/BMC/gsienkf/whitaker/conda/envs/aurora     (microsoft-aurora / torch)
+ace2:      /scratch4/BMC/gsienkf/whitaker/conda/envs/ace2       (fme 2026.5.1 / torch-harmonics 0.8.0)
+ace2ic:    /scratch4/BMC/gsienkf/whitaker/conda/envs/ace2ic     (login-node IC/verif fetch only: xesmf/zarr/gcsfs, conda-forge, NO torch)
 ```
 
 All four pin `torch==2.7.1+cu128` (same CUDA/ABI target), but their
@@ -146,6 +152,7 @@ submodules at the user's request:
 backends/aifs/aifs-single-2.0  -> https://huggingface.co/ecmwf/aifs-single-2.0/   @ 08286fc
 backends/fcn3/fourcastnet3     -> https://huggingface.co/nvidia/fourcastnet3/     @ df5d8d0
 backends/aifs/aifs-single-1.1  -> https://huggingface.co/ecmwf/aifs-single-1.1    @ 049b9ab
+backends/ace2/ACE2-ERA5        -> https://huggingface.co/allenai/ACE2-ERA5        @ f25123c  (pointer-only, see ACE2 section)
 ```
 
 `aifs-single-1.1` (added 2026-09-20, see "`aifs1` environment" below) was
@@ -1130,6 +1137,169 @@ worth trying for AIFS too, at the user's request.
   `probe_aifs_compile_isolate.py`, `run_probe_aifs_compile.sh`,
   `run_probe_aifs_compile_isolate.sh`) left uncommitted/untracked, matching
   this repo's convention for one-off diagnostic tooling.
+
+## Fourth backend: Ai2 ACE2-ERA5 (`model_backend: ace2`, 2026-09-24/25)
+
+Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
+(pip `fme==2026.5.1`). Validated end to end through `long_window_4dvar.py`
+(job 22295991, see below).
+
+- **Architecture, from the real checkpoint + installed `fme` source**:
+  `fme.ace.models.modulus.sfnonet.SphericalFourierNeuralOperatorNet`
+  (embed_dim 384, 8 blocks, scale_factor 1) on the F90 Gaussian grid
+  (180x360, Legendre-Gauss latitudes **south-to-north**, lon 0.5..359.5),
+  6h step, **deterministic and self-starting** (one time level, like FCN3).
+  Vertical coordinate is 8 hybrid sigma-pressure LAYERS (ak/bk in the
+  checkpoint), not pressure levels. 38 prognostics (`air_temperature_k`,
+  `specific_total_water_k`, `eastward_wind_k`, `northward_wind_k`, k=0 top
+  .. 7 bottom; `PRESsfc`, `surface_temperature`, `TMP2m`, `Q2m`, `UGRD10m`,
+  `VGRD10m`), 12 output-only diagnostics (fluxes, `PRATEsfc`, `TMP850`,
+  `h500`) -- all 50 from ONE decoder (no secondary decoder in this
+  checkpoint). Forcings read every step from the yearly `forcing_YYYY.nc`
+  files: `land_fraction`, `ocean_fraction`, `sea_ice_fraction`, `HGTsfc`,
+  `global_mean_co2` at the input time, `DSWRFtoa` at the target time; the
+  checkpoint's `ocean` config then overwrites `surface_temperature` over
+  ocean with the forcing SST, and a conservation corrector (dry air,
+  moisture budget, positivity) runs after every step. **SST and sea ice
+  therefore come from the forcing file for the window's year every step** --
+  a window touching 2014-12-30..2015-01 needs both `forcing_2014.nc` and
+  `forcing_2015.nc`.
+- **`ACE2Model`** (`backends/ace2/ace2_model.py`) calls `fme`'s own
+  `Stepper.step` (not a reimplementation). Latent = output of the SFNO's
+  last block, `latent_shape (384, 180, 360)`, injected by a forward hook
+  registered/removed INSIDE the checkpointed function (so a recompute
+  re-applies it). Runs in fp32 -- none of the fp16-autocast issues from
+  AIFS/Aurora apply. `state_layout='channels_first'`, packed state
+  `(1, 50, 180, 360)` (prognostics first; diagnostics NaN on an initial
+  state that hasn't been stepped).
+- **`control_variables` names for ACE2** (`resolve_columns`, whole families
+  only): layer families `air_temperature`, `specific_total_water`,
+  `eastward_wind`, `northward_wind` (all 8 layers each); singles `PRESsfc`,
+  `surface_temperature`, `TMP2m`, `Q2m`, `UGRD10m`, `VGRD10m`, plus the
+  output-only diagnostics (`h500`, `TMP850`, `PRATEsfc`, `LHTFLsfc`,
+  `SHTFLsfc`, `ULWRFsfc`, `ULWRFtoa`, `DLWRFsfc`, `DSWRFsfc`, `USWRFsfc`,
+  `USWRFtoa`, `tendency_of_total_water_path_due_to_advection`) -- masking
+  those only changes their own t+6h value, they never feed the network.
+  The derived `z`/`t`/`q`/`u`/`v`/`sp`/`z500` are NOT valid control names
+  (no packed columns -> KeyError); they are valid `loss_variables`.
+- **Real bug found and worked around: wrong first checkpointed gradient on
+  CUDA.** With `torch.utils.checkpoint(use_reentrant=False)` (what every
+  other backend uses), the FIRST gradient-enabled checkpointed rollout after
+  any `torch.no_grad()` rollout (e.g. the background forecast) returned a
+  wrong latent gradient: cos 0.12 vs finite differences at 1 step, norm 110x
+  too large at 4 steps, loss itself correct. Every later call, every plain
+  (non-checkpointed) call, and the same sequence on CPU were exact
+  (`probe_ace2_ckpt_grad.py`, `probe_ace2_ckpt_first.py`, untracked:
+  variants -- warm-up plain call first: exact; early-stop off: still wrong;
+  `use_reentrant=True`: exact; no preceding no-grad rollout: exact). Root
+  cause NOT identified (nothing grad-mode-dependent found in `fme`/
+  `sht_fix.py`/torch-harmonics forward code; CPU/CUDA split points at a
+  lazily initialized CUDA resource). **Fix: `ACE2Model` uses
+  `use_reentrant=True`** (backprop only through the graph rebuilt during
+  backward, so a first-forward/recompute disagreement can't reach the
+  gradient; needs `.backward()`, which is all the solver uses).
+  Consequence if unfixed (reasoned, not run): epoch 1's AdamW step goes in
+  a near-random direction, and a 110x-too-large first gradient would
+  inflate AdamW's second moment ~12000x, suppressing step sizes for
+  hundreds of epochs -- finite, loss-correct, invisible to the
+  non-finite-gradient guard. **Other backends checked with the same probe
+  (`probe_first_call_grad.py`, repo root, untracked, via the real
+  `load_config`/`get_model`/`get_input` path): AIFS 2.0, AIFS 1.1, Aurora,
+  FCN3 all NOT affected** (first call agrees with the plain gradient exactly
+  as well as the second call does; AIFS's ~5% scatter vs plain is fp16
+  autocast noise present in both calls).
+- **Pressure-level fields are derived, and biased for z**: `decode_state`
+  derives `z`/`t`/`q`/`u`/`v` on the 13 ERA5 levels hydrostatically from
+  the layers (same method/constants as `fme`'s own
+  `atmosphere_data.compute_layer_thickness`, HGTsfc negatives clipped to 0
+  like fme). Against ERA5: derived z500 is **-18.6 m mean / 20 m rms** even
+  from ERA5-derived layers (an intrinsic 8-layer limitation, not a model
+  error), vs ACE2's own `h500` output at **+0.4 m / 2.8 m rms** after 6h;
+  derived t850 ~1.0 K rms vs `TMP850` 0.55 K. Hence:
+  - **z500 diagnostic uses ACE2's own h500**: new `utils.z500_field()` uses a
+    backend-supplied `'z500'` key when present (ACE2: g*h500 from both
+    `decode_state` and `get_verif`), else `geopotential[nlev500]` -- other
+    backends unchanged. The `bg(t0)` line is NaN if `nhrs_back: 0` (an
+    unstepped IC has no h500).
+  - **New `ps_operator: 'ps_native'` (ACE2 default, ACE2-only)**: `preduce`
+    with the lowest NATIVE layer's t/q and its own per-point midpoint
+    pressure (`t_lowest`/`q_lowest`/`p_lowest` decode keys; midpoint is
+    16-50 hPa above the surface, mean 46) instead of t/q interpolated to
+    700 hPa. Model orography = g*HGTsfc from the forcing file (NOT an ERA5
+    fetch -- ACE2's PRESsfc is consistent with it). `'logpinterp'` is still
+    allowed explicitly but would search the biased derived z (~2 hPa of ps);
+    `'ps'` and `reset_skt_ocean` are rejected for ACE2 by `load_config`.
+- **ICs from the PUBLIC ARCO-ERA5 bucket** (`backends/ace2/ace2_ic.py`,
+  `gs://gcp-public-data-arco-era5`, anonymous -- no billing project; Ai2's
+  own processed zarr is requester-pays and HF only has ICs for
+  1940/1950/1979/2001/2020). Vendors the model-level stream of Ai2's
+  CURRENT pipeline (`ai2cm/ace` `scripts/era5/pipeline/xr-beam-pipeline.py`):
+  137 L137 levels pressure-weighted into the 8 layers (indices
+  `[0,48,67,79,90,100,109,119,137]` reproduce the checkpoint's ak/bk
+  exactly), conservative xESMF regrid to F90, Q2m from dewpoint. ~1 min and
+  ~2.5-3 GB read per IC date. **Known, accepted difference from the training
+  data**: ACE2-ERA5's 2024-11-13 dataset came from the PREVIOUS pipeline
+  (commit aa08fe0312: native spectral/reduced-Gaussian ARCO `co/` stores,
+  MetView/MIR point-sampled regrid, vertical coarsening after regridding).
+  Validated vs HF `ic_2020.nc` (`compare_ic_ace2.py`): means ~0 everywhere,
+  rms/std 0.1-0.7% upper layers, 2-6% near surface. **PRESsfc is
+  hydrostatically reduced from its conservative ERA5 orography to ACE2's
+  HGTsfc** (user's suggestion): 431 -> 280 Pa rms vs the official IC (the
+  official PRESsfc implies an orography within 26.7 m rms of HGTsfc -- the
+  Hawaii-type cells where they disagree are rare outliers); Q2m uses the
+  UNadjusted PRESsfc (better: 2.8% vs 3.3%). Accepted because ICs only START
+  an experiment; the static field the ps operator uses every cycle (HGTsfc)
+  comes straight from Ai2's forcing files (bitwise identical across years).
+- **Verification**: `ace2_ic.py --verif DATES` writes ERA5 z500 (as `h500`,
+  m) and t850 (`TMP850`) from ARCO `full_37`, conservatively regridded to
+  F90 (~160 MB read, ~10-20 s per date). January 2015 (124 six-hourly
+  dates) and IC 2014-12-30T00 are in `ic_cache_ace2/` (gitignored).
+- **Grid**: `backends/ace2/ace2_grid.py` `RectilinearBilinearInterpolator`
+  -- `fcn3_grid.BilinearGridInterpolator` rejects Gaussian latitudes (not
+  uniformly spaced). Exact at grid points, 2.3e-4 max error on a smooth
+  analytic field; clamps to the edge row poleward of |lat| 89.24.
+- **Two envs, deliberately**: `ace2` (GPU: torch 2.7.1+cu128 installed
+  first, torch-harmonics 0.8.0 built `--no-build-isolation --no-deps`, then
+  `fme` with torch/torchvision/triton pinned via a constraints file -- `pip
+  check` clean) and `ace2ic` (login node only, all conda-forge: xesmf/ESMF,
+  zarr 3, gcsfs; no torch). Adding xesmf to `ace2` would have made conda
+  overlay numpy/pandas/xarray/shapely onto the pip-installed stack plus an
+  MPI HDF5 -- kept separate instead. Specs: `ace2-spec.txt`,
+  `ace2-requirements.txt`, `ace2ic-spec.txt`.
+- **Submodule is POINTER-ONLY** (`backends/ace2/ACE2-ERA5` @ f25123c): the
+  HF repo is ~75 GB of LFS (45 GB of yearly forcings + training samples).
+  Fresh clone: `GIT_LFS_SKIP_SMUDGE=1 git submodule update --init
+  backends/ace2/ACE2-ERA5`, then `python
+  backends/ace2/ace2_prefetch_checkpoint.py [YEAR ...]` (login node; pulls the
+  checkpoint, `ic_2020.nc`, and the listed forcing years with `git lfs pull
+  --include`, and records them in the submodule's local `lfs.fetchinclude`).
+  Currently fetched: checkpoint, `ic_2020.nc`, forcing 2014/2015/2020.
+  `ACE2Model` skips LFS pointer stubs and names the year to fetch if a
+  rollout hits one. Populated initially by hard-linking the earlier
+  `huggingface_hub` cache into the submodule's LFS store (gotcha: newer
+  huggingface_hub keeps `blobs/<sha256>` as a SYMLINK into Xet storage --
+  hard-link the resolved file, not the symlink). `git lfs fsck` reports
+  every unfetched object as missing -- expected for a pointer-only checkout.
+- **Speed**: smoke test (`smoke_test_ace2.py`, from HF `ic_2020.nc`): 20-step
+  differentiable rollout fwd+bwd **2.6 s at 10.2 GiB peak** (4 steps: 0.47 s,
+  9.9 GiB) -- roughly 7x faster than AIFS per matched epoch and with almost
+  flat memory growth in window length.
+- **First end-to-end run** (`config_test_ace2.yml` / `run_ace2.sh`: 48h
+  back-forecast from the 2014-12-30T00 ARCO IC, 12h window, 5 epochs,
+  `learn_rate: 2.5e-3`, real ps obs; job 22295991, 43 s total, ~0.2 s/epoch):
+  `Jtot` 59436 -> 49483, monotonic; obs used 8213/9112, 8739/9691,
+  8969/9969 (~90% vs AIFS's ~98%: t+0h rejections = 332 orography-difference
+  -- expected on a 1-deg grid -- + 567 gross check). `ps_native` O-B at t+0h
+  (used obs): **mean -0.04 hPa, std 2.08 hPa**; by station elevation <200 m
+  -0.23/1.89, 200-1000 m +0.30/2.23, >1000 m +0.67/3.00. z500 GL rms:
+  bg(t0) 8.86 m (AIFS 8.54, FCN3 10.37 on the same 48h back-date), before
+  10.20 -> after 10.16 (flat, untuned 5-epoch toy window -- validates the
+  pipeline, not analysis quality).
+- **Deferred at the user's request**: an ACE2-only physical-space increment
+  at t0 (normalized by ACE2's own stds) instead of the latent increment at
+  t+6h -- revisit once the ACE2 solver is tuned. Not yet done: learn_rate
+  tuning, a 5-day/100-epoch run matching the other backends' comparison,
+  `restart`/multi-cycle runs.
 
 ## Known gaps / next steps
 
