@@ -74,6 +74,11 @@ exp:
   # loss at beginning of window (crude treatment of model error).
   oberrstart: 1.0 # ob error at start of window (-1 to use values in obs file)
   oberrdeltaperday: 0.25 # ob error increase (per day) within window.
+  # qc_fixed_oberr: gross check (bg_check) uses the START-of-window ob error
+  # instead of the grown one, so down-weighting late-window obs via
+  # oberrdeltaperday doesn't also loosen their QC. Default False (earlier
+  # runs' behavior: QC uses the grown error).
+  #qc_fixed_oberr: True
 
   # The 4D-Var control variable is a one-time latent-space increment
   # injected at the first rollout step -- NOT a physical-space

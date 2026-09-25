@@ -743,7 +743,7 @@ def get_psobs(exp, model, logger, grid_interp):
         vdate = add_hours(vdate, dt_obs)
     logger.info('max number of obs at each slot in window:' + str(nobs_max))
 
-    for k in ['obtype', 'lon', 'lat', 'elev', 'ob', 'oberr']:
+    for k in ['obtype', 'lon', 'lat', 'elev', 'ob', 'oberr', 'oberr_qc']:
         if k in ('ob', 'elev'):
             psobs_traj[k] = torch.zeros((n_obs, nobs_max), dtype=torch.float32, device=device)
         elif k == 'obtype':
@@ -765,9 +765,13 @@ def get_psobs(exp, model, logger, grid_interp):
         psobs_traj['ob'][j, :nobs] = torch.as_tensor(psobs_data[:, 5], dtype=torch.float32, device=device)
         tday = j * dt_obs / 24.
         if oberrstart > 0:
-            psobs_traj['oberr'][j, :nobs] = oberrstart + oberrdeltaperday * tday
+            base_err = torch.full((nobs,), float(oberrstart), dtype=torch.float32, device=device)
         else:
-            psobs_traj['oberr'][j, :nobs] = torch.as_tensor(psobs_data[:, 7], dtype=torch.float32, device=device) + oberrdeltaperday * tday
+            base_err = torch.as_tensor(psobs_data[:, 7], dtype=torch.float32, device=device)
+        psobs_traj['oberr'][j, :nobs] = base_err + oberrdeltaperday * tday
+        # start-of-window error, without the oberrdeltaperday growth -- used by
+        # the gross check instead of 'oberr' when qc_fixed_oberr is set
+        psobs_traj['oberr_qc'][j, :nobs] = base_err
     logger.info('ps ob times:' + str(psobs_datestrings))
 
     # Per-slot time-bracketing metadata: step_lo = floor(t_j / 6h), alpha =
@@ -952,9 +956,18 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
     orography_difference = torch.where(preliminary_rejected, torch.zeros_like(safe_elevation), torch.abs(safe_model_orography - safe_elevation))
     orography_failed = orography_difference > zthresh
     effective_error = assigned_error + zconst * orography_difference
+    # qc_fixed_oberr: gross-check against the START-of-window error (no
+    # oberrdeltaperday growth), so down-weighting late-window obs in the loss
+    # doesn't also loosen their QC (bg_check * sigma would otherwise grow from
+    # e.g. 4 to 14 hPa by 120h at oberrdeltaperday=0.5). Opt-in, so earlier
+    # runs with oberrdeltaperday > 0 stay reproducible.
+    if exp.get('qc_fixed_oberr', False):
+        qc_error = psobs_traj['oberr_qc'][oind, :] + zconst * orography_difference
+    else:
+        qc_error = effective_error
     base_rejected = preliminary_rejected | interpolation_failed | orography_failed
     innovation = observation - model_equivalent
-    gross_check_failed = (~base_rejected) & (torch.abs(innovation / effective_error) > bg_check)
+    gross_check_failed = (~base_rejected) & (torch.abs(innovation / qc_error) > bg_check)
     total_rejected = preliminary_rejected | interpolation_failed | orography_failed | gross_check_failed
     used = ~total_rejected
 
