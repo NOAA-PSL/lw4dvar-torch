@@ -1030,6 +1030,9 @@ def _resolve_control_mask(model, exp, n_vars, device):
              exactly zeroed (it can still evolve downstream in response to the
              controlled variables).
 
+    A backend's `diagnostic_columns` (output-only fields, if it declares
+    any) are always True, whatever `control_variables` says -- see below.
+
     Returns `None` when `control_variables` is absent (no masking -- the
     increment is free on every variable, the default behaviour).
 
@@ -1055,6 +1058,14 @@ def _resolve_control_mask(model, exp, n_vars, device):
             raise KeyError(f"control_variables entry {base!r} is not a model variable or family")
         for i in cols:
             mask[i] = True
+    # Output-only diagnostic columns (backend-declared, e.g. ACE2's h500/
+    # TMP850/fluxes) are never reset: they don't feed the next step, so
+    # resetting them protects nothing and only replaces the analysis's own
+    # diagnosis with the background's -- which made ACE2's h500-based z500
+    # "after" line identical to "before" whenever control_variables omitted
+    # h500.
+    for i in getattr(model, 'diagnostic_columns', ()):
+        mask[i] = True
     return mask
 
 

@@ -1178,8 +1178,14 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
   `surface_temperature`, `TMP2m`, `Q2m`, `UGRD10m`, `VGRD10m`, plus the
   output-only diagnostics (`h500`, `TMP850`, `PRATEsfc`, `LHTFLsfc`,
   `SHTFLsfc`, `ULWRFsfc`, `ULWRFtoa`, `DLWRFsfc`, `DSWRFsfc`, `USWRFsfc`,
-  `USWRFtoa`, `tendency_of_total_water_path_due_to_advection`) -- masking
-  those only changes their own t+6h value, they never feed the network.
+  `USWRFtoa`, `tendency_of_total_water_path_due_to_advection`). The
+  output-only diagnostics are ALWAYS left as the corrected step produced
+  them (`ACE2Model.diagnostic_columns`, honored by
+  `_resolve_control_mask`) -- they never feed the network, so listing them
+  or not makes no difference. Before this fix (2026-09-25), omitting `h500`
+  reset it to the background at the analysis time, making the z500 "after"
+  line bit-identical to "before" in the user's first 5-day/50-epoch run even
+  though PRESsfc changed by 35 Pa rms there.
   The derived `z`/`t`/`q`/`u`/`v`/`sp`/`z500` are NOT valid control names
   (no packed columns -> KeyError); they are valid `loss_variables`.
 - **Real bug found and worked around: wrong first checkpointed gradient on

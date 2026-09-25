@@ -290,6 +290,14 @@ class ACE2Model(forecast_model.LatentForecastModel):
         return self._latent_shape
 
     @property
+    def diagnostic_columns(self) -> list[int]:
+        """Packed-state columns of ACE2's output-only diagnostics (h500,
+        TMP850, fluxes, PRATEsfc, ...). They never feed the network, so the
+        solver's control mask always leaves them as the corrected step
+        produced them (see long_window_4dvar_utils._resolve_control_mask)."""
+        return list(range(len(self._prognostic), len(self._channel_names)))
+
+    @property
     def surface_geopotential(self) -> torch.Tensor:
         """(n_points,) g * HGTsfc (m^2/s^2) -- ACE2's own static orography
         (from the HF forcing files, negatives clipped to 0 like fme does),
