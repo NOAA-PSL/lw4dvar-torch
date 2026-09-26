@@ -1307,6 +1307,50 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
   tuning, a 5-day/100-epoch run matching the other backends' comparison,
   `restart`/multi-cycle runs.
 
+## Area weights, and the `jc_ps_sigma` balance penalty (2026-09-26)
+
+- **`model.area_weights`** (`forecast_model.area_weights_from_lats`,
+  inherited by every backend): exact relative grid-cell areas (mean 1) for
+  any latitude-row grid. Gaussian rows (ACE2 F90, AIFS N320) use the
+  Gauss-Legendre quadrature weight as the band area; regular grids use bands
+  between row midpoints (FCN3's/Aurora's pole rows get their polar-cap area,
+  not 0); each band is shared by the row's points. Used by the driver's
+  `printz500err`, the Jc penalty, the `logpinterp` rejected-ob fill value,
+  and `diagnostics/z500err_window.py`/`z500err_ts.py`.
+  - **This corrects AIFS z500 numbers.** Everything previously weighted
+    each point by cos(lat), which is right for regular/Gaussian grids but
+    double-counts the latitude factor on AIFS's reduced octahedral grid
+    (points per row shrink toward the poles): it gave |lat|<20 42% of the
+    weight (true 34%) and >60 deg 5.8% (true 13.4%). Example (aifs1, 24h
+    lead): global z500 RMS 11.07 -> 12.50 m, NH 15.83 -> 16.63, SH 12.30 ->
+    13.54, tropics unchanged. **All AIFS z500 errors quoted earlier in this
+    file (and in older logs) are cos(lat)-weighted and understate the
+    area-weighted error** -- fine for AIFS-vs-AIFS comparisons, not for AIFS
+    vs FCN3/Aurora/ACE2. ACE2/FCN3/Aurora numbers are unchanged (to 0.01 m).
+  - AIFS diagnostics must run in an AIFS env (`aifs_ic` needs `eccodes`),
+    with `--cache_dir=./ic_cache_aifs1/` for aifs1 runs.
+- **Why a balance penalty -- ACE2 increment analysis** (477 cycles of the
+  6h-cycled, 5-day-window, 50-epoch run, Jan-Apr 2015): the RMS increment
+  (analysis - background) has a transient mass-field part -- PRESsfc 0.53
+  hPa (NH) / 0.32 (TR) / 0.24 (SH) at 6h, down ~5x by 24h, same for h500
+  (2.5 -> 1.0 m NH) -- while u250/T850 increments grow steadily through the
+  window. At 6h the analysis h500 error is WORSE than the background's in
+  every region (+0.36 m NH). The background error also decays from window
+  start to ~36-40h (NH 15.03 -> 14.54 m): with 6h cycling each background
+  starts from the previous analysis at +6h and inherits the transient. SH
+  (fewer ps obs, smaller transient) has its minimum at the window start.
+- **`jc_ps_sigma` (hPa, opt-in, ACE2/AIFS/Aurora; not FCN3)**: Jc =
+  sum_i w_i (Delta_i / jc_ps_sigma)^2, w = `area_weights`, Delta = (an -
+  bg)(t+12h) - (an - bg)(t+6h) in surface pressure -- the analysis ps
+  tendency minus the background's over the first step after injection, so
+  tides/real tendencies cancel. Background ps at 6h/12h from one no-grad
+  rollout per window. Single-window test (Jan 1, 5-day, 50 epochs, lr 2e-3,
+  sigma 0.1): 6-12h ps increment -40% NH/SH, -65% tropics, unchanged from
+  48h on; the 6h h500 degradation mostly gone (NH +0.19 -> -0.06 m, tropics
+  12h +1.08 -> +0.07); driver z500 "after" 10.38 -> 10.18 m (bg 10.20);
+  obs term +6.8% (304646 -> 325392). Jc floor at zero increment ~256
+  (0.006 hPa rms, GPU non-bitwise rollouts). Cycled test pending.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle

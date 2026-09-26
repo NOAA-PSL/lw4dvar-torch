@@ -38,6 +38,35 @@ import numpy as np
 import torch
 
 
+def area_weights_from_lats(lats: np.ndarray) -> np.ndarray:
+    """Relative grid-cell areas (mean 1) for any grid organized in latitude
+    rows -- regular lat-lon (with or without pole rows), Gaussian (unevenly
+    spaced rows), or reduced/octahedral Gaussian (a different number of
+    points per row, AIFS). Each row's latitude band area (the Gauss-Legendre
+    quadrature weight for Gaussian rows; sin(upper) - sin(lower) between the
+    midpoints to neighbouring rows otherwise) is shared equally by the row's
+    points. Unlike cos(lat) per point, this is right for reduced
+    grids, where points thin out toward the poles and each already covers
+    roughly the same area -- cos(lat) would count the latitude factor twice
+    and underweight high latitudes there.
+    """
+    lats = np.asarray(lats, dtype=np.float64)
+    rows, inverse, counts = np.unique(lats, return_inverse=True, return_counts=True)  # rows ascending
+    # Gaussian row latitudes (ACE2's F90, AIFS's octahedral N320): the exact
+    # band area is the Gauss-Legendre quadrature weight -- midpoint bands are
+    # off by up to ~4% near the poles there (checked against ACE2's own
+    # checkpoint area). Regular grids: midpoint bands (exact cell areas,
+    # including the small polar caps of pole rows).
+    x, gw = np.polynomial.legendre.leggauss(rows.size)  # x = sin(lat), ascending
+    if np.allclose(np.degrees(np.arcsin(x)), rows, atol=1e-3):
+        band = gw
+    else:
+        edges = np.concatenate([[-90.0], 0.5 * (rows[:-1] + rows[1:]), [90.0]])
+        band = np.diff(np.sin(np.radians(edges)))
+    w = (band / counts)[inverse]
+    return w / w.mean()
+
+
 class ModelState(Protocol):
     """Whatever a backend's `advance()`/`decode_state()` pass around as "the
     state" -- opaque to the solver core beyond these two attributes. AIFS's
@@ -95,6 +124,19 @@ class LatentForecastModel(abc.ABC):
     @property
     def n_points(self) -> int:
         return self.lats.size
+
+    @property
+    def area_weights(self) -> np.ndarray:
+        """(n_points,) relative grid-cell areas, mean 1 -- the weights for
+        any area-weighted sum/mean/RMS over the model grid (z500
+        diagnostics, the jc_ps_sigma balance penalty, ...). Exact for every
+        latitude-row grid behind this interface (see area_weights_from_lats);
+        computed once and cached."""
+        w = getattr(self, '_area_weights_cache', None)
+        if w is None:
+            w = area_weights_from_lats(self.lats)
+            self._area_weights_cache = w
+        return w
 
     @abc.abstractmethod
     def pressure_levels(self, base: str) -> np.ndarray:

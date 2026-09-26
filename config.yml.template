@@ -79,6 +79,15 @@ exp:
   # oberrdeltaperday doesn't also loosen their QC. Default False (earlier
   # runs' behavior: QC uses the grown error).
   #qc_fixed_oberr: True
+  # jc_ps_sigma (hPa): optional balance penalty (a Jc term) on how fast the
+  # surface-pressure increment changes over the first step after injection
+  # (t+6h -> t+12h): Jc = sum_i w_i (Delta_i / jc_ps_sigma)^2, w = area weights
+  # with mean 1, Delta = analysis ps tendency minus background ps tendency over
+  # that step. Damps the transient, unbalanced mass-field part of the increment
+  # (seen with ACE2: ps increment ~0.5 hPa rms at 6h in the NH, decaying ~5x
+  # within 24h). Smaller sigma = stronger penalty; ~0.1 hPa makes Jc comparable
+  # to the obs term for a 5-day window. Off unless set; not for FCN3.
+  #jc_ps_sigma: 0.1
 
   # The 4D-Var control variable is a one-time latent-space increment
   # injected at the first rollout step -- NOT a physical-space

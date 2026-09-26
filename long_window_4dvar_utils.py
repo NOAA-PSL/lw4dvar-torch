@@ -303,6 +303,13 @@ def load_config(config_path='config.yml'):
             )
         if exp['ps_operator'] == 'ps':
             raise ValueError("ps_operator='ps' is not supported for ACE2 -- use 'ps_native' (the default)")
+    # jc_ps_sigma needs a native surface-pressure decode field ('sp') and at
+    # least two steps in the window (the penalty spans steps 1 -> 2).
+    if exp.get('jc_ps_sigma'):
+        if backend == 'fcn3':
+            raise ValueError("jc_ps_sigma is not supported for FCN3 (no native surface-pressure field)")
+        if float(exp['jc_ps_sigma']) <= 0:
+            raise ValueError(f"jc_ps_sigma must be > 0 (hPa), got {exp['jc_ps_sigma']!r}")
     # ps_native needs decode_state's lowest-native-level keys
     # (t_lowest/q_lowest/p_lowest), which only the ACE2 backend provides.
     if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend != 'ace2':
@@ -354,6 +361,7 @@ def log_window(exp, logger):
     logger.info('   control_variables: ' + str(exp.get('control_variables', '(all -- increment unrestricted)')))
     logger.info('   latent_scale: ' + str(exp.get('latent_scale', 1.0)))
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
+    logger.info('   jc_ps_sigma: ' + str(exp.get('jc_ps_sigma', '(off)')))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
         logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
@@ -943,8 +951,8 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
         safe_ql = torch.where(preliminary_rejected, torch.full_like(ql_obspace, 1.e-3), ql_obspace)
         model_equivalent = preduce(safe_ps, safe_pl, safe_tl, safe_ql, safe_model_orography, safe_elevation)
     elif ps_operator == 'logpinterp':
-        coslat = torch.as_tensor(model.coslat if hasattr(model, 'coslat') else grid_interp.coslat, device=device)
-        geopotential_mean = (coslat[None, :] * decoded['geopotential']).sum(dim=-1) / coslat.sum()
+        areaw = torch.as_tensor(model.area_weights, dtype=decoded['geopotential'].dtype, device=device)
+        geopotential_mean = (areaw[None, :] * decoded['geopotential']).sum(dim=-1) / areaw.sum()
         safe_geopotential = torch.where(
             preliminary_rejected[None, :], geopotential_mean[:, None], geopotential_obspace
         )
@@ -1191,7 +1199,7 @@ def _apply_control_mask(state, keep_mask, ref_state, state_layout):
 
 def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif_ic,
                        psobs_traj, epoch, exp, grid_interp, print_every, interp_specs,
-                       keep_mask=None, ref_state1=None):
+                       keep_mask=None, ref_state1=None, jc_ref=None):
     """Latent-space 4D-Var cost function, with sub-6h observations.
 
     `latent_increment` lives in the model's latent space -- AIFS's hidden-
@@ -1233,6 +1241,17 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     the loss" check before trusting a non-default value on a new window
     length.
 
+    `jc_ref` (from `compute_optimal`, present iff `exp['jc_ps_sigma']` is
+    set): `(bg_sp_6h, bg_sp_12h, weights)` -- the uncorrected background's
+    surface pressure (Pa) one and two steps in, and area weights with mean
+    1. Adds a balance penalty on how fast the increment changes over the
+    first step after injection, which damps the transient mass-field part of
+    the increment the model otherwise sheds within ~a day:
+        Jc = sum_i w_i (Delta_i / jc_ps_sigma)^2,
+        Delta = (an - bg)(t+12h) - (an - bg)(t+6h)   [surface pressure, hPa]
+    i.e. the analysis ps tendency minus the background's over the same step,
+    so tides/real tendencies common to both cancel.
+
     Callers (`compute_optimal`) must re-prime the model's stochastic noise
     state (`model._prime_noise()`) immediately before calling this, once per
     epoch -- not once before the epoch loop -- so every epoch evaluates the
@@ -1273,6 +1292,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                   f"{int(used.sum().item())} obs used (out of {int(psobs_traj['n_valid'][j])}){tag}")
         return Jt
 
+    jc_sp = {}
     f_state = input_state
     decoded_prev = model.decode_state(f_state, only=loss_bases)   # step 0 = uncorrected background
     for s in range(1, n_steps + 1):
@@ -1289,6 +1309,8 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                 f_state.date,
             )
         decoded_cur = model.decode_state(f_state, only=loss_bases)
+        if jc_ref is not None and s in (1, 2):
+            jc_sp[s] = model.decode_state(f_state, only=['sp'])['sp']
         for j in slots_by_step.get(s - 1, []):
             a = alpha[j]
             if a == 0.0:
@@ -1301,6 +1323,14 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         decoded_prev = decoded_cur
 
     J = sum(Jol)
+    if jc_ref is not None:
+        bg1, bg2, jc_w = jc_ref
+        delta = ((jc_sp[2] - bg2) - (jc_sp[1] - bg1)) / 100.0   # hPa
+        Jc = (jc_w * (delta / exp['jc_ps_sigma']) ** 2).sum()
+        J = J + Jc
+        if do_print:
+            rms = torch.sqrt((jc_w * delta ** 2).sum() / jc_w.sum()).item()
+            print(f"epoch {epoch}, Jc = {Jc.item()} (first-step ps increment change {rms:.4f} hPa rms)")
     if do_print:
         print(f"epoch {epoch}, Jtot = {J.item()}")
 
@@ -1373,6 +1403,21 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         with torch.no_grad():
             ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
 
+    # jc_ps_sigma (hPa): balance penalty on the first-step change of the ps
+    # increment -- see compute_loss_4dvar's docstring. Needs the uncorrected
+    # background's ps one and two steps in (no gradient), computed once here.
+    jc_ref = None
+    if exp.get('jc_ps_sigma'):
+        model._prime_noise()
+        with torch.no_grad():
+            bg1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
+            bg2 = model.advance(bg1, steps=1, use_checkpoint=False)
+            sp1 = model.decode_state(bg1, only=['sp'])['sp'].detach()
+            sp2 = model.decode_state(bg2, only=['sp'])['sp'].detach()
+        jc_w = torch.as_tensor(model.area_weights, dtype=sp1.dtype, device=sp1.device)  # mean 1
+        jc_ref = (sp1, sp2, jc_w)
+        logger.info(f"jc_ps_sigma: {exp['jc_ps_sigma']} hPa -- first-step ps balance penalty on")
+
     optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd, betas=(beta1,beta2))
 
     # linear warmup/cosine decay
@@ -1432,7 +1477,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # loss surface for the fixed `increment`. No-op for AIFS.
         model._prime_noise()
         optimizer.zero_grad()
-        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1)
+        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref)
 
         if not torch.isfinite(loss):
             logger.warning(f'epoch={epoch}: non-finite loss ({loss.item()}), stopping optimization early')

@@ -86,10 +86,13 @@ exp_config['nlev500'] = nlev500
 exp_config['nlev700'] = nlev700
 
 lats = model.lats  # (n_points,) -- AIFS's grid is an irregular mesh; FCN3's is a row-major flatten of its native 721x1440 lat/lon grid. Neither is a regular lat/lon rectangle you can reshape back into.
-coslats = np.cos(np.radians(lats))
-mask_nh = np.where(lats > 20., coslats, np.nan)
-mask_sh = np.where(lats < -20., coslats, np.nan)
-mask_tr = np.where(np.logical_and(lats >= -20, lats <= 20), coslats, np.nan)
+# Grid-cell area weights (model.area_weights: exact for every backend's
+# latitude-row grid -- cos(lat) per point was wrong for AIFS's reduced
+# octahedral grid, where it gave the tropics 42% of the weight instead of 34%).
+areaw = model.area_weights
+mask_nh = np.where(lats > 20., areaw, np.nan)
+mask_sh = np.where(lats < -20., areaw, np.nan)
+mask_tr = np.where(np.logical_and(lats >= -20, lats <= 20), areaw, np.nan)
 
 
 def _z500_rms(mask, z500err):
@@ -113,7 +116,7 @@ def printz500err(label, f_decoded, verif_ic, date):
     z500rmserrnh = _z500_rms(mask_nh, z500err)
     z500rmserrsh = _z500_rms(mask_sh, z500err)
     z500rmserrtr = _z500_rms(mask_tr, z500err)
-    z500rmserrgl = _z500_rms(coslats, z500err)
+    z500rmserrgl = _z500_rms(areaw, z500err)
     print("%s %s %6.2f %6.2f %6.2f %6.2f" % (label, date, z500rmserrnh, z500rmserrtr, z500rmserrsh, z500rmserrgl))
 
 
