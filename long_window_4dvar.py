@@ -107,8 +107,8 @@ def _z500_rms(mask, z500err):
 def printz500err(label, f_decoded, verif_ic, date):
     # print z500 rms err
     z500err = (
-        f_decoded['geopotential'][nlev500, :].detach().cpu().numpy()
-        - verif_ic['geopotential'][nlev500, :].detach().cpu().numpy()
+        utils.z500_field(f_decoded, nlev500).detach().cpu().numpy()
+        - utils.z500_field(verif_ic, nlev500).detach().cpu().numpy()
     ) / utils.GRAV
     z500rmserrnh = _z500_rms(mask_nh, z500err)
     z500rmserrsh = _z500_rms(mask_sh, z500err)

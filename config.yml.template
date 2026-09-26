@@ -1,14 +1,15 @@
 exp:
   # model_backend selects which forecast model backs the 4D-Var solver:
   # 'aifs' (ECMWF AIFS-single-2.0, backends/aifs/), 'fcn3' (NVIDIA
-  # FourCastNet3, backends/fcn3/), or 'aurora' (Microsoft Aurora v1.5,
-  # backends/aurora/). Required -- load_config() raises if this is missing
-  # or not one of these three values. This one key also picks which conda
-  # env the job must run under (aifs2 / fcstnet3 / aurora -- see
-  # run_aifs.sh / run_fcn3.sh / run_aurora.sh); the envs are NOT
+  # FourCastNet3, backends/fcn3/), 'aurora' (Microsoft Aurora v1.5,
+  # backends/aurora/), or 'ace2' (Ai2 ACE2-ERA5, backends/ace2/). Required --
+  # load_config() raises if this is missing or not one of these values.
+  # This one key also picks which conda env the job must run under (aifs2 /
+  # fcstnet3 / aurora / ace2 -- see run_aifs.sh / run_fcn3.sh /
+  # run_aurora.sh / run_ace2.sh); the envs are NOT
   # co-installed (see CLAUDE.md), so backends not selected here don't need
   # to be importable at all in the env you actually run with.
-  model_backend: fcn3  # or: aifs, aurora
+  model_backend: fcn3  # or: aifs, aurora, ace2
 
   # get_input() always builds the very first initial condition from an
   # ERA5 forecast `nhrs_back` hours before `sdate`, fetched via CDS -- see
@@ -48,6 +49,17 @@ exp:
   # unrelated checkpoints; see CLAUDE.md) -- no separate model_name key,
   # the checkpoint/static-pickle filenames inside it are fixed.
   #   path_model: './backends/aurora/hf_cache/models--microsoft--aurora/snapshots/a96afd7ee6d65e3bd2d476f3be798a25a56f2296/'
+  # ACE2: path_model is the backends/ace2/ACE2-ERA5 git submodule
+  # (huggingface.co/allenai/ACE2-ERA5, used POINTER-ONLY: init it with
+  # GIT_LFS_SKIP_SMUDGE=1, then backends/ace2/ace2_prefetch_checkpoint.py
+  # pulls just the checkpoint + forcing_data/forcing_YYYY.nc for every year
+  # a run touches -- the full repo is ~75 GB). model_name defaults to 'ace2_era5_ckpt.tar'; forcing_dir
+  # defaults to path_model + 'forcing_data/'. ic_cache must hold the ICs and
+  # h500/TMP850 verification from backends/ace2/ace2_ic.py (ace2ic env,
+  # login node: `ace2_ic.py DATE` and `ace2_ic.py --verif DATE ...`).
+  # ps_operator defaults to 'ps_native'; reset_skt_ocean is rejected.
+  #   path_model: './backends/ace2/ACE2-ERA5/'
+  #   ic_cache: './ic_cache_ace2/'
   path_model: './backends/fcn3/fourcastnet3/'
 
   device: 'cuda'
@@ -62,6 +74,11 @@ exp:
   # loss at beginning of window (crude treatment of model error).
   oberrstart: 1.0 # ob error at start of window (-1 to use values in obs file)
   oberrdeltaperday: 0.25 # ob error increase (per day) within window.
+  # qc_fixed_oberr: gross check (bg_check) uses the START-of-window ob error
+  # instead of the grown one, so down-weighting late-window obs via
+  # oberrdeltaperday doesn't also loosen their QC. Default False (earlier
+  # runs' behavior: QC uses the grown error).
+  #qc_fixed_oberr: True
 
   # The 4D-Var control variable is a one-time latent-space increment
   # injected at the first rollout step -- NOT a physical-space
@@ -105,6 +122,7 @@ exp:
   # exactly what the active ps_operator reads:
   #   'logpinterp' (all three backends, FCN3/Aurora's only supported option): z
   #   'ps' (AIFS only -- see ps_operator below): t, q, sp
+  #   'ps_native' (ACE2 only): t_lowest, q_lowest, p_lowest, sp
   # There is no reason to override this for FCN3/Aurora. Only set this
   # explicitly for AIFS if you know you need to.
   # loss_variables: [z]
@@ -119,6 +137,10 @@ exp:
   #     native 'sp' field, so this may work in principle, but that forward-
   #     operator path has only been tested for AIFS so far; load_config()
   #     raises rather than silently claim untested support.
+  #   'ps_native' (ACE2 ONLY): native surface pressure reduced to station
+  #     height using the LOWEST NATIVE MODEL LEVEL's t/q and that level's
+  #     own pressure (ACE2's layers are hybrid sigma-pressure -- no
+  #     interpolation to 700 hPa). load_config() raises for other backends.
   #ps_operator: 'ps'
 
   # reset_skt_ocean: AIFS and Aurora only (False/unset default). True
