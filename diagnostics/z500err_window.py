@@ -74,16 +74,16 @@ def _parse_nc_date(value):
     return datetime.strptime(value, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%dT%H')
 
 
-def getrms(diff, coslat):
+def getrms(diff, weights):
     """Region-masked RMS, NaN-safe against a diverged/missing `diff` (not
-    just an out-of-region `coslat`): `nansum` of an all-NaN slice silently
-    returns 0.0, not NaN, so masking only via `coslat` (which never has NaN
+    just an out-of-region `weights`): `nansum` of an all-NaN slice silently
+    returns 0.0, not NaN, so masking only via `weights` (which never has NaN
     where `diff` does) would misreport a fully-NaN forecast as a perfect
     0.0 RMS error instead of "no data" -- discovered from a real diverged
     cycle, see CLAUDE.md. Points where `diff` is NaN are excluded from BOTH
     the numerator and the weight-sum denominator, not just zeroed.
     """
-    weight = np.where(np.isnan(diff), np.nan, coslat)
+    weight = np.where(np.isnan(diff), np.nan, weights)
     denom = np.nansum(weight)
     if not denom > 0:
         return np.nan
