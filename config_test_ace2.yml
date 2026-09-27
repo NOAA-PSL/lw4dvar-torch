@@ -25,6 +25,7 @@ exp:
   # ps_operator defaults to 'ps_native' for ACE2
   checkpoint_stride: 2 # checkpoint_stride: 0 runs out of memory on H100
   control_variables: [air_temperature, specific_total_water, eastward_wind, northward_wind, PRESsfc, surface_temperature, TMP2m, Q2m, UGRD10m, VGRD10m] # this is the full list, nothing excluded (the default)
+  jc_ps_sigma: 0.1
 
 windows:
   '5':
