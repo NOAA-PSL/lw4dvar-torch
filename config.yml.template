@@ -7,7 +7,7 @@ exp:
   # This one key also picks which conda env the job must run under (aifs2 /
   # fcstnet3 / aurora / ace2 -- see run_aifs.sh / run_fcn3.sh /
   # run_aurora.sh / run_ace2.sh); the envs are NOT
-  # co-installed (see CLAUDE.md), so backends not selected here don't need
+  # co-installed (see integrate_multiple_backends.md), so backends not selected here don't need
   # to be importable at all in the env you actually run with.
   model_backend: fcn3  # or: aifs, aurora, ace2
 
@@ -46,7 +46,7 @@ exp:
   # Aurora: path_model is the Hugging Face cache snapshot directory
   # aurora_prefetch_checkpoint.py fetches into (NOT a git submodule, unlike
   # AIFS/FCN3 -- microsoft/aurora on HF is a shared monorepo of many
-  # unrelated checkpoints; see CLAUDE.md) -- no separate model_name key,
+  # unrelated checkpoints; see integrate_multiple_backends.md) -- no separate model_name key,
   # the checkpoint/static-pickle filenames inside it are fixed.
   #   path_model: './backends/aurora/hf_cache/models--microsoft--aurora/snapshots/a96afd7ee6d65e3bd2d476f3be798a25a56f2296/'
   # ACE2: path_model is the backends/ace2/ACE2-ERA5 git submodule
@@ -193,7 +193,7 @@ exp:
 
   # compile_wrapper: Aurora ONLY (default False, meaningless for AIFS/FCN3).
   # Wraps the Aurora model in torch.compile() -- a real, confirmed ~1.87x
-  # steady-state speedup (see CLAUDE.md "Aurora per-epoch runtime
+  # steady-state speedup (see integrate_multiple_backends.md "Aurora per-epoch runtime
   # optimization"), correctness-verified, but at a real one-time
   # compilation cost (130-270s, not fixed, paid separately for each
   # distinct (steps, use_checkpoint) combination the run actually

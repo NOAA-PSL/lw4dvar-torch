@@ -28,7 +28,7 @@ silently guessing.
 ACE2 output (detected from an `h500` variable in the saved forecast file)
 is scored differently: model z500 is ACE2's OWN `h500` decoder output (m),
 not the hydrostatically derived pressure-level 'z' (which runs ~19 m low vs
-ERA5 -- see CLAUDE.md's ACE2 section), and truth is the ERA5 z500 regridded
+ERA5 -- see integrate_multiple_backends.md's ACE2 section), and truth is the ERA5 z500 regridded
 to ACE2's F90 grid by `backends/ace2/ace2_ic.py --verif` (`load_verif`,
 default cache `./ic_cache_ace2/`). Same row-major (lat, lon) flattening as
 the saved file's `values` dimension, so no regridding here either.
@@ -80,7 +80,7 @@ def getrms(diff, weights):
     returns 0.0, not NaN, so masking only via `weights` (which never has NaN
     where `diff` does) would misreport a fully-NaN forecast as a perfect
     0.0 RMS error instead of "no data" -- discovered from a real diverged
-    cycle, see CLAUDE.md. Points where `diff` is NaN are excluded from BOTH
+    cycle, see integrate_multiple_backends.md. Points where `diff` is NaN are excluded from BOTH
     the numerator and the weight-sum denominator, not just zeroed.
     """
     weight = np.where(np.isnan(diff), np.nan, weights)
@@ -261,11 +261,11 @@ if __name__ == '__main__':
     # repo root -- relative paths like ic_cache/ below assume it).
     # {label -> output dir}, ic_cache assumed at ./ic_cache/ for each.
     # Defaults to the mainline reset_skt_ocean cycling experiment (see
-    # CLAUDE.md). Override with `label=dir` args, e.g.:
+    # integrate_multiple_backends.md). Override with `label=dir` args, e.g.:
     #   python diagnostics/z500err_window.py \
     #       'lr=1e-3=output/test_aifs_ctlvars_n_init20_50it' \
     #       'lr=2e-3=output/test_aifs_ctlvars_n_init20_50it_lr2e-3'
-    # (that lr=2e-3 run diverged and was killed -- see CLAUDE.md's
+    # (that lr=2e-3 run diverged and was killed -- see integrate_multiple_backends.md's
     # "learn_rate sweep" section -- so its curve will mostly be gaps.)
     # Optional `--cache_dir=DIR` overrides the per-backend default
     # (./ic_cache/ for AIFS, ./ic_cache_ace2/ for ACE2).

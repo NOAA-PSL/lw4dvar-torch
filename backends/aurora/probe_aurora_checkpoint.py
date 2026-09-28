@@ -3,10 +3,10 @@ One-shot memory/timing probe for whether Aurora's own internal
 `configure_activation_checkpointing()` (per-Swin3D-block) alone is
 sufficient for memory, without this wrapper's ADDITIONAL outer per-step
 `torch.utils.checkpoint` around `_advance_one_step` -- i.e. whether the
-outer layer is redundant double-checkpointing. See CLAUDE.md "Aurora
+outer layer is redundant double-checkpointing. See integrate_multiple_backends.md "Aurora
 per-epoch runtime optimization" for the motivating question.
 
-Before the bfloat16 fix (see CLAUDE.md "Aurora 16-step divergence"), a
+Before the bfloat16 fix (see integrate_multiple_backends.md "Aurora 16-step divergence"), a
 `checkpoint_stride: 0` test at 16 steps was confounded by the NaN
 collapse -- the exact same collapse signature appeared whether or not the
 outer checkpoint was disabled, so its real memory/timing effect was never

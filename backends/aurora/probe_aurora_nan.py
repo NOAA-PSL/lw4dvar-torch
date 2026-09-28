@@ -18,7 +18,7 @@ import sys
 import torch
 
 # This script lives in backends/aurora/, but long_window_4dvar_utils.py
-# lives at the repo root -- see CLAUDE.md "Login-node ERA5 prefetch
+# lives at the repo root -- see integrate_multiple_backends.md "Login-node ERA5 prefetch
 # scripts, and a sys.path bug they share" for the same issue found in the
 # prefetch scripts; same fix here.
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))

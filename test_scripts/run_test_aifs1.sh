@@ -11,7 +11,7 @@
 
 # Quick smoke test for the aifs1 env / AIFS-single-1.1 checkpoint --
 # verifies the get_shard_shapes/get_shape_shards import fix (see
-# CLAUDE.md) and the full encode/process/decode forward+backward path
+# integrate_multiple_backends.md) and the full encode/process/decode forward+backward path
 # actually run cleanly against this checkpoint, not just that it loads.
 
 module load cuda/12.8.1

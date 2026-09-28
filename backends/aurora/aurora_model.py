@@ -174,7 +174,7 @@ class AuroraModel(forecast_model.LatentForecastModel):
             only autocasts the backbone). fp16's narrow dynamic range
             (~+-65504) is fine for a pure forward pass (confirmed clean,
             no NaN/Inf, in a zero-increment background rollout at any
-            length tested) but was confirmed (2026-09-18, see CLAUDE.md
+            length tested) but was confirmed (2026-09-18, see integrate_multiple_backends.md
             "Aurora 16-step divergence") to produce a NaN/Inf gradient
             w.r.t. `latent_increment` when backpropagating through a
             16-step chained rollout -- deterministically, independent of
@@ -193,7 +193,7 @@ class AuroraModel(forecast_model.LatentForecastModel):
             == torch.float16`, confirmed by reading the source) -- which
             looked, on paper, like dead weight now that `autocast_dtype`
             defaults to `bfloat16` here. **Tested and found NOT safe to
-            disable** (2026-09-19, see CLAUDE.md "Aurora per-epoch runtime
+            disable** (2026-09-19, see integrate_multiple_backends.md "Aurora per-epoch runtime
             optimization"): setting this to `False` produces a
             deterministic `CUDA error: an illegal memory access was
             encountered` during `.backward()`, reproduced independently on
@@ -210,7 +210,7 @@ class AuroraModel(forecast_model.LatentForecastModel):
         compile_wrapper : bool
             Wrap `self.wrapper` in `torch.compile()` after it's fully
             constructed/moved/frozen/checkpoint-configured. **Tested and
-            confirmed real, 2026-09-19** (see CLAUDE.md "Aurora per-epoch
+            confirmed real, 2026-09-19** (see integrate_multiple_backends.md "Aurora per-epoch
             runtime optimization"): a genuine ~1.87x steady-state speedup
             (17.85s -> 9.55s per differentiable step at the production
             steps=4/checkpoint-on setting), correctness-verified
@@ -242,7 +242,7 @@ class AuroraModel(forecast_model.LatentForecastModel):
             `RuntimeError: CUDA error: Invalid access of peer GPU memory
             over nvlink or a hardware error`, raised from inside a
             torch-inductor-generated kernel, not plain PyTorch/Python
-            code. See CLAUDE.md "Known gaps" for the full writeup and
+            code. See integrate_multiple_backends.md "Known gaps" for the full writeup and
             what's still unverified (leading hypothesis: stale
             inductor-cached buffer references from cycle 1 becoming
             invalid once cycle 2 allocates fresh tensors, not confirmed).

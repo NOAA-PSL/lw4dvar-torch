@@ -132,11 +132,11 @@ if __name__ == '__main__':
         expts = dict(a.rsplit('=', 1) for a in args)
     else:
         # Default: the mainline reset_skt_ocean cycling experiment (see
-        # CLAUDE.md). Pass experiments explicitly to compare others, e.g.:
+        # integrate_multiple_backends.md). Pass experiments explicitly to compare others, e.g.:
         #   python diagnostics/z500err_ts.py 6 \
         #       'lr=1e-3=output/test_aifs_ctlvars_n_init20_50it' \
         #       'lr=2e-3=output/test_aifs_ctlvars_n_init20_50it_lr2e-3'
-        # (that lr=2e-3 run diverged and was killed -- see CLAUDE.md's
+        # (that lr=2e-3 run diverged and was killed -- see integrate_multiple_backends.md's
         # "learn_rate sweep" section -- so its curve will mostly be gaps.)
         expts = {'lr=1.5e-3': 'output/test_aifs_latent_reset_skt_12h_100it'}
 

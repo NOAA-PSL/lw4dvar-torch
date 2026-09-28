@@ -1,7 +1,9 @@
-# CLAUDE.md
+# Integrating multiple forecast-model backends
 
-This file provides guidance to Claude Code (claude.ai/code) when working with
-code in this repository.
+History, design decisions, and validation results from merging the AIFS and
+FCN3 ports of the long-window 4D-Var solver into one repo and adding the
+Aurora and ACE2 backends. (Formerly this repo's CLAUDE.md; see CLAUDE.md for
+the index of task documents.)
 
 ## What this repository is
 
@@ -938,7 +940,7 @@ existing `model_backend: aifs` dispatch already treats them as one backend;
   - 5-epoch AdamW optimization ran to completion: `Jtot` 23114 (epoch 1) ->
     19967 (epoch 2, new best) -> 20339 -> 28899 -> 32846 -- the epoch
     3-5 uphill trend is the same untuned-fixed-`lr`-overshoot-past-the-
-    optimum shape this repo's CLAUDE.md already documents repeatedly for
+    optimum shape this repo's integrate_multiple_backends.md already documents repeatedly for
     other backends' first low-epoch-count smoke tests, not a new failure
     mode.
   - All diagnostic files saved without error (`*_latent_increment_*.pt`,
@@ -1607,7 +1609,7 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
           (global RMS error worse after this untuned optimization: 8.78
           vs. 8.53). Both differences are consistent with the same class
           of GPU kernel-selection floating-point nondeterminism this
-          repo's CLAUDE.md already documents extensively for bf16 ops
+          repo's integrate_multiple_backends.md already documents extensively for bf16 ops
           elsewhere (kernel fusion changes floating-point operation
           order, shifting results at the last few bits, compounding over
           a 100-epoch/20-step differentiable rollout) -- not a real

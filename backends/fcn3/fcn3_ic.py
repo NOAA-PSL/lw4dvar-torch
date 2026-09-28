@@ -16,7 +16,7 @@ considerably simpler than the AIFS case in two ways:
     variables with real ERA5 gaps to patch (see the AIFS port's
     test_forecast/patch_missing_wave_fields.py) -- every one of FCN3's 72
     channels is a completely standard ERA5 pressure-level or single-level
-    field, confirmed by direct test fetches (see CLAUDE.md's "IC fetching"
+    field, confirmed by direct test fetches (see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "IC fetching"
     section) before writing this module, not assumed from variable names
     alone.
 

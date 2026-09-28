@@ -18,7 +18,7 @@ or 'aurora') now selects the forecast model at runtime;
 model/grid/IC-fetching modules, imported LAZILY (inside the function that
 needs them, never at this module's top level) so that a process running
 with only one backend's conda env active (`aifs2` vs `fcstnet3` vs `aurora`
--- see CLAUDE.md; the three envs are not co-installed) never needs the
+-- see integrate_multiple_backends.md; the three envs are not co-installed) never needs the
 other backends' dependencies importable at all.
 
 All three backends implement `forecast_model.LatentForecastModel` with no
@@ -102,7 +102,7 @@ Where the three backends genuinely differ, and how this file handles it:
     `latent_increment` when backpropagating through a 16+ step chained
     rollout, deterministically, from the all-zero initial increment --
     `backends/aurora/aurora_model.py` now defaults to `bfloat16` instead
-    (see CLAUDE.md "Aurora 16-step divergence: root cause and fix"). Purely
+    (see integrate_multiple_backends.md "Aurora 16-step divergence: root cause and fix"). Purely
     an internal Aurora backend concern, invisible to this file, EXCEPT that
     this file's own `torch.isfinite(loss)` check (before `.backward()`) is
     not sufficient to catch this failure mode by itself -- a finite loss
@@ -269,13 +269,13 @@ def load_config(config_path='config.yml'):
     if backend == 'fcn3' and exp.get('reset_skt_ocean', False):
         raise ValueError(
             "reset_skt_ocean is not supported for the FCN3 backend -- FCN3 has no "
-            "'skt'/'lsm' decode_state field to reset (see CLAUDE.md)."
+            "'skt'/'lsm' decode_state field to reset (see integrate_multiple_backends.md)."
         )
     if backend == 'fcn3' and exp.get('ps_operator', 'logpinterp') == 'ps':
         raise ValueError(
             "ps_operator='ps' is not supported for the FCN3 backend -- FCN3 has no "
             "native surface-pressure ('sp') decode_state field; use the default "
-            "'logpinterp' instead (see CLAUDE.md)."
+            "'logpinterp' instead (see integrate_multiple_backends.md)."
         )
     # Aurora DOES have a native 'sp' field (unlike FCN3), so 'ps' might work
     # here in principle -- but _compute_ps_observation_diagnostics_at_time's
@@ -287,7 +287,7 @@ def load_config(config_path='config.yml'):
             "ps_operator='ps' is not yet supported for the Aurora backend -- Aurora "
             "has a native 'sp' field so this may work in principle, but the 'ps' "
             "forward-operator path has only been tested for AIFS so far. Use the "
-            "default 'logpinterp' instead (see CLAUDE.md)."
+            "default 'logpinterp' instead (see integrate_multiple_backends.md)."
         )
     # ACE2: 'ps_native' is the default operator. Its layers are hybrid
     # sigma-pressure, so 'logpinterp' would have to search a hydrostatically
@@ -682,7 +682,7 @@ def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5):
     open ocean (land-sea-mask-blended upstream of this whole pipeline, not by
     any code here), so resetting `skt` at ocean points from ERA5 is the
     closest available proxy for "reset SST from ERA5 every analysis time" --
-    see CLAUDE.md. No separate sea-ice handling: there's no sea-ice variable
+    see the long-window-4dvar-aifsv2 repo's CLAUDE.md. No separate sea-ice handling: there's no sea-ice variable
     in this checkpoint at all (`lsm` is a static land-sea mask, constant in
     time, with no time-varying ice-extent field to reset).
 
@@ -1063,7 +1063,7 @@ def _resolve_control_mask(model, exp, n_vars, device):
     increment is free on every variable, the default behaviour).
 
     Column lookup (`model.resolve_columns`) checks pressure-level families
-    before any single-level/raw-checkpoint fallback -- see CLAUDE.md for the
+    before any single-level/raw-checkpoint fallback -- see the long-window-4dvar-aifsv2 repo's CLAUDE.md for the
     bug that shipped from getting that order backwards, which is exactly
     what `resolve_columns` closes off at the source for every backend behind
     the `LatentForecastModel` interface, not just AIFS.
@@ -1362,7 +1362,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     reconstruction; FCN3's t=0 reconstruction path was tested empirically
     and found badly damped/biased, ~7-9x worse than a real 6h step, since
     `decode()` was never trained downstream of anything but the processor
-    step -- see CLAUDE.md. Aurora has not been separately investigated;
+    step -- see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md. Aurora has not been separately investigated;
     the same `t+timestep` injection point is used uniformly for all three
     backends by design, not because it has been confirmed to be the only
     option for each one.) This therefore returns a state dated at
@@ -1523,7 +1523,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # rejected as non-finite (`interpolation_failed`) rather than
         # producing a NaN loss -- so the *loss* itself looks deceptively
         # finite and lower than before, and the corrupted increment gets
-        # saved as "new best" rather than caught here. See CLAUDE.md
+        # saved as "new best" rather than caught here. See integrate_multiple_backends.md
         # "Aurora 16-step divergence" for the full root-cause writeup.
         #
         # Originally a skip-and-continue (warn, zero the grad, proceed to

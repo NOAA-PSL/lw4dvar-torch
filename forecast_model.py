@@ -9,7 +9,7 @@ see that repo's CLAUDE.md "Isolating AIFS-specific code behind a model
 interface" section for the history of why this exists and what it does and
 does not cover. This repo's FCN3Model (fcn3_model.py) is the second
 concrete implementation, confirming the interface really is backend-agnostic
-rather than AIFS-shaped in disguise (see this repo's own CLAUDE.md
+rather than AIFS-shaped in disguise (see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md
 architecture notes for how FCN3's encode()/process()/decode() split maps
 onto each abstract method here).
 
@@ -143,7 +143,7 @@ class LatentForecastModel(abc.ABC):
         """Ascending-or-descending level values for a pressure-level family
         (e.g. base='z' -> the geopotential levels). Callers that need a
         specific ordering (e.g. get_surface_pressure's top-of-atmosphere-
-        first `searchsorted` requirement -- see CLAUDE.md's debugging notes
+        first `searchsorted` requirement -- see the long-window-4dvar-aifsv2 repo's CLAUDE.md debugging notes
         on the ~230-280 hPa bias bug this caused when AIFS's surface-first
         convention was fed in unflipped) are responsible for checking/
         flipping it themselves; this method makes no ordering promise
@@ -175,7 +175,7 @@ class LatentForecastModel(abc.ABC):
         surface-pressure column).
 
         MUST check multi-level families before any single-level/raw
-        checkpoint-mapping fallback. CLAUDE.md documents a real, shipped bug
+        checkpoint-mapping fallback. The long-window-4dvar-aifsv2 repo's CLAUDE.md documents a real, shipped bug
         (the `state_scales` lookup, since removed along with the rest of
         physical-space control) where checking the raw checkpoint mapping
         first silently shadowed the 14-level pressure-level 'z' family with
@@ -232,7 +232,7 @@ class LatentForecastModel(abc.ABC):
         side, is one of the concrete simplifications this interface buys.
 
         FCN3Model currently does NOT provide 'surface_pressure' (FCN3 has no
-        native sp channel at all) -- see this repo's CLAUDE.md "Known gaps"
+        native sp channel at all) -- see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "Known gaps"
         for the deferred ps-obs forward-operator design decision this
         blocks. Not a violation overlooked in this pass; a backend that
         can't yet meet the full contract is expected to say so loudly
@@ -288,8 +288,8 @@ class InitialConditionProvider(abc.ABC):
     """Sketched, not worked out in detail. Per-backend historical IC/
     verification fetching -- deliberately NOT part of LatentForecastModel,
     since it's about *data access* (ERA5 via CDS) not model architecture; a
-    backend swap and an IC-source swap are independent changes. See this
-    repo's CLAUDE.md "Known gaps" for fcn3_ic.py, the analogous
+    backend swap and an IC-source swap are independent changes. See
+    the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "Known gaps" for fcn3_ic.py, the analogous
     not-yet-written module for this backend.
     """
 

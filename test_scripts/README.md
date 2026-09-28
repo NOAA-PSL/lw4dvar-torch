@@ -5,7 +5,7 @@
 are not part of the production pipeline (`run_aifs.sh`/`run_fcn3.sh`/
 `run_aurora.sh`, which remain at the repo root) -- they're throwaway or
 semi-permanent tooling used to investigate a specific question, documented
-in CLAUDE.md.
+in integrate_multiple_backends.md.
 
 **Must be submitted from the repo root**, not from inside this directory:
 
