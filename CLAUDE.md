@@ -1349,7 +1349,32 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
   48h on; the 6h h500 degradation mostly gone (NH +0.19 -> -0.06 m, tropics
   12h +1.08 -> +0.07); driver z500 "after" 10.38 -> 10.18 m (bg 10.20);
   obs term +6.8% (304646 -> 325392). Jc floor at zero increment ~256
-  (0.006 hPa rms, GPU non-bitwise rollouts). Cycled test pending.
+  (0.006 hPa rms, GPU non-bitwise rollouts).
+- **Replaced by `jc_ps_weight` (kappa, hPa^-2), 2026-09-27/28**: Jc =
+  kappa * N_obs * area-weighted grid MEAN of Delta^2, N_obs = ps obs
+  available in the window. The old sum over grid points made the same sigma
+  ~8x stronger on AIFS N320 than ACE2 F90 (16x on FCN3/Aurora 0.25 deg);
+  the N_obs factor keeps Jc/Jo roughly fixed as obs counts change. sigma = s
+  <-> kappa = n_points / (s^2 * N_obs) (s = 0.1 on ACE2, 5-day window ~2.1e5
+  obs -> kappa ~ 30). Verified equivalent: kappa = 31.142 reproduces sigma
+  0.1 at epoch 1 (Jc 255.908 vs 255.913) and stays within the spread of two
+  identical old-form runs by epoch 50 (GPU run-to-run noise ~1.5% in Jtot).
+  `jc_ps_sigma` was then REMOVED (load_config raises with the conversion).
+  Pressure field chosen automatically: 'sp' where decoded (ACE2, AIFS,
+  Aurora), else 'msl' (FCN3 -- so the penalty now works for FCN3 too).
+- **Cycled result (sigma 0.1 ~ kappa 30, ACE2, 6h cycling, lr 2e-3, 50
+  epochs; 147 cycles Jan 1 - Feb 6 12Z, vs the same run with Jc off)**: the
+  NH/tropics early-window error decay disappears (NH bg 15.78 -> 14.44 m
+  over 0-36h without Jc; flat ~13.6 m with it). NH better at every lead
+  (0h -2.0 m, 24h -0.9, 48h -0.8; every cycle better at 0h, gap growing
+  over the month; weekly-block bootstrap CI excludes 0). Tropics: no
+  detectable difference. SH worse on average (0h +0.8, 48h +1.3 m) but it's
+  one episode (~Jan 23 - Feb 6, peak +3 m, easing at the end; weeks 1-3
+  even) -- 0h CI includes 0; SH errors are more autocorrelated, so a longer
+  sample is needed. The first-step ps increment change was cut >100x.
+  Caveat for that comparison: the sigma=0.1 and sigma=10 runs were launched
+  with the same exp_name and overwrote each other's saved trajectories;
+  only files attributable by mtime to the sigma=0.1 job were used.
 
 ## Known gaps / next steps
 

@@ -80,26 +80,25 @@ exp:
   # runs' behavior: QC uses the grown error).
   #qc_fixed_oberr: True
   # jc_ps_weight (kappa, hPa^-2): optional balance penalty (a Jc term) on how
-  # fast the surface-pressure increment changes over the first step after
-  # injection (t+6h -> t+12h):
+  # fast the pressure increment changes over the first step after injection
+  # (t+6h -> t+12h):
   #   Jc = kappa * N_obs * area-weighted grid mean of Delta^2,
-  #   Delta = analysis ps tendency minus background ps tendency over that step
-  #   (hPa), N_obs = ps obs available in the window.
-  # The grid mean makes kappa independent of model resolution; the N_obs
-  # factor keeps Jc / Jo roughly fixed as observation counts change. Damps
-  # the transient, unbalanced mass-field part of the increment (ACE2: ps
-  # increment ~0.5 hPa rms at 6h in the NH, decaying ~5x within 24h).
-  # Reference: kappa ~ 30 reproduces the tested jc_ps_sigma: 0.1 on ACE2 for a
-  # 5-day window (~2.1e5 obs) -- a strong constraint (first-step change cut
-  # >100x); kappa ~ 3 / ~0.3 correspond to sigma ~ 0.3 / 1 hPa there. The
-  # log line prints the equivalent jc_ps_sigma for the run's grid/obs count.
-  # Off unless set; not for FCN3.
+  #   Delta = analysis pressure tendency minus background pressure tendency
+  #   over that step (hPa), N_obs = ps obs available in the window.
+  # Pressure field: surface pressure where the backend has it (ACE2, AIFS,
+  # Aurora), else mean sea-level pressure (FCN3) -- chosen automatically,
+  # named in the log. The grid mean makes kappa independent of model
+  # resolution; the N_obs factor keeps Jc / Jo roughly fixed as observation
+  # counts change. Damps the transient, unbalanced mass-field part of the
+  # increment (ACE2: ps increment ~0.5 hPa rms at 6h in the NH, decaying ~5x
+  # within 24h).
+  # Reference (ACE2, 5-day window, ~2.1e5 obs): kappa ~ 30 is a strong
+  # constraint (first-step change cut >100x; tested in a month of cycling);
+  # kappa ~ 3 / ~0.3 are moderate / light. The log line also prints the
+  # equivalent per-point sigma, (n_points / (kappa * N_obs)) ** 0.5. Off
+  # unless set. (Replaces the removed jc_ps_sigma: sigma = s corresponds to
+  # kappa = n_points / (s^2 * N_obs).)
   #jc_ps_weight: 30.
-  # jc_ps_sigma (hPa): LEGACY form of the same penalty, Jc = sum_i w_i
-  # (Delta_i / sigma)^2 with area weights of mean 1 -- scales with the
-  # number of grid points and ignores the obs count. Kept so earlier runs
-  # reproduce; don't set both.
-  #jc_ps_sigma: 0.1
 
   # The 4D-Var control variable is a one-time latent-space increment
   # injected at the first rollout step -- NOT a physical-space

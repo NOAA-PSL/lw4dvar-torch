@@ -303,16 +303,17 @@ def load_config(config_path='config.yml'):
             )
         if exp['ps_operator'] == 'ps':
             raise ValueError("ps_operator='ps' is not supported for ACE2 -- use 'ps_native' (the default)")
-    # jc_ps_sigma needs a native surface-pressure decode field ('sp') and at
-    # least two steps in the window (the penalty spans steps 1 -> 2).
-    if exp.get('jc_ps_sigma') and exp.get('jc_ps_weight'):
-        raise ValueError("set jc_ps_weight OR (legacy) jc_ps_sigma, not both")
-    for key in ('jc_ps_sigma', 'jc_ps_weight'):
-        if exp.get(key):
-            if backend == 'fcn3':
-                raise ValueError(f"{key} is not supported for FCN3 (no native surface-pressure field)")
-            if float(exp[key]) <= 0:
-                raise ValueError(f"{key} must be > 0, got {exp[key]!r}")
+    # jc_ps_sigma (the original, un-normalized penalty) was removed -- fail
+    # loudly rather than silently run without the penalty.
+    if 'jc_ps_sigma' in exp:
+        raise ValueError(
+            "jc_ps_sigma has been removed -- use jc_ps_weight (kappa, hPa^-2): "
+            "Jc = kappa * N_obs * area-weighted mean of Delta^2. The equivalent of "
+            "jc_ps_sigma = s is kappa = n_points / (s^2 * N_obs) -- e.g. s = 0.1 on "
+            "ACE2 (64800 points) with a 5-day window (~2.1e5 obs) is kappa ~ 30."
+        )
+    if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
+        raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
     # ps_native needs decode_state's lowest-native-level keys
     # (t_lowest/q_lowest/p_lowest), which only the ACE2 backend provides.
     if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend != 'ace2':
@@ -364,10 +365,8 @@ def log_window(exp, logger):
     logger.info('   control_variables: ' + str(exp.get('control_variables', '(all -- increment unrestricted)')))
     logger.info('   latent_scale: ' + str(exp.get('latent_scale', 1.0)))
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
-    if exp.get('jc_ps_weight'):
-        logger.info('   jc_ps_weight: ' + str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)')
-    else:
-        logger.info('   jc_ps_sigma: ' + str(exp.get('jc_ps_sigma', '(off)')))
+    logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
+                                        if exp.get('jc_ps_weight') else '(off)'))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
         logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
@@ -1247,22 +1246,21 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     the loss" check before trusting a non-default value on a new window
     length.
 
-    `jc_ref` (from `compute_optimal`, present iff `exp['jc_ps_weight']` or
-    `exp['jc_ps_sigma']` is set): `(bg_sp_6h, bg_sp_12h, weights, factor)`
-    -- the uncorrected background's surface pressure (Pa) one and two steps
-    in, grid weights, and a scalar. Adds a balance penalty on how fast the
-    increment changes over the first step after injection, which damps the
-    transient mass-field part of the increment the model otherwise sheds
-    within ~a day:
-        Jc = factor * sum_i weights_i * Delta_i^2,
-        Delta = (an - bg)(t+12h) - (an - bg)(t+6h)   [surface pressure, hPa]
-    jc_ps_weight (kappa, hPa^-2): weights = area weights summing to 1,
-    factor = kappa * N_obs (obs available in the window) -- i.e.
-    kappa * N_obs * area-weighted mean of Delta^2, independent of grid size
-    and of the obs count relative to Jo. jc_ps_sigma (legacy): weights =
-    area weights with mean 1, factor = 1/sigma^2.
-    i.e. the analysis ps tendency minus the background's over the same step,
-    so tides/real tendencies common to both cancel.
+    `jc_ref` (from `compute_optimal`, present iff `exp['jc_ps_weight']` is
+    set): `(field, bg_p_6h, bg_p_12h, weights, factor)` -- the pressure
+    field used ('sp' where the backend has it, else 'msl' -- FCN3), the
+    uncorrected background's values of it (Pa) one and two steps in, area
+    weights summing to 1, and factor = kappa * N_obs (N_obs = obs available
+    in the window). Adds a balance penalty on how fast the increment changes
+    over the first step after injection, which damps the transient
+    mass-field part of the increment the model otherwise sheds within ~a
+    day:
+        Jc = kappa * N_obs * sum_i weights_i * Delta_i^2,
+        Delta = (an - bg)(t+12h) - (an - bg)(t+6h)   [pressure, hPa]
+    i.e. the analysis pressure tendency minus the background's over the same
+    step, so tides/real tendencies common to both cancel. The grid mean
+    makes kappa independent of resolution; the N_obs factor keeps Jc / Jo
+    roughly fixed as obs counts change.
 
     Callers (`compute_optimal`) must re-prime the model's stochastic noise
     state (`model._prime_noise()`) immediately before calling this, once per
@@ -1322,7 +1320,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             )
         decoded_cur = model.decode_state(f_state, only=loss_bases)
         if jc_ref is not None and s in (1, 2):
-            jc_sp[s] = model.decode_state(f_state, only=['sp'])['sp']
+            jc_sp[s] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
         for j in slots_by_step.get(s - 1, []):
             a = alpha[j]
             if a == 0.0:
@@ -1336,13 +1334,13 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
 
     J = sum(Jol)
     if jc_ref is not None:
-        bg1, bg2, jc_w, jc_factor = jc_ref
+        jc_field, bg1, bg2, jc_w, jc_factor = jc_ref
         delta = ((jc_sp[2] - bg2) - (jc_sp[1] - bg1)) / 100.0   # hPa
         Jc = jc_factor * (jc_w * delta ** 2).sum()
         J = J + Jc
         if do_print:
             rms = torch.sqrt((jc_w * delta ** 2).sum() / jc_w.sum()).item()
-            print(f"epoch {epoch}, Jc = {Jc.item()} (first-step ps increment change {rms:.4f} hPa rms)")
+            print(f"epoch {epoch}, Jc = {Jc.item()} (first-step {jc_field} increment change {rms:.4f} hPa rms)")
     if do_print:
         print(f"epoch {epoch}, Jtot = {J.item()}")
 
@@ -1415,36 +1413,39 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         with torch.no_grad():
             ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
 
-    # jc_ps_sigma (hPa): balance penalty on the first-step change of the ps
-    # increment -- see compute_loss_4dvar's docstring. Needs the uncorrected
-    # background's ps one and two steps in (no gradient), computed once here.
+    # jc_ps_weight (kappa, hPa^-2): balance penalty on the first-step change
+    # of the pressure increment -- see compute_loss_4dvar's docstring. Needs
+    # the uncorrected background's pressure one and two steps in (no
+    # gradient), computed once here.
     jc_ref = None
-    if exp.get('jc_ps_sigma') or exp.get('jc_ps_weight'):
+    if exp.get('jc_ps_weight'):
+        # Pressure field for the penalty: surface pressure where the backend
+        # decodes it (ACE2, AIFS, Aurora), else mean sea-level pressure
+        # (FCN3, which has no surface-pressure channel). Both in Pa.
+        if model.is_known_variable('sp'):
+            jc_field = 'sp'
+        elif model.is_known_variable('msl'):
+            jc_field = 'msl'
+        else:
+            raise ValueError("jc_ps_weight needs a surface ('sp') or mean-sea-level ('msl') pressure field")
         model._prime_noise()
         with torch.no_grad():
             bg1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
             bg2 = model.advance(bg1, steps=1, use_checkpoint=False)
-            sp1 = model.decode_state(bg1, only=['sp'])['sp'].detach()
-            sp2 = model.decode_state(bg2, only=['sp'])['sp'].detach()
-        areaw = torch.as_tensor(model.area_weights, dtype=sp1.dtype, device=sp1.device)  # mean 1
-        if exp.get('jc_ps_weight'):
-            # Jc = kappa * N_obs * mean_w(Delta^2): grid mean (resolution-
-            # independent) scaled by the number of obs AVAILABLE in the window
-            # (fixed for the whole optimization, unlike the used count), so
-            # Jc / Jo stays ~constant as obs counts change.
-            n_obs = int(psobs_traj['n_valid'].sum())
-            jc_w = areaw / areaw.sum()
-            jc_factor = float(exp['jc_ps_weight']) * n_obs
-            logger.info(f"jc_ps_weight: {exp['jc_ps_weight']} hPa^-2 x N_obs={n_obs} -- first-step ps "
-                        f"balance penalty on (equivalent jc_ps_sigma on this grid: "
-                        f"{(model.n_points / jc_factor) ** 0.5:.4g} hPa)")
-        else:
-            # legacy form: Jc = sum_i w_i (Delta_i / sigma)^2, w mean 1 --
-            # scales with grid size and is independent of the obs count
-            jc_w = areaw
-            jc_factor = 1.0 / float(exp['jc_ps_sigma']) ** 2
-            logger.info(f"jc_ps_sigma: {exp['jc_ps_sigma']} hPa -- first-step ps balance penalty on")
-        jc_ref = (sp1, sp2, jc_w, jc_factor)
+            p1 = model.decode_state(bg1, only=[jc_field])[jc_field].detach()
+            p2 = model.decode_state(bg2, only=[jc_field])[jc_field].detach()
+        # Jc = kappa * N_obs * mean_w(Delta^2): area-weighted grid mean
+        # (resolution-independent) scaled by the number of obs AVAILABLE in
+        # the window (fixed for the whole optimization, unlike the used
+        # count), so Jc / Jo stays ~constant as obs counts change.
+        areaw = torch.as_tensor(model.area_weights, dtype=p1.dtype, device=p1.device)
+        jc_w = areaw / areaw.sum()
+        n_obs = int(psobs_traj['n_valid'].sum())
+        jc_factor = float(exp['jc_ps_weight']) * n_obs
+        logger.info(f"jc_ps_weight: {exp['jc_ps_weight']} hPa^-2 x N_obs={n_obs} on '{jc_field}' -- "
+                    f"first-step pressure balance penalty on (a per-point sigma of "
+                    f"{(model.n_points / jc_factor) ** 0.5:.4g} hPa on this grid)")
+        jc_ref = (jc_field, p1, p2, jc_w, jc_factor)
 
     optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd, betas=(beta1,beta2))
 
