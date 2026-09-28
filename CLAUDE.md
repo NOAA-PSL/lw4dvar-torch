@@ -27,9 +27,11 @@ documented in `config.yml.template`.
 - **Compute (GPU) nodes have no internet.** Every IC, verification file,
   checkpoint and forcing file must be prefetched from a login node first
   (`backends/<name>/*_prefetch_*.py`, `backends/ace2/ace2_ic.py`).
-- **ACE2 submodule is pointer-only** (the HF repo is ~75 GB): initialize with
-  `GIT_LFS_SKIP_SMUDGE=1 git submodule update --init backends/ace2/ACE2-ERA5`,
-  then `python backends/ace2/ace2_prefetch_checkpoint.py YEAR ...`.
+- **Clone/checkout recipe is in README.md ("Getting the code")**: clone with
+  `GIT_LFS_SKIP_SMUDGE=1 git clone --recursive`, then `git lfs pull` in the
+  AIFS/FCN3 submodules and `backends/ace2/ace2_prefetch_checkpoint.py YEAR ...`
+  for ACE2 -- the ACE2-ERA5 submodule is kept pointer-only (its HF repo is
+  ~75 GB of LFS content).
 - **Give every concurrent run its own `exp_name`** -- runs sharing one write
   identically named files into the same output directory and overwrite each
   other's trajectories (this happened; see the backends doc).
