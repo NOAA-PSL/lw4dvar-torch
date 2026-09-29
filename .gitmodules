@@ -7,3 +7,6 @@
 [submodule "backends/aifs/aifs-single-1.1"]
 	path = backends/aifs/aifs-single-1.1
 	url = https://huggingface.co/ecmwf/aifs-single-1.1
+[submodule "backends/ace2/ACE2-ERA5"]
+	path = backends/ace2/ACE2-ERA5
+	url = https://huggingface.co/allenai/ACE2-ERA5

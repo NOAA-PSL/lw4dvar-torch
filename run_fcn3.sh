@@ -12,7 +12,7 @@
 # cuda/12.8.1 (not the login/compute-node default, which has drifted
 # before) matches the CUDA toolkit torch==2.7.1+cu128 and the from-source
 # torch_harmonics CUDA extension were built against -- load-bearing for
-# this backend specifically (see CLAUDE.md's "fcstnet3 conda environment"
+# this backend specifically (see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "fcstnet3 conda environment"
 # section in the original long-window-4dvar-fcstnetv3 repo).
 module load cuda/12.8.1
 module load rdhpcs-conda

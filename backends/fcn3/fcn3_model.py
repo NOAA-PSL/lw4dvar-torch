@@ -28,7 +28,7 @@ code, not a search-and-replace port:
   `advance()` call -- see `_advance_one_step`'s docstring for why the noise
   update must run OUTSIDE the `torch.utils.checkpoint` boundary.
 
-See this repo's CLAUDE.md "FourCastNet3 architecture notes" section for the
+See the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "FourCastNet3 architecture notes" section for the
 config.json-derived facts (channel schema, latent shape formula, big_skip/
 bias_correction/history_normalization_mode all being no-ops for this
 checkpoint) this implementation depends on -- established by direct
@@ -62,7 +62,7 @@ def _chunked_encode(net, x: torch.Tensor, chunk_size: int) -> torch.Tensor:
     `net.atmo_encoder` is called on `chunk_size`-sized slices of the
     (batchdims * n_atmo_groups)-folded leading dimension instead of all 13
     pressure-level groups in one call. See FCN3Model.__init__'s
-    `atmo_chunk_size` docstring and this repo's CLAUDE.md "decode() memory
+    `atmo_chunk_size` docstring and the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "decode() memory
     investigation" for why -- kept as a free function (not a method) since
     it operates purely on `net`'s own submodules/buffers, mirroring exactly
     how the unmodified method is written, so a future upstream fix is easy
@@ -179,13 +179,13 @@ class FCN3Model(forecast_model.LatentForecastModel):
             `_chunked_encode`/`_chunked_decode` (module-level functions
             below) push through `net.atmo_encoder`/`net.atmo_decoder` in one
             call, instead of all 13 at once the way the unmodified
-            `AtmoSphericNeuralOperatorNet.encode`/`.decode` do. See this
-            repo's CLAUDE.md "decode() memory investigation" section for why
+            `AtmoSphericNeuralOperatorNet.encode`/`.decode` do. See
+            the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "decode() memory investigation" section for why
             this exists: a single unchunked `decode()` call needs ~20GiB
             (all 13 levels batched through one DISCO transpose-convolution
             at native 721x1440 resolution), which alone makes a 2-step
             differentiable rollout exceed a 93GiB H100. Default `2`: the
-            measured memory/time sweep (see CLAUDE.md) found peak memory for
+            measured memory/time sweep (see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md) found peak memory for
             a 2-step checkpointed rollout drops from OOM (chunk_size=13,
             unchunked) to 78.18 / 67.64 / 64.08 / 62.05 / 62.05 GiB at
             chunk_size 7 / 4 / 3 / 2 / 1 respectively, with NO measurable
@@ -218,7 +218,7 @@ class FCN3Model(forecast_model.LatentForecastModel):
         # We only ever want gradients w.r.t. OUR latent increment, never
         # w.r.t. FCN3's pretrained weights -- torch.load doesn't set
         # requires_grad=False on its own. Same lesson AIFSModel.__init__
-        # documents at length (CLAUDE.md's frozen-weights graph-reuse bug).
+        # documents at length (the long-window-4dvar-fcstnetv3 repo's CLAUDE.md's frozen-weights graph-reuse bug).
         for p in self.wrapper.parameters():
             p.requires_grad_(False)
 
@@ -295,7 +295,7 @@ class FCN3Model(forecast_model.LatentForecastModel):
 
     @property
     def latent_shape(self) -> tuple[int, int, int]:
-        """(total_embed_dim, h, w) -- see this repo's CLAUDE.md
+        """(total_embed_dim, h, w) -- see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md
         "FourCastNet3 architecture notes" for the formula
         (n_atmo_groups * atmo_embed_dim + surf_embed_dim, img_shape // scale_factor)
         this is computed from at __init__ time, so it stays correct if the
@@ -306,7 +306,7 @@ class FCN3Model(forecast_model.LatentForecastModel):
         """See forecast_model.LatentForecastModel.resolve_columns. Checks
         `_levels_by_base` (pressure-level families) BEFORE
         `_single_by_base` -- same precedence lesson AIFSModel.resolve_columns
-        documents (CLAUDE.md's retired `state_scales` lookup-order bug).
+        documents (the long-window-4dvar-fcstnetv3 repo's CLAUDE.md's retired `state_scales` lookup-order bug).
         FCN3 has no separate raw-checkpoint-mapping fallback tier the way
         AIFS's `var_to_idx` is (there is no anemoi `Checkpoint` object here),
         so this is a two-tier, not three-tier, lookup.
@@ -349,7 +349,7 @@ class FCN3Model(forecast_model.LatentForecastModel):
         there is only ever one time level.
 
         Does NOT provide 'surface_pressure' -- FCN3 has no native `sp`
-        channel at all (see this repo's CLAUDE.md "Variables" note); the
+        channel at all (see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "Variables" note); the
         ps-obs forward-operator design this would feed is an explicitly
         deferred decision, not resolved by this model-backend pass.
         """
@@ -490,7 +490,7 @@ class FCN3Model(forecast_model.LatentForecastModel):
         unmodified behavior exactly), but processes the 13 atmospheric
         pressure-level groups `self._atmo_chunk_size` at a time instead of
         all at once, which is what makes a multi-step differentiable
-        rollout fit in memory at all -- see this repo's CLAUDE.md "decode()
+        rollout fit in memory at all -- see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md "decode()
         memory investigation" section for the measurements that motivated
         this and __init__'s `atmo_chunk_size` docstring for the mechanism.
         """

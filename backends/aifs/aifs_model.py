@@ -196,7 +196,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
             fp16's narrow dynamic range can overflow when backpropagating
             through a long (here: 24-step/5-day) chained differentiable
             rollout, the exact mechanism root-caused for Aurora's own
-            16-step divergence (see CLAUDE.md). Confirmed 2026-09-21:
+            16-step divergence (see integrate_multiple_backends.md). Confirmed 2026-09-21:
             aifs-single-1.1 hits this (non-finite `increment.grad`,
             reproduced at 3 different learn_rates/epoch counts on an
             otherwise-identical 5-day-window config that aifs-single-2.0
@@ -218,7 +218,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
             compared against and optimized toward closing the gap to, not
             a target for its own optimization pass. Off by default;
             correctness/speed not yet validated at real production scale
-            when this param was added -- see CLAUDE.md for whatever the
+            when this param was added -- see integrate_multiple_backends.md for whatever the
             first real test found.
         """
         # `device` isn't in aifs_inference.yaml (it has no fixed GPU/CPU
@@ -233,7 +233,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
             # training precision, or bf16 if `autocast_dtype` overrides it,
             # see that param's docstring above), and this whole pipeline
             # already tolerates that level of numerical noise (see
-            # CLAUDE.md's finite-difference-checks note) -- so there's no
+            # the long-window-4dvar-aifsv2 repo's CLAUDE.md's finite-difference-checks note) -- so there's no
             # accuracy reason to force full fp32 matmul precision for
             # whatever falls outside that autocast block (e.g.
             # pre_processors/post_processors). TF32 is a free speedup there.
@@ -359,7 +359,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
         `_levels_by_base` (pressure-level families) BEFORE `_single_by_base`/
         `var_to_idx` -- checking the raw checkpoint mapping first would
         silently shadow a family like `'z'` with a same-named single-column
-        entry (surface orography); see this method's callers and CLAUDE.md
+        entry (surface orography); see this method's callers and the long-window-4dvar-aifsv2 repo's CLAUDE.md
         for the real bug that shipped from getting this order backwards.
         """
         if name in self._levels_by_base:

@@ -1,12 +1,12 @@
 """
 Staged torch.compile experiment for the Aurora backend, following the
-profiling finding (see CLAUDE.md "Aurora per-epoch runtime optimization")
+profiling finding (see integrate_multiple_backends.md "Aurora per-epoch runtime optimization")
 that ~31.6% of CPU time goes to GPU-command-queue backpressure ("Command
 Buffer Full") plus heavy copy/roll/reshape bookkeeping -- kernel-launch-
 count overhead, which torch.compile's kernel fusion directly targets.
 
 Genuinely risky given the confirmed fused-SDPA-kernel crash on this exact
-PyTorch/CUDA stack (use_fp16_safe_attention=False -- see CLAUDE.md "Aurora
+PyTorch/CUDA stack (use_fp16_safe_attention=False -- see integrate_multiple_backends.md "Aurora
 16-step divergence" era work) and the dynamic forward_pre_hook this
 wrapper registers/removes on model.wrapper.decoder on EVERY call (a
 pattern torch.compile's guards may not handle cleanly). Staged so a

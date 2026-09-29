@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 # standard behavior: the script's OWN directory, never the caller's cwd),
 # so the repo root needs to be added explicitly or `import
 # long_window_4dvar_utils` fails with ModuleNotFoundError (confirmed by
-# direct test, 2026-09-19 -- see CLAUDE.md "Login-node ERA5 prefetch
+# direct test, 2026-09-19 -- see integrate_multiple_backends.md "Login-node ERA5 prefetch
 # scripts, and a sys.path bug they share"). Didn't exist in the original
 # single-backend repo, where this script lived at the repo root alongside
 # long_window_4dvar_utils.py itself.

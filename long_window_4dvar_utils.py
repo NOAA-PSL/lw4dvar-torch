@@ -18,7 +18,7 @@ or 'aurora') now selects the forecast model at runtime;
 model/grid/IC-fetching modules, imported LAZILY (inside the function that
 needs them, never at this module's top level) so that a process running
 with only one backend's conda env active (`aifs2` vs `fcstnet3` vs `aurora`
--- see CLAUDE.md; the three envs are not co-installed) never needs the
+-- see integrate_multiple_backends.md; the three envs are not co-installed) never needs the
 other backends' dependencies importable at all.
 
 All three backends implement `forecast_model.LatentForecastModel` with no
@@ -68,6 +68,9 @@ Where the three backends genuinely differ, and how this file handles it:
     principle, but it has only ever been exercised for AIFS -- `load_config`
     raises for `model_backend: 'aurora'` too, until it's actually been
     tested, rather than silently claim support that hasn't been verified.
+    `'ps_native'` (ACE2 only) is `'ps'` with the lowest NATIVE model
+    level's t/q/pressure in place of t/q interpolated to 700 hPa --
+    `load_config` raises for any other backend.
   - **`reset_skt_ocean`.** Supported for AIFS and Aurora (both have
     `skt`/`lsm` decode_state fields -- Aurora's `lsm` was added to its
     packed state specifically to support this). FCN3 has no equivalent at
@@ -99,7 +102,7 @@ Where the three backends genuinely differ, and how this file handles it:
     `latent_increment` when backpropagating through a 16+ step chained
     rollout, deterministically, from the all-zero initial increment --
     `backends/aurora/aurora_model.py` now defaults to `bfloat16` instead
-    (see CLAUDE.md "Aurora 16-step divergence: root cause and fix"). Purely
+    (see integrate_multiple_backends.md "Aurora 16-step divergence: root cause and fix"). Purely
     an internal Aurora backend concern, invisible to this file, EXCEPT that
     this file's own `torch.isfinite(loss)` check (before `.backward()`) is
     not sufficient to catch this failure mode by itself -- a finite loss
@@ -174,9 +177,13 @@ _DECODE_ALIASES = {
 # front; Aurora DOES have a native 'sp' field but this path hasn't been
 # tested for it yet, so load_config() rejects
 # `model_backend: 'aurora'` + `ps_operator: 'ps'` too, for now.
+# 'ps_native' (ACE2 only) reads the lowest NATIVE model level's t/q/pressure
+# ('t_lowest'/'q_lowest'/'p_lowest', which only ACE2Model.decode_state
+# supplies) instead of t/q on the 700 hPa pressure level.
 _PS_OPERATOR_REQUIRES = {
     "logpinterp": {"z"},
     "ps": {"t", "q", "sp"},
+    "ps_native": {"t_lowest", "q_lowest", "p_lowest", "sp"},
 }
 
 PSOBS_QC_FLAG_MASKS = np.array([1, 2, 4, 8], dtype=np.int16)
@@ -249,9 +256,9 @@ def load_config(config_path='config.yml'):
     exp['path_output'] = exp['path_output'] + exp['exp_name'] + '/'
 
     backend = exp.get('model_backend')
-    if backend not in ('aifs', 'fcn3', 'aurora'):
+    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2'):
         raise ValueError(
-            f"exp.model_backend must be 'aifs', 'fcn3', or 'aurora', got {backend!r} -- "
+            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', or 'ace2', got {backend!r} -- "
             "this key is required (see config.yml.template)"
         )
     # reset_skt_ocean: AIFS and Aurora both have 'skt'/'lsm' packed-state
@@ -262,13 +269,13 @@ def load_config(config_path='config.yml'):
     if backend == 'fcn3' and exp.get('reset_skt_ocean', False):
         raise ValueError(
             "reset_skt_ocean is not supported for the FCN3 backend -- FCN3 has no "
-            "'skt'/'lsm' decode_state field to reset (see CLAUDE.md)."
+            "'skt'/'lsm' decode_state field to reset (see integrate_multiple_backends.md)."
         )
     if backend == 'fcn3' and exp.get('ps_operator', 'logpinterp') == 'ps':
         raise ValueError(
             "ps_operator='ps' is not supported for the FCN3 backend -- FCN3 has no "
             "native surface-pressure ('sp') decode_state field; use the default "
-            "'logpinterp' instead (see CLAUDE.md)."
+            "'logpinterp' instead (see integrate_multiple_backends.md)."
         )
     # Aurora DOES have a native 'sp' field (unlike FCN3), so 'ps' might work
     # here in principle -- but _compute_ps_observation_diagnostics_at_time's
@@ -280,7 +287,39 @@ def load_config(config_path='config.yml'):
             "ps_operator='ps' is not yet supported for the Aurora backend -- Aurora "
             "has a native 'sp' field so this may work in principle, but the 'ps' "
             "forward-operator path has only been tested for AIFS so far. Use the "
-            "default 'logpinterp' instead (see CLAUDE.md)."
+            "default 'logpinterp' instead (see integrate_multiple_backends.md)."
+        )
+    # ACE2: 'ps_native' is the default operator. Its layers are hybrid
+    # sigma-pressure, so 'logpinterp' would have to search a hydrostatically
+    # DERIVED geopotential that is ~19 m low vs ERA5 (~2 hPa of ps) -- still
+    # allowed if set explicitly, for comparison.
+    if backend == 'ace2':
+        exp.setdefault('ps_operator', 'ps_native')
+        if exp.get('reset_skt_ocean', False):
+            raise ValueError(
+                "reset_skt_ocean is not supported for the ACE2 backend -- ACE2's own ocean "
+                "scheme already prescribes surface_temperature over ocean from the forcing "
+                "file's SST at every step."
+            )
+        if exp['ps_operator'] == 'ps':
+            raise ValueError("ps_operator='ps' is not supported for ACE2 -- use 'ps_native' (the default)")
+    # jc_ps_sigma (the original, un-normalized penalty) was removed -- fail
+    # loudly rather than silently run without the penalty.
+    if 'jc_ps_sigma' in exp:
+        raise ValueError(
+            "jc_ps_sigma has been removed -- use jc_ps_weight (kappa, hPa^-2): "
+            "Jc = kappa * N_obs * area-weighted mean of Delta^2. The equivalent of "
+            "jc_ps_sigma = s is kappa = n_points / (s^2 * N_obs) -- e.g. s = 0.1 on "
+            "ACE2 (64800 points) with a 5-day window (~2.1e5 obs) is kappa ~ 30."
+        )
+    if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
+        raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
+    # ps_native needs decode_state's lowest-native-level keys
+    # (t_lowest/q_lowest/p_lowest), which only the ACE2 backend provides.
+    if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend != 'ace2':
+        raise ValueError(
+            f"ps_operator='ps_native' is only supported for model_backend 'ace2', got {backend!r} "
+            "(it needs decode_state's lowest-native-level t_lowest/q_lowest/p_lowest fields)."
         )
     return exp, windows
 
@@ -326,6 +365,8 @@ def log_window(exp, logger):
     logger.info('   control_variables: ' + str(exp.get('control_variables', '(all -- increment unrestricted)')))
     logger.info('   latent_scale: ' + str(exp.get('latent_scale', 1.0)))
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
+    logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
+                                        if exp.get('jc_ps_weight') else '(off)'))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
         logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
@@ -358,7 +399,7 @@ def get_model(exp):
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
-            autocast_dtype=exp.get('aifs_autocast_dtype', None),
+            autocast_dtype=exp.get('aifs_autocast_dtype', 'bfloat16'),
             compile_wrapper=exp.get('compile_wrapper', False),
         )
     elif backend == 'fcn3':
@@ -377,7 +418,15 @@ def get_model(exp):
             device=exp.get('device', 'cuda'),
             compile_wrapper=exp.get('compile_wrapper', False),
         )
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
+    elif backend == 'ace2':
+        _ensure_backend_on_path('ace2')
+        import ace2_model
+        return ace2_model.ACE2Model(
+            checkpoint_path=exp['path_model'] + exp.get('model_name', 'ace2_era5_ckpt.tar'),
+            forcing_dir=exp.get('forcing_dir', exp['path_model'] + 'forcing_data/'),
+            device=exp.get('device', 'cuda'),
+        )
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
 
 
 def get_grid_interpolator(model, exp):
@@ -412,7 +461,22 @@ def get_grid_interpolator(model, exp):
         if kind == 'kdtree':
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
+    elif backend == 'ace2':
+        # F90 Gaussian grid: unevenly spaced latitudes, so fcn3_grid's
+        # uniform-latitude BilinearGridInterpolator doesn't apply --
+        # ace2_grid's rectilinear version is the same scheme on the real
+        # latitudes. 'kdtree' falls back to fcn3_grid.GridInterpolator.
+        kind = exp.get('grid_interp', 'bilinear')
+        if kind == 'bilinear':
+            _ensure_backend_on_path('ace2')
+            import ace2_grid
+            return ace2_grid.RectilinearBilinearInterpolator(model.lons, model.lats)
+        if kind == 'kdtree':
+            _ensure_backend_on_path('fcn3')
+            import fcn3_grid
+            return fcn3_grid.GridInterpolator(model.lons, model.lats)
+        raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
 
 
 # ---------------------------------------------------------------------------
@@ -458,14 +522,32 @@ def get_input(exp, model, logger):
             _ensure_backend_on_path('aurora')
             import aurora_ic
             input_state = aurora_ic.build_input_state(back_dt, cache_dir)
+        elif backend == 'ace2':
+            # ICs are prefetched from a LOGIN node (ace2ic env):
+            # `python backends/ace2/ace2_ic.py YYYY-MM-DDTHH` -- this only
+            # reads the cached netCDF.
+            _ensure_backend_on_path('ace2')
+            import ace2_ic
+            input_state = ace2_ic.build_input_state(back_dt, cache_dir)
         else:
-            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
+            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
         input_encoded = model.prepare_initial_state(input_state, back_dt)
         dt_hours = exp['nhrs_back']
         logger.info('generating input state from a forecast...')
         input_encoded = model.advance(input_encoded, steps=int(round(dt_hours / (model.timestep.total_seconds() / 3600))))
 
     return input_encoded, exp
+
+
+def z500_field(decoded, nlev500):
+    """500 hPa geopotential (m^2/s^2, (n_points,)) from a decode_state dict or
+    a get_verif dict: a backend-supplied 'z500' if present (ACE2 -- its own
+    h500 output / ERA5 z500, since its pressure-level 'geopotential' is only
+    a hydrostatic derivation), else the pressure-level 'geopotential' family
+    at index nlev500 (AIFS/FCN3/Aurora)."""
+    if 'z500' in decoded:
+        return decoded['z500']
+    return decoded['geopotential'][nlev500, :]
 
 
 def get_verif(exp, model, logger, date_override=None):
@@ -555,8 +637,21 @@ def get_verif(exp, model, logger, date_override=None):
         verif_ic['geopotential_at_surface'] = torch.as_tensor(
             raw_fields['geopotential_at_surface'], dtype=torch.float32, device=model.device
         ).reshape(-1)
+    elif backend == 'ace2':
+        # Orography for the ps-obs QC/station reduction: ACE2's OWN static
+        # HGTsfc (what its PRESsfc is consistent with), not a separate ERA5
+        # fetch. Truth for the z500 diagnostic: ERA5 z500/t850 conservatively
+        # regridded to F90 (prefetched from a login node:
+        # `python backends/ace2/ace2_ic.py --verif YYYY-MM-DDTHH`), stored
+        # under 'z500' so the driver compares it with ACE2's own h500.
+        _ensure_backend_on_path('ace2')
+        import ace2_ic
+        verif_ic['geopotential_at_surface'] = model.surface_geopotential
+        truth = ace2_ic.load_verif(date_dt, cache_dir)
+        verif_ic['z500'] = GRAV * torch.as_tensor(truth['h500'], dtype=torch.float32, device=model.device).reshape(-1)
+        verif_ic['TMP850'] = torch.as_tensor(truth['TMP850'], dtype=torch.float32, device=model.device).reshape(-1)
     else:
-        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', or 'aurora')")
+        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
 
     if "z" in verif_ic:
         verif_ic["geopotential"] = verif_ic["z"]
@@ -587,7 +682,7 @@ def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5):
     open ocean (land-sea-mask-blended upstream of this whole pipeline, not by
     any code here), so resetting `skt` at ocean points from ERA5 is the
     closest available proxy for "reset SST from ERA5 every analysis time" --
-    see CLAUDE.md. No separate sea-ice handling: there's no sea-ice variable
+    see the long-window-4dvar-aifsv2 repo's CLAUDE.md. No separate sea-ice handling: there's no sea-ice variable
     in this checkpoint at all (`lsm` is a static land-sea mask, constant in
     time, with no time-varying ice-extent field to reset).
 
@@ -661,7 +756,7 @@ def get_psobs(exp, model, logger, grid_interp):
         vdate = add_hours(vdate, dt_obs)
     logger.info('max number of obs at each slot in window:' + str(nobs_max))
 
-    for k in ['obtype', 'lon', 'lat', 'elev', 'ob', 'oberr']:
+    for k in ['obtype', 'lon', 'lat', 'elev', 'ob', 'oberr', 'oberr_qc']:
         if k in ('ob', 'elev'):
             psobs_traj[k] = torch.zeros((n_obs, nobs_max), dtype=torch.float32, device=device)
         elif k == 'obtype':
@@ -683,9 +778,13 @@ def get_psobs(exp, model, logger, grid_interp):
         psobs_traj['ob'][j, :nobs] = torch.as_tensor(psobs_data[:, 5], dtype=torch.float32, device=device)
         tday = j * dt_obs / 24.
         if oberrstart > 0:
-            psobs_traj['oberr'][j, :nobs] = oberrstart + oberrdeltaperday * tday
+            base_err = torch.full((nobs,), float(oberrstart), dtype=torch.float32, device=device)
         else:
-            psobs_traj['oberr'][j, :nobs] = torch.as_tensor(psobs_data[:, 7], dtype=torch.float32, device=device) + oberrdeltaperday * tday
+            base_err = torch.as_tensor(psobs_data[:, 7], dtype=torch.float32, device=device)
+        psobs_traj['oberr'][j, :nobs] = base_err + oberrdeltaperday * tday
+        # start-of-window error, without the oberrdeltaperday growth -- used by
+        # the gross check instead of 'oberr' when qc_fixed_oberr is set
+        psobs_traj['oberr_qc'][j, :nobs] = base_err
     logger.info('ps ob times:' + str(psobs_datestrings))
 
     # Per-slot time-bracketing metadata: step_lo = floor(t_j / 6h), alpha =
@@ -778,9 +877,10 @@ def get_surface_pressure(pressure_levels, geopotential, orography):
 
 def preduce(ps, tpress, t, q, zmodel, zob, rlapse=0.0065, grav=GRAV, rd=RD, rv=RV):
     """MAPS pressure reduction from model to station elevation.
-    See Benjamin and Miller (1990, MWR, p. 2100). AIFS ONLY -- used by
-    `ps_operator='ps'`, which is unreachable for FCN3 (see module
-    docstring/load_config).
+    See Benjamin and Miller (1990, MWR, p. 2100). Used by
+    `ps_operator='ps'` (AIFS; `tpress` = the scalar 700 hPa level) and
+    `ps_operator='ps_native'` (ACE2; `tpress` = the lowest native level's
+    per-point pressure) -- elementwise, so either works.
     """
     alpha = rd * rlapse / grav
     fv = rv / rd - 1.
@@ -839,23 +939,48 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
         safe_t700 = torch.where(preliminary_rejected, torch.full_like(t700_obspace, 300.), t700_obspace)
         safe_q700 = torch.where(preliminary_rejected, torch.full_like(q700_obspace, 1.e-5), q700_obspace)
         model_equivalent = preduce(safe_ps, tpress, safe_t700, safe_q700, safe_model_orography, safe_elevation)
+    elif ps_operator == 'ps_native':
+        # ACE2 only (load_config enforces): same MAPS reduction as 'ps', but
+        # with the lowest NATIVE model level's t/q and its own per-point
+        # pressure instead of t/q interpolated to the fixed 700 hPa level --
+        # ACE2's layers are hybrid sigma-pressure, so no pressure-level
+        # interpolation at all. preduce is elementwise, so a per-point
+        # `tpress` works unchanged. Pressures in Pa -> hPa.
+        ps_obspace = grid_interp.interp(idx, wts, decoded['surface_pressure'] / 100.0)
+        pl_obspace = grid_interp.interp(idx, wts, decoded['p_lowest'] / 100.0)
+        tl_obspace = grid_interp.interp(idx, wts, decoded['t_lowest'])
+        ql_obspace = grid_interp.interp(idx, wts, decoded['q_lowest'])
+        safe_ps = torch.where(preliminary_rejected, torch.full_like(ps_obspace, 985.), ps_obspace)
+        safe_pl = torch.where(preliminary_rejected, torch.full_like(pl_obspace, 925.), pl_obspace)
+        safe_tl = torch.where(preliminary_rejected, torch.full_like(tl_obspace, 285.), tl_obspace)
+        safe_ql = torch.where(preliminary_rejected, torch.full_like(ql_obspace, 1.e-3), ql_obspace)
+        model_equivalent = preduce(safe_ps, safe_pl, safe_tl, safe_ql, safe_model_orography, safe_elevation)
     elif ps_operator == 'logpinterp':
-        coslat = torch.as_tensor(model.coslat if hasattr(model, 'coslat') else grid_interp.coslat, device=device)
-        geopotential_mean = (coslat[None, :] * decoded['geopotential']).sum(dim=-1) / coslat.sum()
+        areaw = torch.as_tensor(model.area_weights, dtype=decoded['geopotential'].dtype, device=device)
+        geopotential_mean = (areaw[None, :] * decoded['geopotential']).sum(dim=-1) / areaw.sum()
         safe_geopotential = torch.where(
             preliminary_rejected[None, :], geopotential_mean[:, None], geopotential_obspace
         )
         plevs = torch.as_tensor(model.pressure_levels('z'), device=device)
         model_equivalent = get_surface_pressure(plevs, safe_geopotential, GRAV * safe_elevation)
     else:
-        raise ValueError(f"unknown ps_operator {ps_operator!r} (expected 'ps' or 'logpinterp')")
+        raise ValueError(f"unknown ps_operator {ps_operator!r} (expected 'ps', 'ps_native' or 'logpinterp')")
 
     orography_difference = torch.where(preliminary_rejected, torch.zeros_like(safe_elevation), torch.abs(safe_model_orography - safe_elevation))
     orography_failed = orography_difference > zthresh
     effective_error = assigned_error + zconst * orography_difference
+    # qc_fixed_oberr: gross-check against the START-of-window error (no
+    # oberrdeltaperday growth), so down-weighting late-window obs in the loss
+    # doesn't also loosen their QC (bg_check * sigma would otherwise grow from
+    # e.g. 4 to 14 hPa by 120h at oberrdeltaperday=0.5). Opt-in, so earlier
+    # runs with oberrdeltaperday > 0 stay reproducible.
+    if exp.get('qc_fixed_oberr', False):
+        qc_error = psobs_traj['oberr_qc'][oind, :] + zconst * orography_difference
+    else:
+        qc_error = effective_error
     base_rejected = preliminary_rejected | interpolation_failed | orography_failed
     innovation = observation - model_equivalent
-    gross_check_failed = (~base_rejected) & (torch.abs(innovation / effective_error) > bg_check)
+    gross_check_failed = (~base_rejected) & (torch.abs(innovation / qc_error) > bg_check)
     total_rejected = preliminary_rejected | interpolation_failed | orography_failed | gross_check_failed
     used = ~total_rejected
 
@@ -931,11 +1056,14 @@ def _resolve_control_mask(model, exp, n_vars, device):
              exactly zeroed (it can still evolve downstream in response to the
              controlled variables).
 
+    A backend's `diagnostic_columns` (output-only fields, if it declares
+    any) are always True, whatever `control_variables` says -- see below.
+
     Returns `None` when `control_variables` is absent (no masking -- the
     increment is free on every variable, the default behaviour).
 
     Column lookup (`model.resolve_columns`) checks pressure-level families
-    before any single-level/raw-checkpoint fallback -- see CLAUDE.md for the
+    before any single-level/raw-checkpoint fallback -- see the long-window-4dvar-aifsv2 repo's CLAUDE.md for the
     bug that shipped from getting that order backwards, which is exactly
     what `resolve_columns` closes off at the source for every backend behind
     the `LatentForecastModel` interface, not just AIFS.
@@ -956,6 +1084,14 @@ def _resolve_control_mask(model, exp, n_vars, device):
             raise KeyError(f"control_variables entry {base!r} is not a model variable or family")
         for i in cols:
             mask[i] = True
+    # Output-only diagnostic columns (backend-declared, e.g. ACE2's h500/
+    # TMP850/fluxes) are never reset: they don't feed the next step, so
+    # resetting them protects nothing and only replaces the analysis's own
+    # diagnosis with the background's -- which made ACE2's h500-based z500
+    # "after" line identical to "before" whenever control_variables omitted
+    # h500.
+    for i in getattr(model, 'diagnostic_columns', ()):
+        mask[i] = True
     return mask
 
 
@@ -1068,7 +1204,7 @@ def _apply_control_mask(state, keep_mask, ref_state, state_layout):
 
 def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif_ic,
                        psobs_traj, epoch, exp, grid_interp, print_every, interp_specs,
-                       keep_mask=None, ref_state1=None):
+                       keep_mask=None, ref_state1=None, jc_ref=None):
     """Latent-space 4D-Var cost function, with sub-6h observations.
 
     `latent_increment` lives in the model's latent space -- AIFS's hidden-
@@ -1110,6 +1246,22 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     the loss" check before trusting a non-default value on a new window
     length.
 
+    `jc_ref` (from `compute_optimal`, present iff `exp['jc_ps_weight']` is
+    set): `(field, bg_p_6h, bg_p_12h, weights, factor)` -- the pressure
+    field used ('sp' where the backend has it, else 'msl' -- FCN3), the
+    uncorrected background's values of it (Pa) one and two steps in, area
+    weights summing to 1, and factor = kappa * N_obs (N_obs = obs available
+    in the window). Adds a balance penalty on how fast the increment changes
+    over the first step after injection, which damps the transient
+    mass-field part of the increment the model otherwise sheds within ~a
+    day:
+        Jc = kappa * N_obs * sum_i weights_i * Delta_i^2,
+        Delta = (an - bg)(t+12h) - (an - bg)(t+6h)   [pressure, hPa]
+    i.e. the analysis pressure tendency minus the background's over the same
+    step, so tides/real tendencies common to both cancel. The grid mean
+    makes kappa independent of resolution; the N_obs factor keeps Jc / Jo
+    roughly fixed as obs counts change.
+
     Callers (`compute_optimal`) must re-prime the model's stochastic noise
     state (`model._prime_noise()`) immediately before calling this, once per
     epoch -- not once before the epoch loop -- so every epoch evaluates the
@@ -1150,6 +1302,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                   f"{int(used.sum().item())} obs used (out of {int(psobs_traj['n_valid'][j])}){tag}")
         return Jt
 
+    jc_sp = {}
     f_state = input_state
     decoded_prev = model.decode_state(f_state, only=loss_bases)   # step 0 = uncorrected background
     for s in range(1, n_steps + 1):
@@ -1166,6 +1319,8 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                 f_state.date,
             )
         decoded_cur = model.decode_state(f_state, only=loss_bases)
+        if jc_ref is not None and s in (1, 2):
+            jc_sp[s] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
         for j in slots_by_step.get(s - 1, []):
             a = alpha[j]
             if a == 0.0:
@@ -1178,6 +1333,14 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         decoded_prev = decoded_cur
 
     J = sum(Jol)
+    if jc_ref is not None:
+        jc_field, bg1, bg2, jc_w, jc_factor = jc_ref
+        delta = ((jc_sp[2] - bg2) - (jc_sp[1] - bg1)) / 100.0   # hPa
+        Jc = jc_factor * (jc_w * delta ** 2).sum()
+        J = J + Jc
+        if do_print:
+            rms = torch.sqrt((jc_w * delta ** 2).sum() / jc_w.sum()).item()
+            print(f"epoch {epoch}, Jc = {Jc.item()} (first-step {jc_field} increment change {rms:.4f} hPa rms)")
     if do_print:
         print(f"epoch {epoch}, Jtot = {J.item()}")
 
@@ -1199,7 +1362,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     reconstruction; FCN3's t=0 reconstruction path was tested empirically
     and found badly damped/biased, ~7-9x worse than a real 6h step, since
     `decode()` was never trained downstream of anything but the processor
-    step -- see CLAUDE.md. Aurora has not been separately investigated;
+    step -- see the long-window-4dvar-fcstnetv3 repo's CLAUDE.md. Aurora has not been separately investigated;
     the same `t+timestep` injection point is used uniformly for all three
     backends by design, not because it has been confirmed to be the only
     option for each one.) This therefore returns a state dated at
@@ -1249,6 +1412,40 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         model._prime_noise()  # no-op for AIFS
         with torch.no_grad():
             ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
+
+    # jc_ps_weight (kappa, hPa^-2): balance penalty on the first-step change
+    # of the pressure increment -- see compute_loss_4dvar's docstring. Needs
+    # the uncorrected background's pressure one and two steps in (no
+    # gradient), computed once here.
+    jc_ref = None
+    if exp.get('jc_ps_weight'):
+        # Pressure field for the penalty: surface pressure where the backend
+        # decodes it (ACE2, AIFS, Aurora), else mean sea-level pressure
+        # (FCN3, which has no surface-pressure channel). Both in Pa.
+        if model.is_known_variable('sp'):
+            jc_field = 'sp'
+        elif model.is_known_variable('msl'):
+            jc_field = 'msl'
+        else:
+            raise ValueError("jc_ps_weight needs a surface ('sp') or mean-sea-level ('msl') pressure field")
+        model._prime_noise()
+        with torch.no_grad():
+            bg1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
+            bg2 = model.advance(bg1, steps=1, use_checkpoint=False)
+            p1 = model.decode_state(bg1, only=[jc_field])[jc_field].detach()
+            p2 = model.decode_state(bg2, only=[jc_field])[jc_field].detach()
+        # Jc = kappa * N_obs * mean_w(Delta^2): area-weighted grid mean
+        # (resolution-independent) scaled by the number of obs AVAILABLE in
+        # the window (fixed for the whole optimization, unlike the used
+        # count), so Jc / Jo stays ~constant as obs counts change.
+        areaw = torch.as_tensor(model.area_weights, dtype=p1.dtype, device=p1.device)
+        jc_w = areaw / areaw.sum()
+        n_obs = int(psobs_traj['n_valid'].sum())
+        jc_factor = float(exp['jc_ps_weight']) * n_obs
+        logger.info(f"jc_ps_weight: {exp['jc_ps_weight']} hPa^-2 x N_obs={n_obs} on '{jc_field}' -- "
+                    f"first-step pressure balance penalty on (a per-point sigma of "
+                    f"{(model.n_points / jc_factor) ** 0.5:.4g} hPa on this grid)")
+        jc_ref = (jc_field, p1, p2, jc_w, jc_factor)
 
     optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd, betas=(beta1,beta2))
 
@@ -1309,7 +1506,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # loss surface for the fixed `increment`. No-op for AIFS.
         model._prime_noise()
         optimizer.zero_grad()
-        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1)
+        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref)
 
         if not torch.isfinite(loss):
             logger.warning(f'epoch={epoch}: non-finite loss ({loss.item()}), stopping optimization early')
@@ -1326,7 +1523,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # rejected as non-finite (`interpolation_failed`) rather than
         # producing a NaN loss -- so the *loss* itself looks deceptively
         # finite and lower than before, and the corrupted increment gets
-        # saved as "new best" rather than caught here. See CLAUDE.md
+        # saved as "new best" rather than caught here. See integrate_multiple_backends.md
         # "Aurora 16-step divergence" for the full root-cause writeup.
         #
         # Originally a skip-and-continue (warn, zero the grad, proceed to
