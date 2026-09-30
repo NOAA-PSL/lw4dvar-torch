@@ -9,7 +9,7 @@ exp:
   # run_aurora.sh / run_ace2.sh); the envs are NOT
   # co-installed (see integrate_multiple_backends.md), so backends not selected here don't need
   # to be importable at all in the env you actually run with.
-  model_backend: fcn3  # or: aifs, aurora, ace2
+  model_backend: fcn3  # or: aifs, aurora, ace2, sfno
 
   # get_input() always builds the very first initial condition from an
   # ERA5 forecast `nhrs_back` hours before `sdate`, fetched via CDS -- see
@@ -60,6 +60,17 @@ exp:
   # ps_operator defaults to 'ps_native'; reset_skt_ocean is rejected.
   #   path_model: './backends/ace2/ACE2-ERA5/'
   #   ic_cache: './ic_cache_ace2/'
+  # SFNO (NVIDIA SFNO-73ch-small from NGC, run with makani in the fcstnet3
+  # env): path_model is the converted package dir fetched by
+  # backends/sfno/sfno_prefetch_checkpoint.py (not a submodule -- NGC isn't
+  # git). ic_cache can be FCN3's ERA5 cache: SFNO's 73 channels are FCN3's 72
+  # plus 'sp', which backends/sfno/sfno_ic.py adds as one small file per date.
+  # sfno_latent_block (default -2): the SFNO block whose output receives the
+  # latent increment -- -2 = block 6, the last 240x480 latent (384x240x480);
+  # -1 = block 7's full-resolution output (384x721x1440, 9x larger).
+  # ps_operator: both 'logpinterp' (default, better O-B fit) and 'ps' work.
+  #   path_model: './backends/sfno/ngc_cache/sfno_73ch_small/'
+  #   ic_cache: '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-fcstnetv3/ic_cache/'
   path_model: './backends/fcn3/fourcastnet3/'
 
   device: 'cuda'

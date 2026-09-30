@@ -1378,6 +1378,78 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
   with the same exp_name and overwrote each other's saved trajectories;
   only files attributable by mtime to the sigma=0.1 job were used.
 
+## Fifth backend: NVIDIA SFNO-73ch-small (`model_backend: sfno`, 2026-09-29/30)
+
+Branch `sfno`. Purpose: ACE2 is the only backend so far that cycles stably
+with ps obs only; SFNO shares ACE2's network body, so a stable SFNO would
+point at the architecture. **Confounders to record with any result**: SFNO
+is 0.25 deg (721x1440) on 13 pressure levels vs ACE2's 1 deg / 8 hybrid
+layers; it has NO conservation corrector (ACE2 conserves global dry-air mass
+every step -- directly constraining ps); NO SST/skin temperature and no
+forcing, so the ocean lower boundary is free-running (ACE2 prescribes SST and
+sea ice every step), which alone could cause drift under cycling; trained
+for medium-range weather (ACE2 for long climate rollouts). FCN3 (also a
+spherical neural operator) did not cycle stably, but differs again (DISCO
+encoder/decoder, stochastic, 166M-element latent).
+
+- **Package**: NGC `nvidia/modulus/sfno_73ch_small` v0.1.0 (April 2024,
+  makani v0.1.x), a makani model package (same layout as FCN3's). Not a git
+  repo -> `backends/sfno/sfno_prefetch_checkpoint.py` downloads to the
+  gitignored `backends/sfno/ngc_cache/` and converts it for makani 0.2.0 (the
+  fcstnet3 env), each step checked against makani's source:
+  1. config `in_channels`/`out_channels` = range(73) -- global_means/stds.npy
+     have 75 entries whose FIRST 73 match the channel names (verified by
+     magnitude; the last 2 are unused);
+  2. `global_means_path`/`global_stds_path` placeholders (makani only
+     substitutes the package's stats files when the keys exist);
+  3. `dhours: 1` (timestep = dt*dhours; hourly training data, dt = 6);
+  4. weights-only checkpoint: the pickle references ruamel.yaml objects the
+     weights_only unpickler can't rebuild, so it is loaded ONCE with
+     weights_only=False after a static pickletools check (no execution) that
+     it only references torch storage/rebuild, OrderedDict, makani YParams
+     and ruamel.yaml containers; keep `model_state` only (6.9 -> 2.1 GB),
+     drop the DDP `module.` prefix, and add a leading group axis to the 8
+     dhconv filter weights (v0.1 "bixy,iox->boxy" [in,out,l] vs v0.2
+     "bgixy,giox->bgoxy" [g,in,out,l] -- identical for 1 group). Loads
+     strictly via makani's safe loader; re-running the conversion reproduces
+     the weights byte-for-byte.
+  **Correctness check** (CPU, ERA5 2015-01-01T00 -> 06Z): 6h forecast RMS
+  z500 2.31 m (persistence 24.3), t850 0.43 K (1.62), sp 0.35 hPa (2.62), msl
+  0.31 (2.77), u250 1.69 m/s (5.12) -- the converted weights compute
+  correctly.
+- **Architecture** (makani SphericalFourierNeuralOperatorNet): embed 384, 8
+  blocks, instance norm, dhconv -- ACE2's body -- but scale_factor 3: block 0
+  721x1440 -> 240x480, blocks 1-6 at 240x480, block 7 back to 721x1440; big
+  skip. Inputs 73 channels + zenith, orography, land/sea masks (77); 6h step;
+  self-starting; deterministic; trained bf16 AMP (run here in fp32).
+- **Latent (option B, user's choice)**: output of block 6 (`sfno_latent_block:
+  -2`), (384, 240, 480) ~ 44M -- comparable to ACE2's 25M; forward hook
+  registered inside the checkpointed function. Option A (block 7 output,
+  384x721x1440 ~ 400M, same position as ACE2's but 0.25 deg) is available as
+  `sfno_latent_block: -1`.
+- **`SFNOModel`** (`backends/sfno/sfno_model.py`) subclasses FCN3Model (same
+  channels/names/grid/packed layout (1,73,721,1440)); overrides loading, the
+  (absent) noise, the single step; adds the `surface_pressure` alias. ERA5 ICs
+  and verification: `sfno_ic.py` reuses FCN3's cached ERA5 files unchanged
+  and adds one ~1.4 MB `era5_sfno_<date>_sp.nc` per date (CDS, ~30 s).
+  Grid: fcn3_grid.BilinearGridInterpolator. Dates tz-aware UTC (makani zenith).
+- **Smoke test** (H100): decode round-trip exact; repeat rollouts and zero
+  increment BITWISE identical (unlike ACE2); first checkpointed gradient after
+  a no-grad rollout identical to the plain one (cos 1.000000, rel 0 -- ACE2's
+  first-call bug does not occur; non-reentrant checkpointing kept); AdamW
+  0.176 -> 0.026 in 10 epochs. Checkpointed fwd+bwd: 1 step 0.28 s / 26.8 GiB,
+  2 steps 0.64 s / 44.7 GiB, 4 steps 1.36 s / 45.3, 8 steps 2.80 s / 46.5 GiB
+  -> 20 steps ~50 GiB, ~7 s/epoch (ACE2 2.6 s, AIFS 18 s, FCN3 94 s).
+- **End-to-end** (`config_test_sfno.yml` / `run_sfno.sh`, 12h window, 5
+  epochs, 48h back-forecast from 2014-12-30T00): completes; Jtot -26%. t+0h
+  O-B (used obs): logpinterp mean -0.27 / std 1.35 hPa (8816 used; >1000 m
+  stations +0.65/1.54); `ps` operator +0.23 / 1.86 (8743 used; >1000 m
+  +1.89/2.00 -- t700-based reduction biased over high terrain). **logpinterp
+  (the default) fits better for SFNO.** SFNO's O-B spread is well below
+  ACE2's (2.08, 8213 used) -- 0.25 vs 1 deg terrain smoothing. z500 bg(t0)
+  11.28 m global (area-weighted).
+- **Not yet done**: cycled experiments (the actual architecture test).
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
