@@ -180,6 +180,22 @@ _DECODE_ALIASES = {
 # 'ps_native' (ACE2 only) reads the lowest NATIVE model level's t/q/pressure
 # ('t_lowest'/'q_lowest'/'p_lowest', which only ACE2Model.decode_state
 # supplies) instead of t/q on the 700 hPa pressure level.
+# autocast_dtype config values (canonical names) and which each backend
+# accepts; backends not listed run in fp32 only.
+_AUTOCAST_NAMES = {'bfloat16': 'bfloat16', 'bf16': 'bfloat16', 'float16': 'float16', 'fp16': 'float16',
+                   'float32': 'float32', 'fp32': 'float32'}
+_AUTOCAST_ALLOWED = {'aifs': {'bfloat16', 'float16'}, 'aurora': {'bfloat16', 'float16'},
+                     'sfno': {'bfloat16', 'float32'}}
+_AUTOCAST_DEFAULT = {'aifs': 'bfloat16', 'aurora': 'bfloat16', 'sfno': 'float32'}
+
+
+def _autocast_torch_dtype(exp, backend):
+    """The configured (or backend-default) autocast dtype as a torch.dtype;
+    None means no autocast (fp32)."""
+    name = exp.get('autocast_dtype') or _AUTOCAST_DEFAULT[backend]
+    return None if name == 'float32' else getattr(torch, name)
+
+
 _PS_OPERATOR_REQUIRES = {
     "logpinterp": {"z"},
     "ps": {"t", "q", "sp"},
@@ -314,6 +330,22 @@ def load_config(config_path='config.yml'):
         )
     if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
+    # autocast_dtype: one key for every backend that supports mixed precision.
+    # aifs_autocast_dtype is a deprecated alias (existing aifs1 configs use it).
+    if 'aifs_autocast_dtype' in exp:
+        old = exp.pop('aifs_autocast_dtype')
+        if exp.get('autocast_dtype', old) != old:
+            raise ValueError(f"aifs_autocast_dtype={old!r} conflicts with autocast_dtype={exp['autocast_dtype']!r}")
+        exp['autocast_dtype'] = old
+        print("NOTE: 'aifs_autocast_dtype' is deprecated -- use 'autocast_dtype' (same values)")
+    if exp.get('autocast_dtype') is not None:
+        name = _AUTOCAST_NAMES.get(str(exp['autocast_dtype']).lower())
+        allowed = _AUTOCAST_ALLOWED.get(backend)
+        if allowed is None:
+            raise ValueError(f"autocast_dtype is not implemented for model_backend {backend!r} (it runs in fp32)")
+        if name not in allowed:
+            raise ValueError(f"autocast_dtype for {backend!r} must be one of {sorted(allowed)}, got {exp['autocast_dtype']!r}")
+        exp['autocast_dtype'] = name
     # ps_native needs decode_state's lowest-native-level keys
     # (t_lowest/q_lowest/p_lowest), which only the ACE2 backend provides.
     if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend != 'ace2':
@@ -399,7 +431,7 @@ def get_model(exp):
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
-            autocast_dtype=exp.get('aifs_autocast_dtype', 'bfloat16'),
+            autocast_dtype=_autocast_torch_dtype(exp, 'aifs'),
             compile_wrapper=exp.get('compile_wrapper', False),
         )
     elif backend == 'fcn3':
@@ -420,6 +452,7 @@ def get_model(exp):
             package_root=exp.get('path_model', sfno_model.DEFAULT_PACKAGE),
             device=exp.get('device', 'cuda'),
             latent_block=exp.get('sfno_latent_block', -2),
+            autocast_dtype=_autocast_torch_dtype(exp, 'sfno'),
         )
     elif backend == 'aurora':
         _ensure_backend_on_path('aurora')
@@ -427,6 +460,7 @@ def get_model(exp):
         return aurora_model.AuroraModel(
             package_root=exp['path_model'],
             device=exp.get('device', 'cuda'),
+            autocast_dtype=_autocast_torch_dtype(exp, 'aurora'),
             compile_wrapper=exp.get('compile_wrapper', False),
         )
     elif backend == 'ace2':

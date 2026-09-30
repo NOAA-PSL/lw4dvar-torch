@@ -1448,6 +1448,25 @@ encoder/decoder, stochastic, 166M-element latent).
   (the default) fits better for SFNO.** SFNO's O-B spread is well below
   ACE2's (2.08, 8213 used) -- 0.25 vs 1 deg terrain smoothing. z500 bg(t0)
   11.28 m global (area-weighted).
+- **`checkpoint_stride` must be 1** for a 20-step window: the user found
+  stride 2 OOMs in fp32, and it also OOMs in bf16 (stride 4 too) --
+  each non-checkpointed 0.25 deg step holds ~18 GiB of full-resolution
+  activations. fp32, stride 1: 20 steps 7.2 s / 51.8 GiB.
+- **`autocast_dtype: bfloat16` (opt-in; default fp32)**: the first version
+  autocast the whole network and was NOT usable for ps DA -- bf16 rounding on
+  the normalized inputs/outputs (~0.0078 relative x sp's 9584 Pa std ~ 0.75
+  hPa) moved sp by 0.43 hPa rms in 2 steps (zero-increment loss 0.176 ->
+  0.361) and turned the latent gradient 23 deg (cos 0.919, norm x1.21). Fixed
+  by autocasting ONLY the 8 SFNO blocks (encoder, decoder, big-skip residual
+  projection stay fp32; installed once at load so the checkpoint recompute
+  matches): 6h forecast z500 2.313 / sp 0.356 (fp32 2.305 / 0.354), loss
+  0.1766 (0.1764), gradient cos 0.9997 / norm x0.998; 20 steps 6.18 s / 41.0
+  GiB (-14% / -21% vs fp32). Probe: `backends/sfno/probe_sfno_bf16.py`.
+- **`autocast_dtype` is now one key for all backends** (was
+  `aifs_autocast_dtype`, kept as a deprecated alias for the user's existing
+  aifs1 configs): aifs bfloat16|float16 (default bfloat16), aurora
+  bfloat16|float16 (default bfloat16), sfno bfloat16|float32 (default
+  float32); load_config raises for ace2/fcn3.
 - **Not yet done**: cycled experiments (the actual architecture test).
 
 ## Known gaps / next steps

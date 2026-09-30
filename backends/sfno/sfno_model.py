@@ -47,13 +47,25 @@ DEFAULT_PACKAGE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ngc_
 
 
 class SFNOModel(FCN3Model):
-    def __init__(self, package_root: str = DEFAULT_PACKAGE, device: str = "cuda", latent_block: int = -2):
+    def __init__(self, package_root: str = DEFAULT_PACKAGE, device: str = "cuda", latent_block: int = -2,
+                 autocast_dtype=None):
         """
         package_root : converted NGC package (sfno_prefetch_checkpoint.py).
         latent_block : index of the block whose OUTPUT receives the latent
             increment; -2 (block 6, the last 240x480 latent) is option B.
             -1 would be block 7's full-resolution output (384x721x1440).
+        autocast_dtype : None (default, fp32) or torch.bfloat16 -- run the 8
+            SFNO BLOCKS under torch.autocast; the encoder, decoder and big-skip
+            residual projection stay fp32 (makani also keeps its spherical-
+            harmonic transforms fp32 inside autocast). Autocasting the whole
+            network (the first version) put bf16 rounding on the physical
+            inputs/outputs: ~0.0078 relative resolution x sp's 9584 Pa
+            normalization std ~ 0.75 hPa -- it moved surface pressure by 0.43
+            hPa rms in 2 steps and turned the latent gradient 23 deg (cos 0.92).
         """
+        if isinstance(autocast_dtype, str):
+            autocast_dtype = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16}[autocast_dtype.lower()]
+        self._autocast_dtype = autocast_dtype
         self._device = torch.device(device)
         if self._device.type == "cuda":
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -67,6 +79,8 @@ class SFNOModel(FCN3Model):
         self._net = self._step_wrapper.model  # SphericalFourierNeuralOperatorNet
         self._preprocessor = self._step_wrapper.preprocessor
         _assert_checkpoint_safe(self._net)
+        if self._autocast_dtype is not None:
+            self._install_block_autocast(self._autocast_dtype)
 
         params = self.wrapper.params
         self._channel_names = list(params.channel_names)
@@ -95,6 +109,24 @@ class SFNOModel(FCN3Model):
         h, w = (self._nlat, self._nlon) if idx == n_blocks - 1 else (int(self._net.h), int(self._net.w))
         self._latent_shape = (int(self._net.embed_dim), h, w)
 
+    def _install_block_autocast(self, dtype):
+        """Wrap each SFNO block's forward in torch.autocast(dtype) and cast the
+        decoder's input back to fp32, so only the latent-space blocks run in
+        reduced precision. Installed once at load time, so the checkpoint
+        recompute during backward sees the same precision as the forward."""
+        dev = self._device.type
+
+        def autocast_fwd(fwd):
+            def f(*args, **kwargs):
+                with torch.autocast(device_type=dev, dtype=dtype):
+                    return fwd(*args, **kwargs)
+            return f
+
+        for blk in self._net.blocks:
+            blk.forward = autocast_fwd(blk.forward)
+        dec_fwd = self._net.decoder.forward
+        self._net.decoder.forward = lambda x, *a, **k: dec_fwd(x.float(), *a, **k)
+
     # SFNO is deterministic -- no noise to prime (FCN3Model's noise calls would fail)
     def _prime_noise(self) -> None:
         pass
@@ -121,7 +153,7 @@ class SFNOModel(FCN3Model):
             if inc_ is not None:
                 handle = self._latent_block.register_forward_hook(lambda _m, _i, out: out + inc_)
             try:
-                return self._net(inp_)
+                return self._net(inp_).float()
             finally:
                 if handle is not None:
                     handle.remove()

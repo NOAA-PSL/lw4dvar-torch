@@ -69,6 +69,8 @@ exp:
   # latent increment -- -2 = block 6, the last 240x480 latent (384x240x480);
   # -1 = block 7's full-resolution output (384x721x1440, 9x larger).
   # ps_operator: both 'logpinterp' (default, better O-B fit) and 'ps' work.
+  # checkpoint_stride must stay 1 for a 5-day window (2 and 4 run out of
+  # memory even in bf16: each unsaved 0.25 deg step holds ~18 GiB).
   #   path_model: './backends/sfno/ngc_cache/sfno_73ch_small/'
   #   ic_cache: '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-fcstnetv3/ic_cache/'
   path_model: './backends/fcn3/fourcastnet3/'
@@ -215,6 +217,19 @@ exp:
   # does not) -- default is off since the cost/benefit depends on epoch
   # count, not something safe to assume for every run.
   #compile_wrapper: True
+  # autocast_dtype: mixed precision for the model rollout, one key for every
+  # backend that supports it ('bfloat16'/'bf16', 'float16'/'fp16',
+  # 'float32'/'fp32'); load_config raises for a backend that doesn't:
+  #   aifs:   bfloat16 | float16      (default bfloat16; the checkpoint's own
+  #           fp16 overflowed in backward for aifs-single-1.1)
+  #   aurora: bfloat16 | float16      (default bfloat16; fp16 diverged)
+  #   sfno:   bfloat16 | float32      (default float32; bfloat16 autocasts only
+  #           the 8 SFNO blocks -- encoder/decoder stay fp32 so bf16 rounding
+  #           never lands on surface pressure: -14% time / -21% memory for a
+  #           20-step window, gradient cos 0.9997 vs fp32)
+  #   ace2, fcn3: not supported (fp32).
+  # 'aifs_autocast_dtype' is a deprecated alias for this key.
+  #autocast_dtype: 'bfloat16'
 
   # grid_interp: FCN3 and Aurora only (default 'bilinear', meaningless for
   # AIFS -- AIFS's irregular N320 octahedral grid always uses the k-d-tree
