@@ -330,6 +330,19 @@ def load_config(config_path='config.yml'):
         )
     if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
+    # More than one DA cycle requires cycle: True. With cycle: False the driver
+    # never advances the previous analysis (valid at window_start + dt_verif)
+    # to the next cycle time -- it falls through to the next-window-in-the-
+    # same-cycle branch and reuses it as is. That is only accidentally right
+    # when dt_init == dt_verif; for dt_init = 12 every cycle fell a further 6 h
+    # behind its label (found 2026-10-01: a 240-cycle SFNO run verified Jan 25
+    # cycles against a Jan 13 state). Fail loudly instead.
+    if int(exp.get('n_init', 1)) > 1 and not exp.get('cycle', False):
+        raise ValueError(
+            f"n_init={exp.get('n_init')} needs cycle: True -- with cycle: False the previous "
+            "analysis is not advanced to the next cycle time (only correct by accident when "
+            "dt_init == dt_verif). Set cycle: True for cycling DA, or n_init: 1."
+        )
     # autocast_dtype: one key for every backend that supports mixed precision.
     # aifs_autocast_dtype is a deprecated alias (existing aifs1 configs use it).
     if 'aifs_autocast_dtype' in exp:

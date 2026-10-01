@@ -1469,6 +1469,31 @@ encoder/decoder, stochastic, 166M-element latent).
   float32); load_config raises for ace2/fcn3.
 - **Not yet done**: cycled experiments (the actual architecture test).
 
+## `cycle: False` with `n_init > 1` silently mis-cycled (found 2026-10-01)
+
+With `cycle: False`, cycles after the first (k > 0) fell through to the
+driver's next-window-in-the-same-cycle branch, which reuses `analysis_state`
+(valid at window_start + dt_verif) as the next background WITHOUT advancing it
+to the next cycle time. Correct only by accident when `dt_init == dt_verif`
+(6 h). For `dt_init: 12`, every cycle fell a further 6 h behind its label: in
+a 240-cycle SFNO run the "2015-01-25T00" cycle verified a Jan 13 state (z500
+85-124 m), and in a 2-cycle test the second cycle's `bg(t0)` was 26.97 m
+(a 06Z state scored against 12Z ERA5) instead of ~12.7.
+
+- **Fix (option 2, user's choice)**: `load_config` now raises for `n_init > 1`
+  with `cycle: False` -- set `cycle: True` for cycling DA (the template's
+  `cycle` line says so).
+- **Affected saved runs** (n_init > 1, cycle False, dt_init 12 != dt_verif 6
+  -- multi-cycle results after cycle 1 are mis-dated / not cycled as
+  labelled): `output/test_aurora_5d_50it`, `output/test_fcn3_5d_6h_50it`,
+  `output/test_sfno_6h_5d_50it_lr3e-3_jc32`, `output/test_sfno_6h_5d_50it_test`,
+  `output/test_sfno_6h_5d_50it_test12`. Runs with dt_init 6 (incl. all ACE2
+  6h-cycling experiments) or `cycle: True` were unaffected.
+- The earlier "Aurora `compile_wrapper` crash on cycle 2" (Known gaps) came
+  from `test_aurora_5d_50it`, i.e. a run with this mis-cycling -- the crash
+  itself is unrelated to dates, but that run's cycle-2 setup was not what
+  it was thought to be.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle

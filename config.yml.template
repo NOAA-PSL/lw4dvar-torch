@@ -30,7 +30,10 @@ exp:
 # save initial and final trajectory output on these isobaric levels (set to "all" for all levels)
   #save_levs = 'all'
   save_levs: [1000, 850, 500, 250, 50]
-  cycle: True # cycling data assimilation
+  cycle: True # cycling data assimilation -- REQUIRED (True) when n_init > 1;
+  # load_config raises for n_init > 1 with cycle: False (it used to silently
+  # skip advancing the analysis to the next cycle time, see
+  # integrate_multiple_backends.md "cycle: False with n_init > 1")
   exp_name: 'test_v1' # data is saved in this subdirectory
 
   # --- path_model / model_backend-specific checkpoint keys ---
