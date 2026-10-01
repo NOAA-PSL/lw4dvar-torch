@@ -1,7 +1,7 @@
 # lw4dvar-torch
 
 Prototype long-window 4dvar solver (no background or model error terms in loss).
-A surface-pressure increment tendency penalty is available (jc_ps_weight config parameter).
+A surface-pressure increment tendency penalty is available (`jc_ps_weight` yaml config parameter).
 
 Compute optimal initial conditions for torch-based AI forecast models. 
 Options include AIFS-single-1.1, AIFS-single-2.0, ACE2-ERA5, SFNO (FourCastNet2), FourCastNet3 and Aurora.
