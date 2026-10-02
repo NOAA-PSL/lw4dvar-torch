@@ -57,7 +57,10 @@ def _backend_module(backend, name):
     return __import__(name)
 
 
-DEFAULT_CACHE_DIR = {'aifs': './ic_cache/', 'ace2': './ic_cache_ace2/'}
+_FCN3_ERA5_CACHE = '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-fcstnetv3/ic_cache/'
+DEFAULT_CACHE_DIR = {'aifs': './ic_cache/', 'ace2': './ic_cache_ace2/',
+                     'fcn3': _FCN3_ERA5_CACHE, 'sfno': _FCN3_ERA5_CACHE}
+BACKEND_NAMES = {'aifs': 'AIFS', 'ace2': 'ACE2-ERA5 (own h500)', 'fcn3': 'FCN3', 'sfno': 'SFNO-73ch'}
 
 GRAV = 9.80665
 _DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2})_control_forecast_(.+)\.nc$')
@@ -71,7 +74,9 @@ def add_hours(date_str, nhours):
 def _parse_nc_date(value):
     """`trajectory_start_date` attr ('2015-01-01 00:00:00', from
     str(datetime...) in save_xr_trajectory) -> '%Y-%m-%dT%H' string."""
-    return datetime.strptime(value, '%Y-%m-%d %H:%M:%S').strftime('%Y-%m-%dT%H')
+    # fromisoformat also accepts the tz-aware '... 00:00:00+00:00' that the
+    # makani backends (FCN3, SFNO) write
+    return datetime.fromisoformat(value).strftime('%Y-%m-%dT%H')
 
 
 def getrms(diff, weights):
@@ -120,11 +125,23 @@ def get_z500_truth(date_str, cache_dir, backend='aifs'):
             if backend == 'ace2':
                 truth = _backend_module('ace2', 'ace2_ic').load_verif(date_dt, cache_dir)
                 _verif_cache[key] = GRAV * np.asarray(truth['h500'], dtype=np.float64).reshape(-1)
+            elif backend in ('fcn3', 'sfno'):
+                # FCN3/SFNO share the 0.25 deg 721x1440 ERA5 cache (pressure-
+                # level file holds z500, already on the model grid, same
+                # north-to-south row-major order as the saved 'values')
+                fcn3_ic = _backend_module('fcn3', 'fcn3_ic')
+                pl_path, _ = fcn3_ic._cache_paths(cache_dir, date_dt)
+                if not os.path.exists(pl_path):
+                    raise FileNotFoundError(pl_path)  # don't let fcn3_ic fetch over the network
+                with xr.open_dataset(pl_path) as ds_pl:
+                    _verif_cache[key] = np.asarray(ds_pl['z'].isel(valid_time=0).sel(pressure_level=500).values,
+                                                   dtype=np.float64).reshape(-1)
             else:
                 fields = _backend_module('aifs', 'aifs_ic').read_single_date_fields(None, date_dt, cache_dir)
                 _verif_cache[key] = fields['z_500']
         except Exception as e:
-            hint = ('backends/ace2/ace2_ic.py --verif' if backend == 'ace2' else 'aifs_prefetch_ic.py')
+            hint = {'ace2': 'backends/ace2/ace2_ic.py --verif', 'fcn3': 'backends/fcn3/fcn3_prefetch_ic.py',
+                    'sfno': 'backends/sfno/sfno_ic.py CACHE_DIR DATE'}.get(backend, 'aifs_prefetch_ic.py')
             raise RuntimeError(
                 f"no cached ERA5 z500 for {date_str} in {cache_dir} ({e}) -- "
                 f"prefetch it from a login node first ({hint}), "
@@ -134,9 +151,19 @@ def get_z500_truth(date_str, cache_dir, backend='aifs'):
 
 
 def detect_backend(nc_path):
-    """'ace2' if the saved forecast carries ACE2's own h500 output, else 'aifs'."""
+    """Backend that wrote a saved forecast, from its contents: ACE2 carries its
+    own h500 output; the 721x1440 makani grid (1038240 points) is FCN3, or SFNO
+    if it also has native 'sp'; AIFS's N320 grid has 542080 points. Aurora
+    (720x1440) is not supported here yet."""
     with xr.open_dataset(nc_path) as ds:
-        return 'ace2' if 'h500' in ds.data_vars else 'aifs'
+        n = ds.sizes.get('values')
+        if 'h500' in ds.data_vars:
+            return 'ace2'
+        if n == 721 * 1440:
+            return 'sfno' if 'sp' in ds.data_vars else 'fcn3'
+        if n == 720 * 1440:
+            raise NotImplementedError(f"{nc_path}: Aurora output is not supported by this script yet")
+        return 'aifs'
 
 
 def _model_z500(ds, backend):
@@ -322,9 +349,8 @@ if __name__ == '__main__':
         ax.legend(fontsize=7, loc='upper left')
         ax.grid(alpha=0.3)
     axes[-1].set_xlabel('lead time within window (h)')
-    names = {'aifs': 'AIFS', 'ace2': 'ACE2-ERA5 (own h500)'}
     fig.suptitle('Z500 error growth within window, averaged across DA cycles ('
-                 + ', '.join(names[b] for b in sorted(backends_seen) or ['aifs']) + ')')
+                 + ', '.join(BACKEND_NAMES[b] for b in sorted(backends_seen) or ['aifs']) + ')')
     fig.tight_layout()
     fig.savefig('z500err_window.png')
     print('wrote z500err_window.png' if any_data else 'wrote z500err_window.png (empty -- no complete cycles yet)')
