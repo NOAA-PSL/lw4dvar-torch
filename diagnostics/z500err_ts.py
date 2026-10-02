@@ -168,7 +168,7 @@ if __name__ == '__main__':
         ax.legend(fontsize=7, loc='upper left')
         ax.grid(alpha=0.3)
     axes[-1].set_xlabel('cycle date (window start)')
-    names = {'aifs': 'AIFS', 'ace2': 'ACE2-ERA5 (own h500)'}
+    names = zw.BACKEND_NAMES
     fig.suptitle(f'Z500 error time series at lead={lead_hours}h (long-window 4D-Var, '
                  + ', '.join(names[b] for b in sorted(backends_seen) or ['aifs']) + ')')
     fig.autofmt_xdate()
