@@ -1467,7 +1467,40 @@ encoder/decoder, stochastic, 166M-element latent).
   aifs1 configs): aifs bfloat16|float16 (default bfloat16), aurora
   bfloat16|float16 (default bfloat16), sfno bfloat16|float32 (default
   float32); load_config raises for ace2/fcn3.
-- **Not yet done**: cycled experiments (the actual architecture test).
+- **First cycled result (2026-10-02/03)**: `output/test_sfno_6h_5d_50it_test`
+  (6h cycling, cycle: True, 5-day window, 50 epochs, lr 2e-3, `jc_ps_weight:
+  32`, from 2014-12-30T00 48h back-forecast), through Feb 19. Global z500 at
+  window start settles at ~15 m after day 1 and stays flat; NH and SH stable;
+  pooled O-B 0.83 hPa (0h) -> 1.39 (120h), O-A ~10% lower, bias ~0
+  (`diagnostics/analyze_obstats.py`). **But the TROPICS drift**: analysis at +6h
+  vs ERA5, |lat| <= 20, one cycle/day:
+
+  | | SFNO (jc32, lr 2e-3) | ACE2 (jc32, lr 1e-3, `test_ace2_6h_50it_5day_lr1e-3_jc32`) |
+  |---|---|---|
+  | z500 bias Jan 1 -> Feb 19 | +3.1 -> -13.3 m (-4.4 m / 10 d) | +0.0 -> -1.6 m (-0.3 m / 10 d) |
+  | z500 std | 5.0 -> 9.9 m (+0.7 / 10 d) | 4.1 -> 7.2 m (+0.4 / 10 d) |
+  | t850 bias | +0.28 -> -0.40 K (-0.21 / 10 d) | within +-0.16 K (-0.01 / 10 d) |
+  | t500 bias | 0.0 -> -1.15 K (-0.20 / 10 d) | (no ACE2 t500 truth) |
+
+  The tropical error growth is mostly a systematic cooling of the tropical
+  troposphere (largest aloft), not loss of skill; ACE2, with the same SFNO
+  body and the same (sparse) tropical ps obs, keeps its tropical mean state
+  near ERA5. So architecture alone does not explain ACE2's tropical
+  stability. SFNO's tropical-ocean t2m (its only SST proxy) did NOT lead the
+  drift: ocean t2m rms stays ~0.8-0.9 K, its bias drifts -0.17 K / 10 d (land
+  -0.24) -- slower than t500 -- so a visibly wandering sea surface is not the
+  mechanism, though missing SST could still act via the column's heat
+  supply. **Candidate explanations** (ACE2 has all three, SFNO none): (1)
+  prescribed SST/sea ice every step, (2) the dry-air-mass/moisture
+  conservation corrector, (3) training for long stable climate rollouts (its
+  free climate may sit closer to ERA5). **Discriminating test, not yet run**:
+  a ~50-day free SFNO forecast from 2015-01-01 (no DA, ~200 no-grad steps, ~15
+  min on one H100) -- if it cools the tropics similarly, the drift is SFNO's
+  own climate that ps obs can't correct; if it stays near ERA5, the cycling
+  causes it. Caveat: the learning rates differ (2e-3 vs 1e-3), unlikely to
+  produce a steady one-sided trend.
+- **Not yet done**: the free-forecast test above; cycled runs at other
+  `jc_ps_weight` values for SFNO.
 
 ## `cycle: False` with `n_init > 1` silently mis-cycled (found 2026-10-01)
 
