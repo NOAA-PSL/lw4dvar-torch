@@ -150,7 +150,9 @@ for k in range(exp_config['n_init']):
                 # next cycle's date, not the full dt_init, or the latent shift
                 # is double-counted -- the same correction the k != 0 cycling
                 # branch below applies.
-                shift_hours = (input_encoded.date - datetime.strptime(date, '%Y-%m-%dT%H')).total_seconds() / 3600.0
+                # same tz convention as the model's own state dates (tz-aware
+                # UTC for the makani backends FCN3/SFNO, naive otherwise)
+                shift_hours = (input_encoded.date - utils._to_utc_datetime(date, exp_config['model_backend'])).total_seconds() / 3600.0
                 remaining_hours = exp_config['dt_init'] - shift_hours
                 if remaining_hours < -1e-6:
                     raise ValueError(

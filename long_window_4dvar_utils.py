@@ -180,6 +180,22 @@ _DECODE_ALIASES = {
 # 'ps_native' (ACE2 only) reads the lowest NATIVE model level's t/q/pressure
 # ('t_lowest'/'q_lowest'/'p_lowest', which only ACE2Model.decode_state
 # supplies) instead of t/q on the 700 hPa pressure level.
+# autocast_dtype config values (canonical names) and which each backend
+# accepts; backends not listed run in fp32 only.
+_AUTOCAST_NAMES = {'bfloat16': 'bfloat16', 'bf16': 'bfloat16', 'float16': 'float16', 'fp16': 'float16',
+                   'float32': 'float32', 'fp32': 'float32'}
+_AUTOCAST_ALLOWED = {'aifs': {'bfloat16', 'float16'}, 'aurora': {'bfloat16', 'float16'},
+                     'sfno': {'bfloat16', 'float32'}}
+_AUTOCAST_DEFAULT = {'aifs': 'bfloat16', 'aurora': 'bfloat16', 'sfno': 'float32'}
+
+
+def _autocast_torch_dtype(exp, backend):
+    """The configured (or backend-default) autocast dtype as a torch.dtype;
+    None means no autocast (fp32)."""
+    name = exp.get('autocast_dtype') or _AUTOCAST_DEFAULT[backend]
+    return None if name == 'float32' else getattr(torch, name)
+
+
 _PS_OPERATOR_REQUIRES = {
     "logpinterp": {"z"},
     "ps": {"t", "q", "sp"},
@@ -234,7 +250,7 @@ def _to_utc_datetime(date_str, backend, date_format='%Y-%m-%dT%H'):
     backend-conditional: naive for 'aifs' (matches its own, validated,
     original behavior exactly), tz-aware UTC for 'fcn3' (required)."""
     dt = datetime.strptime(date_str, date_format)
-    if backend == 'fcn3':
+    if backend in ('fcn3', 'sfno'):  # makani's zenith-angle input needs tz-aware UTC
         dt = dt.replace(tzinfo=timezone.utc)
     return dt
 
@@ -256,9 +272,9 @@ def load_config(config_path='config.yml'):
     exp['path_output'] = exp['path_output'] + exp['exp_name'] + '/'
 
     backend = exp.get('model_backend')
-    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2'):
+    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno'):
         raise ValueError(
-            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', or 'ace2', got {backend!r} -- "
+            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno', got {backend!r} -- "
             "this key is required (see config.yml.template)"
         )
     # reset_skt_ocean: AIFS and Aurora both have 'skt'/'lsm' packed-state
@@ -266,7 +282,7 @@ def load_config(config_path='config.yml'):
     # aurora_model.py), so reset_skt_over_ocean works unmodified for either.
     # FCN3 has no equivalent at all -- fail loudly here rather than
     # silently ignore a config key that looks like it should do something.
-    if backend == 'fcn3' and exp.get('reset_skt_ocean', False):
+    if backend in ('fcn3', 'sfno') and exp.get('reset_skt_ocean', False):
         raise ValueError(
             "reset_skt_ocean is not supported for the FCN3 backend -- FCN3 has no "
             "'skt'/'lsm' decode_state field to reset (see integrate_multiple_backends.md)."
@@ -314,6 +330,35 @@ def load_config(config_path='config.yml'):
         )
     if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
+    # More than one DA cycle requires cycle: True. With cycle: False the driver
+    # never advances the previous analysis (valid at window_start + dt_verif)
+    # to the next cycle time -- it falls through to the next-window-in-the-
+    # same-cycle branch and reuses it as is. That is only accidentally right
+    # when dt_init == dt_verif; for dt_init = 12 every cycle fell a further 6 h
+    # behind its label (found 2026-10-01: a 240-cycle SFNO run verified Jan 25
+    # cycles against a Jan 13 state). Fail loudly instead.
+    if int(exp.get('n_init', 1)) > 1 and not exp.get('cycle', False):
+        raise ValueError(
+            f"n_init={exp.get('n_init')} needs cycle: True -- with cycle: False the previous "
+            "analysis is not advanced to the next cycle time (only correct by accident when "
+            "dt_init == dt_verif). Set cycle: True for cycling DA, or n_init: 1."
+        )
+    # autocast_dtype: one key for every backend that supports mixed precision.
+    # aifs_autocast_dtype is a deprecated alias (existing aifs1 configs use it).
+    if 'aifs_autocast_dtype' in exp:
+        old = exp.pop('aifs_autocast_dtype')
+        if exp.get('autocast_dtype', old) != old:
+            raise ValueError(f"aifs_autocast_dtype={old!r} conflicts with autocast_dtype={exp['autocast_dtype']!r}")
+        exp['autocast_dtype'] = old
+        print("NOTE: 'aifs_autocast_dtype' is deprecated -- use 'autocast_dtype' (same values)")
+    if exp.get('autocast_dtype') is not None:
+        name = _AUTOCAST_NAMES.get(str(exp['autocast_dtype']).lower())
+        allowed = _AUTOCAST_ALLOWED.get(backend)
+        if allowed is None:
+            raise ValueError(f"autocast_dtype is not implemented for model_backend {backend!r} (it runs in fp32)")
+        if name not in allowed:
+            raise ValueError(f"autocast_dtype for {backend!r} must be one of {sorted(allowed)}, got {exp['autocast_dtype']!r}")
+        exp['autocast_dtype'] = name
     # ps_native needs decode_state's lowest-native-level keys
     # (t_lowest/q_lowest/p_lowest), which only the ACE2 backend provides.
     if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend != 'ace2':
@@ -399,7 +444,7 @@ def get_model(exp):
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
-            autocast_dtype=exp.get('aifs_autocast_dtype', 'bfloat16'),
+            autocast_dtype=_autocast_torch_dtype(exp, 'aifs'),
             compile_wrapper=exp.get('compile_wrapper', False),
         )
     elif backend == 'fcn3':
@@ -410,12 +455,25 @@ def get_model(exp):
             device=exp.get('device', 'cuda'),
             atmo_chunk_size=exp.get('atmo_chunk_size', 2),
         )
+    elif backend == 'sfno':
+        # NVIDIA SFNO-73ch-small (NGC), run with makani in the fcstnet3 env;
+        # path_model = the converted package dir (backends/sfno/ngc_cache/
+        # sfno_73ch_small by default, see sfno_prefetch_checkpoint.py).
+        _ensure_backend_on_path('sfno')
+        import sfno_model
+        return sfno_model.SFNOModel(
+            package_root=exp.get('path_model', sfno_model.DEFAULT_PACKAGE),
+            device=exp.get('device', 'cuda'),
+            latent_block=exp.get('sfno_latent_block', -2),
+            autocast_dtype=_autocast_torch_dtype(exp, 'sfno'),
+        )
     elif backend == 'aurora':
         _ensure_backend_on_path('aurora')
         import aurora_model
         return aurora_model.AuroraModel(
             package_root=exp['path_model'],
             device=exp.get('device', 'cuda'),
+            autocast_dtype=_autocast_torch_dtype(exp, 'aurora'),
             compile_wrapper=exp.get('compile_wrapper', False),
         )
     elif backend == 'ace2':
@@ -426,7 +484,7 @@ def get_model(exp):
             forcing_dir=exp.get('forcing_dir', exp['path_model'] + 'forcing_data/'),
             device=exp.get('device', 'cuda'),
         )
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
 
 
 def get_grid_interpolator(model, exp):
@@ -444,7 +502,7 @@ def get_grid_interpolator(model, exp):
         _ensure_backend_on_path('aifs')
         import aifs_grid
         return aifs_grid.GridInterpolator(model.lons, model.lats)
-    elif backend in ('fcn3', 'aurora'):
+    elif backend in ('fcn3', 'aurora', 'sfno'):
         # Aurora shares FCN3's regular-grid machinery directly (same 0.25deg
         # ERA5 grid, just 720 rather than 721 rows -- fcn3_grid.py's classes
         # derive nlat/nlon from the data itself). Deliberately imports from
@@ -476,7 +534,7 @@ def get_grid_interpolator(model, exp):
             import fcn3_grid
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +576,11 @@ def get_input(exp, model, logger):
             _ensure_backend_on_path('fcn3')
             import fcn3_ic
             input_state = fcn3_ic.build_input_state(back_dt, cache_dir)
+        elif backend == 'sfno':
+            # FCN3's cached ERA5 fields + a small per-date 'sp' file (sfno_ic.py)
+            _ensure_backend_on_path('sfno')
+            import sfno_ic
+            input_state = sfno_ic.build_input_state(back_dt, cache_dir)
         elif backend == 'aurora':
             _ensure_backend_on_path('aurora')
             import aurora_ic
@@ -530,7 +593,7 @@ def get_input(exp, model, logger):
             import ace2_ic
             input_state = ace2_ic.build_input_state(back_dt, cache_dir)
         else:
-            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
+            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
         input_encoded = model.prepare_initial_state(input_state, back_dt)
         dt_hours = exp['nhrs_back']
         logger.info('generating input state from a forecast...')
@@ -589,10 +652,15 @@ def get_verif(exp, model, logger, date_override=None):
             src = "z" if name == "geopotential_at_surface" else name
             if src in raw:
                 verif_ic[name] = raw[src]
-    elif backend == 'fcn3':
-        _ensure_backend_on_path('fcn3')
-        import fcn3_ic
-        raw_fields = fcn3_ic.read_single_date_fields(date_dt, cache_dir)
+    elif backend in ('fcn3', 'sfno'):
+        # same 721x1440 grid and channel naming; SFNO's reader adds native 'sp'
+        if backend == 'sfno':
+            _ensure_backend_on_path('sfno')
+            import sfno_ic as ic_module
+        else:
+            _ensure_backend_on_path('fcn3')
+            import fcn3_ic as ic_module
+        raw_fields = ic_module.read_single_date_fields(date_dt, cache_dir)
         # decode_state's flat n_points convention (see FCN3Model.decode_state)
         # is a row-major flatten of the native (721, 1440) grid -- flatten
         # here too so verif_ic's tensors line up with decoded model fields.
@@ -651,7 +719,7 @@ def get_verif(exp, model, logger, date_override=None):
         verif_ic['z500'] = GRAV * torch.as_tensor(truth['h500'], dtype=torch.float32, device=model.device).reshape(-1)
         verif_ic['TMP850'] = torch.as_tensor(truth['TMP850'], dtype=torch.float32, device=model.device).reshape(-1)
     else:
-        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', or 'ace2')")
+        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
 
     if "z" in verif_ic:
         verif_ic["geopotential"] = verif_ic["z"]
