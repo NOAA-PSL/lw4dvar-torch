@@ -1,8 +1,8 @@
 exp:
   model_backend: aifs
   nhrs_back: 48
-  restart: False
-  rpath: './output/smoke_test_aifs2-1.0deg-v1.0-pretraining/'
+  restart: True
+  rpath: './output/<previous_exp_name>/'
   obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
   nobs_max: 15000
   ic_suffix: '120h_100it'
@@ -11,19 +11,15 @@ exp:
   dt_init: 12
   save_levs: [1000,850,500,250,50]
   cycle: True
-  exp_name: 'smoke_test_aifs2-1.0deg-v1.0-pretraining'
+  exp_name: 'test_aifs2-1.0deg-v1.0-5d_12h_100it'
 
-  model_name: 'aifs-single-mse-2.0-1.0deg-v1.0-pretraining.ckpt'
+  model_name: 'aifs-single-mse-2.0-1.0deg-v1.0.ckpt'
   path_model: './backends/aifs/aifs2-1.0deg-v1.0/'
   aifs_config: 'backends/aifs/aifs_inference_aifs2-1.0deg-v1.0.yaml'
   device: 'cuda'
   path_output: './output/'
-  # separate from ic_cache/ic_cache_aifs1/ -- this checkpoint's native grid
-  # (O96, 40320 points) and variable set (89 vars, no wave/snow) differ from
-  # both the official 0.25deg AIFS-single-2.0 and AIFS-single-1.1 checkpoints;
-  # the ERA5 GRIB cache is keyed only by date, not by checkpoint (see
-  # integrate_multiple_backends.md's aifs1 "stale-cache gotcha"), so reusing
-  # either existing cache would silently serve the wrong grid/variables.
+  # reuse the original aifsv2-1.0deg-v1.0 repo's already-warmed ERA5 cache -- avoids
+  # needing internet from this (offline) H100 compute node for a smoke test
   ic_cache: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/ic_cache/ic_cache_aifs2-1.0deg-v1.0/'
   print_every: 10
   oberrstart: -1

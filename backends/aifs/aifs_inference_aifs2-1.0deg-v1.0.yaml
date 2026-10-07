@@ -36,8 +36,7 @@ description: |
   run_aifs2-1.0deg-v1.0.sh (activates `lwaifs2`, not the shared `aifs2` env)
   and aifs2-1.0deg-v1.0-requirements.txt/aifs2-1.0deg-v1.0-spec.txt.
 
-#checkpoint: backends/aifs/aifs2-1.0deg-v1.0/aifs-single-mse-2.0-1.0deg-v1.0.ckpt
-checkpoint: backends/aifs/aifs2-1.0deg-v1.0/aifs-single-mse-2.0-1.0deg-v1.0-pretraining.ckpt
+checkpoint: backends/aifs/aifs2-1.0deg-v1.0/aifs-single-mse-2.0-1.0deg-v1.0.ckpt
 
 date: 2015-01-01T00
 lead_time: 6

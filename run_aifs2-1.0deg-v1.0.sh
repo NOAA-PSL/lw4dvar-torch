@@ -3,7 +3,7 @@
 #SBATCH -o lw4dvar_aifs2_1p0deg_v1p0_%j.out
 #SBATCH -e lw4dvar_aifs2_1p0deg_v1p0_%j.err
 #SBATCH --account=gpu-ai4wp
-#SBATCH -t 5:00:00
+#SBATCH -t 12:00:00
 #SBATCH --partition=u1-h100
 #SBATCH --gres=gpu:h100:1
 #SBATCH --mem=96g
