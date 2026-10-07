@@ -43,7 +43,7 @@ cd ${tmpdir}
 # aifs_prefetch_ic.py reads config.yml (a fixed filename, see
 # long_window_4dvar_utils.load_config()'s default) -- point it at this
 # checkpoint's real config, matching every other run_*.sh's convention.
-cp -r  ${projdir}/config_test_aifs2-1.0deg-v1.0_ic.yml config.yml
+cp -r  ${projdir}/test_scripts/config_test_aifs2-1.0deg-v1.0_ic.yml config.yml
 
 python -u ${projdir}/backends/aifs/aifs_prefetch_ic.py
 status=$?
