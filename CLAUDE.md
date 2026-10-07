@@ -11,7 +11,7 @@ relevant one before working on that area.
 pressure observations, with a latent-space control variable, running on
 interchangeable ML forecast-model backends selected by `exp.model_backend`
 in the config: `aifs` (AIFS-single 2.0 / 1.1), `fcn3` (FourCastNet3),
-`aurora` (Aurora v1.5), `ace2` (ACE2-ERA5). Shared driver/solver:
+`aurora` (Aurora v1.5), `ace2` (ACE2-ERA5), `sfno` (SFNO-73ch-small). Shared driver/solver:
 `long_window_4dvar.py`, `long_window_4dvar_utils.py`; backend interface:
 `forecast_model.py`; backends: `backends/<name>/`; all config keys are
 documented in `config.yml.template`.
@@ -20,7 +20,8 @@ documented in `config.yml.template`.
 
 - **One conda env per backend, never merged** -- run each backend in its
   own env with its own launcher: `aifs2`/`aifs1` (`run_aifs.sh`), `fcstnet3`
-  (`run_fcn3.sh`), `aurora` (`run_aurora.sh`), `ace2` (`run_ace2.sh`), all
+  (`run_fcn3.sh`; also runs `sfno` via `run_sfno.sh`), `aurora` (`run_aurora.sh`),
+  `ace2` (`run_ace2.sh`), all
   under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2ic` is a
   login-node-only env for ACE2 IC/verification fetching. Backend modules are
   imported lazily so a process never needs another backend's dependencies.

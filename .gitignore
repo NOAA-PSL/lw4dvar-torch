@@ -202,6 +202,9 @@ cython_debug/
 # checkpoint+static-pickle are fetched selectively via huggingface_hub
 # (see aurora_prefetch_checkpoint.py) into this local, gitignored cache.
 backends/aurora/hf_cache/
+# SFNO-73ch (NVIDIA NGC model package, not a git repo) -- fetched by
+# backends/sfno/sfno_prefetch_checkpoint.py into this local cache.
+backends/sfno/ngc_cache/
 
 # per-experiment config symlink + run artifacts (SLURM logs, cached ICs,
 # per-run output dirs) -- config.yml.template is the tracked, real config

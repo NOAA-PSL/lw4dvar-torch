@@ -1448,6 +1448,155 @@ summary here since it's a CLAUDE.md-indexed backend-specific change:
   it (background and analysis z500 error track each other almost exactly
   throughout the cycled run). Not yet root-caused.
 
+## Fifth backend: NVIDIA SFNO-73ch-small (`model_backend: sfno`, 2026-09-29/30)
+
+Branch `sfno`. Purpose: ACE2 is the only backend so far that cycles stably
+with ps obs only; SFNO shares ACE2's network body, so a stable SFNO would
+point at the architecture. **Confounders to record with any result**: SFNO
+is 0.25 deg (721x1440) on 13 pressure levels vs ACE2's 1 deg / 8 hybrid
+layers; it has NO conservation corrector (ACE2 conserves global dry-air mass
+every step -- directly constraining ps); NO SST/skin temperature and no
+forcing, so the ocean lower boundary is free-running (ACE2 prescribes SST and
+sea ice every step), which alone could cause drift under cycling; trained
+for medium-range weather (ACE2 for long climate rollouts). FCN3 (also a
+spherical neural operator) did not cycle stably, but differs again (DISCO
+encoder/decoder, stochastic, 166M-element latent).
+
+- **Package**: NGC `nvidia/modulus/sfno_73ch_small` v0.1.0 (April 2024,
+  makani v0.1.x), a makani model package (same layout as FCN3's). Not a git
+  repo -> `backends/sfno/sfno_prefetch_checkpoint.py` downloads to the
+  gitignored `backends/sfno/ngc_cache/` and converts it for makani 0.2.0 (the
+  fcstnet3 env), each step checked against makani's source:
+  1. config `in_channels`/`out_channels` = range(73) -- global_means/stds.npy
+     have 75 entries whose FIRST 73 match the channel names (verified by
+     magnitude; the last 2 are unused);
+  2. `global_means_path`/`global_stds_path` placeholders (makani only
+     substitutes the package's stats files when the keys exist);
+  3. `dhours: 1` (timestep = dt*dhours; hourly training data, dt = 6);
+  4. weights-only checkpoint: the pickle references ruamel.yaml objects the
+     weights_only unpickler can't rebuild, so it is loaded ONCE with
+     weights_only=False after a static pickletools check (no execution) that
+     it only references torch storage/rebuild, OrderedDict, makani YParams
+     and ruamel.yaml containers; keep `model_state` only (6.9 -> 2.1 GB),
+     drop the DDP `module.` prefix, and add a leading group axis to the 8
+     dhconv filter weights (v0.1 "bixy,iox->boxy" [in,out,l] vs v0.2
+     "bgixy,giox->bgoxy" [g,in,out,l] -- identical for 1 group). Loads
+     strictly via makani's safe loader; re-running the conversion reproduces
+     the weights byte-for-byte.
+  **Correctness check** (CPU, ERA5 2015-01-01T00 -> 06Z): 6h forecast RMS
+  z500 2.31 m (persistence 24.3), t850 0.43 K (1.62), sp 0.35 hPa (2.62), msl
+  0.31 (2.77), u250 1.69 m/s (5.12) -- the converted weights compute
+  correctly.
+- **Architecture** (makani SphericalFourierNeuralOperatorNet): embed 384, 8
+  blocks, instance norm, dhconv -- ACE2's body -- but scale_factor 3: block 0
+  721x1440 -> 240x480, blocks 1-6 at 240x480, block 7 back to 721x1440; big
+  skip. Inputs 73 channels + zenith, orography, land/sea masks (77); 6h step;
+  self-starting; deterministic; trained bf16 AMP (run here in fp32).
+- **Latent (option B, user's choice)**: output of block 6 (`sfno_latent_block:
+  -2`), (384, 240, 480) ~ 44M -- comparable to ACE2's 25M; forward hook
+  registered inside the checkpointed function. Option A (block 7 output,
+  384x721x1440 ~ 400M, same position as ACE2's but 0.25 deg) is available as
+  `sfno_latent_block: -1`.
+- **`SFNOModel`** (`backends/sfno/sfno_model.py`) subclasses FCN3Model (same
+  channels/names/grid/packed layout (1,73,721,1440)); overrides loading, the
+  (absent) noise, the single step; adds the `surface_pressure` alias. ERA5 ICs
+  and verification: `sfno_ic.py` reuses FCN3's cached ERA5 files unchanged
+  and adds one ~1.4 MB `era5_sfno_<date>_sp.nc` per date (CDS, ~30 s).
+  Grid: fcn3_grid.BilinearGridInterpolator. Dates tz-aware UTC (makani zenith).
+- **Smoke test** (H100): decode round-trip exact; repeat rollouts and zero
+  increment BITWISE identical (unlike ACE2); first checkpointed gradient after
+  a no-grad rollout identical to the plain one (cos 1.000000, rel 0 -- ACE2's
+  first-call bug does not occur; non-reentrant checkpointing kept); AdamW
+  0.176 -> 0.026 in 10 epochs. Checkpointed fwd+bwd: 1 step 0.28 s / 26.8 GiB,
+  2 steps 0.64 s / 44.7 GiB, 4 steps 1.36 s / 45.3, 8 steps 2.80 s / 46.5 GiB
+  -> 20 steps ~50 GiB, ~7 s/epoch (ACE2 2.6 s, AIFS 18 s, FCN3 94 s).
+- **End-to-end** (`config_test_sfno.yml` / `run_sfno.sh`, 12h window, 5
+  epochs, 48h back-forecast from 2014-12-30T00): completes; Jtot -26%. t+0h
+  O-B (used obs): logpinterp mean -0.27 / std 1.35 hPa (8816 used; >1000 m
+  stations +0.65/1.54); `ps` operator +0.23 / 1.86 (8743 used; >1000 m
+  +1.89/2.00 -- t700-based reduction biased over high terrain). **logpinterp
+  (the default) fits better for SFNO.** SFNO's O-B spread is well below
+  ACE2's (2.08, 8213 used) -- 0.25 vs 1 deg terrain smoothing. z500 bg(t0)
+  11.28 m global (area-weighted).
+- **`checkpoint_stride` must be 1** for a 20-step window: the user found
+  stride 2 OOMs in fp32, and it also OOMs in bf16 (stride 4 too) --
+  each non-checkpointed 0.25 deg step holds ~18 GiB of full-resolution
+  activations. fp32, stride 1: 20 steps 7.2 s / 51.8 GiB.
+- **`autocast_dtype: bfloat16` (opt-in; default fp32)**: the first version
+  autocast the whole network and was NOT usable for ps DA -- bf16 rounding on
+  the normalized inputs/outputs (~0.0078 relative x sp's 9584 Pa std ~ 0.75
+  hPa) moved sp by 0.43 hPa rms in 2 steps (zero-increment loss 0.176 ->
+  0.361) and turned the latent gradient 23 deg (cos 0.919, norm x1.21). Fixed
+  by autocasting ONLY the 8 SFNO blocks (encoder, decoder, big-skip residual
+  projection stay fp32; installed once at load so the checkpoint recompute
+  matches): 6h forecast z500 2.313 / sp 0.356 (fp32 2.305 / 0.354), loss
+  0.1766 (0.1764), gradient cos 0.9997 / norm x0.998; 20 steps 6.18 s / 41.0
+  GiB (-14% / -21% vs fp32). Probe: `backends/sfno/probe_sfno_bf16.py`.
+- **`autocast_dtype` is now one key for all backends** (was
+  `aifs_autocast_dtype`, kept as a deprecated alias for the user's existing
+  aifs1 configs): aifs bfloat16|float16 (default bfloat16), aurora
+  bfloat16|float16 (default bfloat16), sfno bfloat16|float32 (default
+  float32); load_config raises for ace2/fcn3.
+- **First cycled result (2026-10-02/03)**: `output/test_sfno_6h_5d_50it_test`
+  (6h cycling, cycle: True, 5-day window, 50 epochs, lr 2e-3, `jc_ps_weight:
+  32`, from 2014-12-30T00 48h back-forecast), through Feb 19. Global z500 at
+  window start settles at ~15 m after day 1 and stays flat; NH and SH stable;
+  pooled O-B 0.83 hPa (0h) -> 1.39 (120h), O-A ~10% lower, bias ~0
+  (`diagnostics/analyze_obstats.py`). **But the TROPICS drift**: analysis at +6h
+  vs ERA5, |lat| <= 20, one cycle/day:
+
+  | | SFNO (jc32, lr 2e-3) | ACE2 (jc32, lr 1e-3, `test_ace2_6h_50it_5day_lr1e-3_jc32`) |
+  |---|---|---|
+  | z500 bias Jan 1 -> Feb 19 | +3.1 -> -13.3 m (-4.4 m / 10 d) | +0.0 -> -1.6 m (-0.3 m / 10 d) |
+  | z500 std | 5.0 -> 9.9 m (+0.7 / 10 d) | 4.1 -> 7.2 m (+0.4 / 10 d) |
+  | t850 bias | +0.28 -> -0.40 K (-0.21 / 10 d) | within +-0.16 K (-0.01 / 10 d) |
+  | t500 bias | 0.0 -> -1.15 K (-0.20 / 10 d) | (no ACE2 t500 truth) |
+
+  The tropical error growth is mostly a systematic cooling of the tropical
+  troposphere (largest aloft), not loss of skill; ACE2, with the same SFNO
+  body and the same (sparse) tropical ps obs, keeps its tropical mean state
+  near ERA5. So architecture alone does not explain ACE2's tropical
+  stability. SFNO's tropical-ocean t2m (its only SST proxy) did NOT lead the
+  drift: ocean t2m rms stays ~0.8-0.9 K, its bias drifts -0.17 K / 10 d (land
+  -0.24) -- slower than t500 -- so a visibly wandering sea surface is not the
+  mechanism, though missing SST could still act via the column's heat
+  supply. **Candidate explanations** (ACE2 has all three, SFNO none): (1)
+  prescribed SST/sea ice every step, (2) the dry-air-mass/moisture
+  conservation corrector, (3) training for long stable climate rollouts (its
+  free climate may sit closer to ERA5). **Discriminating test, not yet run**:
+  a ~50-day free SFNO forecast from 2015-01-01 (no DA, ~200 no-grad steps, ~15
+  min on one H100) -- if it cools the tropics similarly, the drift is SFNO's
+  own climate that ps obs can't correct; if it stays near ERA5, the cycling
+  causes it. Caveat: the learning rates differ (2e-3 vs 1e-3), unlikely to
+  produce a steady one-sided trend.
+- **Not yet done**: the free-forecast test above; cycled runs at other
+  `jc_ps_weight` values for SFNO.
+
+## `cycle: False` with `n_init > 1` silently mis-cycled (found 2026-10-01)
+
+With `cycle: False`, cycles after the first (k > 0) fell through to the
+driver's next-window-in-the-same-cycle branch, which reuses `analysis_state`
+(valid at window_start + dt_verif) as the next background WITHOUT advancing it
+to the next cycle time. Correct only by accident when `dt_init == dt_verif`
+(6 h). For `dt_init: 12`, every cycle fell a further 6 h behind its label: in
+a 240-cycle SFNO run the "2015-01-25T00" cycle verified a Jan 13 state (z500
+85-124 m), and in a 2-cycle test the second cycle's `bg(t0)` was 26.97 m
+(a 06Z state scored against 12Z ERA5) instead of ~12.7.
+
+- **Fix (option 2, user's choice)**: `load_config` now raises for `n_init > 1`
+  with `cycle: False` -- set `cycle: True` for cycling DA (the template's
+  `cycle` line says so).
+- **Affected saved runs** (n_init > 1, cycle False, dt_init 12 != dt_verif 6
+  -- multi-cycle results after cycle 1 are mis-dated / not cycled as
+  labelled): `output/test_aurora_5d_50it`, `output/test_fcn3_5d_6h_50it`,
+  `output/test_sfno_6h_5d_50it_lr3e-3_jc32`, `output/test_sfno_6h_5d_50it_test`,
+  `output/test_sfno_6h_5d_50it_test12`. Runs with dt_init 6 (incl. all ACE2
+  6h-cycling experiments) or `cycle: True` were unaffected.
+- The earlier "Aurora `compile_wrapper` crash on cycle 2" (Known gaps) came
+  from `test_aurora_5d_50it`, i.e. a run with this mis-cycling -- the crash
+  itself is unrelated to dates, but that run's cycle-2 setup was not what
+  it was thought to be.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
