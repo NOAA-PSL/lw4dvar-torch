@@ -246,14 +246,22 @@ exp:
   # 'aifs_autocast_dtype' is a deprecated alias for this key.
   #autocast_dtype: 'bfloat16'
 
-  # grid_interp: FCN3 and Aurora only (default 'bilinear', meaningless for
-  # AIFS -- AIFS's irregular N320 octahedral grid always uses the k-d-tree
-  # approach, no config key needed). How ps-obs are interpolated to/from
-  # the model's regular 0.25deg grid. 'bilinear' (BilinearGridInterpolator,
+  # grid_interp: how ps-obs are interpolated from the model grid.
+  # AIFS (default 'bilinear' since 2026-10-08): 'bilinear' is closed-form
+  # bilinear on the N320 reduced Gaussian grid
+  # (aifs_grid.ReducedGaussianBilinearInterpolator: linear in longitude
+  # along the two bracketing latitude rows, then linear in latitude) --
+  # exact for linear fields, 5-100x smaller interpolation error than
+  # 'kdtree' on smooth test fields, same per-epoch cost, and slightly
+  # lower cycled z500 error (mainly SH). 'kdtree' is the k=4
+  # inverse-distance-weighted k-NN scheme (aifs_grid.GridInterpolator)
+  # that every earlier AIFS result used -- set it to reproduce those.
+  # FCN3/Aurora/SFNO/ACE2 (default 'bilinear'): how ps-obs are interpolated
+  # to/from the model's regular grid. 'bilinear' (BilinearGridInterpolator,
   # backends/fcn3/fcn3_grid.py -- Aurora reuses this directly, see
   # get_grid_interpolator) is exact and ~50x faster per obs slot than
   # 'kdtree' (GridInterpolator, the k=4 inverse-distance-weighted k-NN
-  # approach AIFS always uses) -- see the original repo's
+  # approach) -- see the original repo's
   # verify_bilinear_grid_interp.py. 'kdtree' is kept only as an A/B
   # fallback; there is no reason to set this for either backend's regular
   # grid.
