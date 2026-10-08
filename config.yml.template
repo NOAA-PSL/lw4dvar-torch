@@ -6,7 +6,11 @@ exp:
   # load_config() raises if this is missing or not one of these values.
   # This one key also picks which conda env the job must run under (aifs2 /
   # fcstnet3 / aurora / ace2 -- see run_aifs.sh / run_fcn3.sh /
-  # run_aurora.sh / run_ace2.sh); the envs are NOT
+  # run_aurora.sh / run_ace2.sh). Exception: AIFS checkpoints trained with
+  # the multi-dataset anemoi API (anemoi-models >= 0.19, e.g. the 1-degree
+  # aifs2-1deg-ic1) keep model_backend: aifs but run in the aifs3 env
+  # (run_aifs3.sh), where get_model() picks aifs3_model.AIFS3Model -- see
+  # config_test_aifs3.yml. The envs are NOT
   # co-installed (see integrate_multiple_backends.md), so backends not selected here don't need
   # to be importable at all in the env you actually run with.
   model_backend: fcn3  # or: aifs, aurora, ace2, sfno

@@ -19,7 +19,9 @@ documented in `config.yml.template`.
 ## Rules that apply to every task
 
 - **One conda env per backend, never merged** -- run each backend in its
-  own env with its own launcher: `aifs2`/`aifs1` (`run_aifs.sh`), `fcstnet3`
+  own env with its own launcher: `aifs2`/`aifs1` (`run_aifs.sh`), `aifs3`
+  (`run_aifs3.sh`; AIFS checkpoints on the multi-dataset anemoi API, e.g.
+  the 1-degree `aifs2-1deg-ic1` -> `AIFS3Model`), `fcstnet3`
   (`run_fcn3.sh`; also runs `sfno` via `run_sfno.sh`), `aurora` (`run_aurora.sh`),
   `ace2` (`run_ace2.sh`), all
   under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2ic` is a

@@ -47,7 +47,13 @@ try:
     # so the import needs to tolerate either name rather than picking one.
     from anemoi.models.distributed.shapes import get_shard_shapes
 except ImportError:
-    from anemoi.models.distributed.shapes import get_shape_shards as get_shard_shapes
+    try:
+        from anemoi.models.distributed.shapes import get_shape_shards as get_shard_shapes
+    except ImportError:
+        # anemoi-models >= 0.19 (aifs3 env) has neither -- shard shapes became
+        # shard sizes. Only this module's own manual unroll uses it, and
+        # aifs3_model.AIFS3Model (the class for that API) overrides it.
+        get_shard_shapes = None
 
 import forecast_model
 
@@ -295,25 +301,31 @@ class AIFSModel(forecast_model.LatentForecastModel):
             m.decoder = torch.compile(m.decoder)
         self.multi_step = self.interface.multi_step
         self._timestep: datetime.timedelta = self.checkpoint.timestep
+        self._init_variable_index(self.checkpoint)
 
-        self.var_to_idx = self.checkpoint.variable_to_input_tensor_index
-        self.idx_to_var = self.checkpoint.output_tensor_index_to_variable
-        self._lats = np.asarray(self.checkpoint.latitudes)
-        self._lons = np.asarray(self.checkpoint.longitudes)
+    def _init_variable_index(self, md) -> None:
+        """Variable/column bookkeeping shared with aifs3_model.AIFS3Model.
+        `md` carries the per-dataset metadata: the `Checkpoint` itself on
+        the aifs1/aifs2 pins, a dataset's `tensor_handlers[...].metadata` on
+        anemoi-inference >= 0.12 (same attribute names on both)."""
+        self.var_to_idx = md.variable_to_input_tensor_index
+        self.idx_to_var = md.output_tensor_index_to_variable
+        self._lats = np.asarray(md.latitudes)
+        self._lons = np.asarray(md.longitudes)
 
         self.pmask_in = torch.as_tensor(
-            self.checkpoint.prognostic_input_mask, device=self.device, dtype=torch.long
+            md.prognostic_input_mask, device=self.device, dtype=torch.long
         )
         self.pmask_out = torch.as_tensor(
-            self.checkpoint.prognostic_output_mask, device=self.device, dtype=torch.long
+            md.prognostic_output_mask, device=self.device, dtype=torch.long
         )
         # Which input-tensor columns are constant in time (orography, land-sea
         # mask, bathymetry, ...): these are never refreshed after the initial
         # state is built -- `.roll()` alone keeps them correct since both time
         # levels already carry the same value.
-        self._reset = np.zeros(self.checkpoint.number_of_input_features, dtype=bool)
+        self._reset = np.zeros(md.number_of_input_features, dtype=bool)
         for name, i in self.var_to_idx.items():
-            if self.checkpoint.typed_variables[name].is_constant_in_time:
+            if md.typed_variables[name].is_constant_in_time:
                 self._reset[i] = True
 
         # Group each family of pressure-level variables (e.g. z_10, z_50, ...,
