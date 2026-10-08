@@ -114,8 +114,11 @@ fcstnetv3 repo's CLAUDE.md for the incident this pin traces back to).
 - **`get_model` / `get_grid_interpolator` / `get_input` / `get_verif`** each
   branch on `exp['model_backend']` at the top and call into the matching
   `backends/<backend>/*_model.py` / `*_grid.py` / `*_ic.py` module. AIFS's
-  irregular N320 octahedral grid always uses `aifs_grid.GridInterpolator`
-  (k-d-tree/k-NN); FCN3's regular grid defaults to
+  N320 reduced Gaussian grid defaults to
+  `aifs_grid.ReducedGaussianBilinearInterpolator` (added 2026-10-07,
+  default since 2026-10-08; see below), with `grid_interp: 'kdtree'`
+  selecting the original `aifs_grid.GridInterpolator` (k-d-tree/k-NN);
+  FCN3's regular grid defaults to
   `fcn3_grid.BilinearGridInterpolator` (exact, ~50x faster -- see the
   fcstnetv3 repo's CLAUDE.md), with `grid_interp: 'kdtree'` as an opt-out.
 - **Packed-state layout differs by backend** (AIFS: `(1, multi_step,
@@ -1526,6 +1529,69 @@ a 240-cycle SFNO run the "2015-01-25T00" cycle verified a Jan 13 state (z500
   from `test_aurora_5d_50it`, i.e. a run with this mis-cycling -- the crash
   itself is unrelated to dates, but that run's cycle-2 setup was not what
   it was thought to be.
+
+## AIFS bilinear observation interpolation (`grid_interp: bilinear`, 2026-10-07)
+
+AIFS's grid (both 2.0 and 1.1 checkpoints, identical coordinates) is the
+**classic N320 reduced Gaussian grid, not octahedral O320**: 542080 points
+in 640 latitude rows ordered north-to-south, row lengths 18, 25, 36, ...
+up to 1280, each row equally spaced in longitude starting at 0 deg
+(O320 would be 20+4i points per row, 421120 in all). Checked directly
+from the checkpoints' `anemoi-metadata/{latitudes,longitudes}.numpy`.
+
+`aifs_grid.ReducedGaussianBilinearInterpolator` exploits that row
+structure: per observation it interpolates linearly in longitude along the
+two bracketing latitude rows (each with its own spacing), then linearly in
+latitude between them -- 4 points, the same `(n_obs, 4)` idx/wts as the
+k-NN `GridInterpolator`, so the solver is unchanged. Row lengths are
+derived from the data and validated in the constructor. Poleward of the
+outermost rows (|lat| > 89.78) the edge row's value is used. Selected by
+`grid_interp: bilinear`, the AIFS default since 2026-10-08 (after the
+cycled comparison below); set `grid_interp: kdtree` to reproduce AIFS
+results from before that date.
+
+Offline check (200k random points uniform on the sphere, relative RMS
+interpolation error vs. analytic fields; identical for 2.0 and 1.1):
+
+| field | kdtree (k=4 IDW) | bilinear | ratio |
+|---|---|---|---|
+| linear in x,y,z | 3.8e-4 | 3.5e-6 | 109 |
+| ~l=5 harmonic | 1.0e-3 | 2.3e-5 | 44 |
+| ~l=20 harmonic | 2.1e-3 | 1.0e-4 | 20 |
+| ~l=60 harmonic | 6.9e-3 | 1.3e-3 | 5.5 |
+
+Both reproduce grid-point values exactly; bilinear weights are ~2x cheaper
+to build than the k-d-tree query, and per-epoch cost is identical (same
+4-point gather).
+
+**Cycled 4D-Var comparison (2026-10-08, AIFS 1.1).** Two otherwise
+identical runs differing only in `grid_interp`, 26 cycles from
+2015-01-01T06 to 2015-01-07T18. Mean z500 RMS error (m) over the 26
+cycles, "after" = analysis; Δ = bilinear - kdtree; win/loss counts
+cycles where bilinear is lower/higher:
+
+| region | kdtree after | bilinear after | Δ after | Δ before (bg) | win/loss (after) |
+|---|---|---|---|---|---|
+| NH | 11.78 | 11.79 | +0.01 | +0.01 | 12/11 |
+| TR | 4.79 | 4.80 | +0.02 | +0.02 | 6/15 |
+| SH | 11.36 | 11.24 | **-0.12** | -0.12 | 23/1 |
+| GL | 9.81 | 9.77 | **-0.04** | -0.04 | 18/8 |
+
+- The gain is almost entirely SH, and it grows with cycling: last-day
+  (4 cycles) mean SH analysis error 12.61 (kdtree) vs 12.28 (bilinear).
+  The backgrounds show the same difference, so it propagates through
+  the cycle rather than being an analysis-only effect -- consistent
+  with a small systematic obs-operator error from the 4-point IDW
+  accumulating where obs are sparse.
+- Tropics marginally worse (~0.02 m, <0.5%); NH neutral.
+- One week, one period, strongly autocorrelated cycles -- the win counts
+  are not independent samples. The direction is consistent and the
+  cost is identical, which was enough to switch the default.
+- Independent of the interpolator: global error drifts up ~9.0 -> 10.4 m
+  over the week in both runs, and after the first cycle the mean
+  analysis improvement over the background is only ~0.04 m global
+  (slightly negative in the tropics) -- a much bigger issue than the
+  interpolation choice.
 
 ## Known gaps / next steps
 
