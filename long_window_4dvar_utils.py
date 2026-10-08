@@ -48,9 +48,11 @@ Where the three backends genuinely differ, and how this file handles it:
     against the packed state directly (`control_variables`, via
     `_resolve_control_mask` / `_apply_control_mask`), it branches on
     `model.state_layout` rather than assuming any one packing.
-  - **Grid regularity.** AIFS's grid is an irregular N320 octahedral mesh,
-    interpolated via a k-d-tree/inverse-distance scheme
-    (`aifs_grid.GridInterpolator`) with no alternative. FCN3's and Aurora's
+  - **Grid regularity.** AIFS's grid is the N320 reduced Gaussian grid
+    (640 rows of 18..1280 points), interpolated by default via row-wise
+    bilinear (`aifs_grid.ReducedGaussianBilinearInterpolator`), or the
+    k-d-tree/inverse-distance scheme (`aifs_grid.GridInterpolator`,
+    `grid_interp: 'kdtree'`). FCN3's and Aurora's
     grids are both regular 0.25 deg equiangular lat/lon grids (FCN3:
     721x1440, including both poles; Aurora: 720x1440, `Batch.crop()` drops
     the South Pole row), so both additionally support an exact,
@@ -121,6 +123,7 @@ purely through `model.advance`/`model.decode_state`).
 import copy
 import json
 import logging
+import math
 import os
 import pickle
 import sys
@@ -330,6 +333,8 @@ def load_config(config_path='config.yml'):
         )
     if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
+    if float(exp.get('obs_density_box_deg', 0.0)) < 0:
+        raise ValueError(f"obs_density_box_deg must be >= 0 (degrees; 0 = off), got {exp['obs_density_box_deg']!r}")
     # More than one DA cycle requires cycle: True. With cycle: False the driver
     # never advances the previous analysis (valid at window_start + dt_verif)
     # to the next cycle time -- it falls through to the next-window-in-the-
@@ -412,9 +417,11 @@ def log_window(exp, logger):
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
+    logger.info('   obs_density_box_deg: ' + (str(exp['obs_density_box_deg']) + ' (area-weighted Jo)'
+                                               if exp.get('obs_density_box_deg') else '(off)'))
+    logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
-        logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
     if 'bg_check' in exp: logger.info('   bg_check: ' + str(exp['bg_check']))
     if 'zthresh' in exp: logger.info('   zthresh: ' + str(exp['zthresh']))
     if 'zconst' in exp: logger.info('   zconst: ' + str(exp['zconst']))
@@ -488,8 +495,11 @@ def get_model(exp):
 
 
 def get_grid_interpolator(model, exp):
-    """AIFS's irregular N320 octahedral grid always uses the k-d-tree/k-NN
-    approach (no alternative exists). FCN3's and Aurora's regular grids both
+    """AIFS's N320 reduced Gaussian grid defaults to
+    aifs_grid.ReducedGaussianBilinearInterpolator (row-wise bilinear,
+    exact for linear fields, ~5-100x smaller error on smooth fields);
+    `grid_interp: 'kdtree'` selects the k-d-tree/k-NN inverse-distance
+    scheme used by every AIFS result before 2026-10-08. FCN3's and Aurora's regular grids both
     default to the exact, ~50x-faster BilinearGridInterpolator -- see
     fcn3_grid.py's module docstring and verify_bilinear_grid_interp.py (in
     the original long-window-4dvar-fcstnetv3 repo) for the
@@ -501,7 +511,14 @@ def get_grid_interpolator(model, exp):
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
         import aifs_grid
-        return aifs_grid.GridInterpolator(model.lons, model.lats)
+        # default 'bilinear' (row-wise reduced-Gaussian) since 2026-10-08;
+        # set 'kdtree' to reproduce earlier AIFS results
+        kind = exp.get('grid_interp', 'bilinear')
+        if kind == 'bilinear':
+            return aifs_grid.ReducedGaussianBilinearInterpolator(model.lons, model.lats)
+        if kind == 'kdtree':
+            return aifs_grid.GridInterpolator(model.lons, model.lats)
+        raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
     elif backend in ('fcn3', 'aurora', 'sfno'):
         # Aurora shares FCN3's regular-grid machinery directly (same 0.25deg
         # ERA5 grid, just 720 rather than 721 rows -- fcn3_grid.py's classes
@@ -1270,6 +1287,37 @@ def _apply_control_mask(state, keep_mask, ref_state, state_layout):
     raise ValueError(f"unknown state_layout {state_layout!r} (expected 'channels_first' or 'channels_last')")
 
 
+def _obs_density_weights(used, lat, lon, box_deg):
+    """Per-ob Jo weights that make one obs slot's Jo an area-weighted rather
+    than an obs-weighted sum (exp['obs_density_box_deg']; ported from the
+    JAX ensemble branch, lw4dvar-torch-frolovsa, where it cut z500 RMSE ~7%
+    globally / ~10% in the SH over 60 cycles of the deterministic control).
+
+    Used obs are binned into box_deg x box_deg lat-lon boxes; an ob in box b
+    gets cos(lat of b's centre) / (number of used obs in b), so every unit of
+    AREA with at least one ob counts equally -- dense networks (NH land) are
+    down-weighted, isolated obs (SH, oceans) up-weighted. The weights are
+    then rescaled to sum to the number of used obs, so Jo keeps its scale
+    against Jc (which is normalized by N_obs). A weight w acts like an ob
+    error sigma / sqrt(w). Unused slots (QC-rejected, padding) get 0.
+
+    `used` is boolean (nobs_max,); lat/lon in degrees, same shape. The
+    weights depend only on ob locations and the QC mask, so no gradient flows
+    through them; they do follow the dynamic background check each epoch."""
+    m = used.to(torch.float32)
+    nlat_b = int(math.ceil(180.0 / box_deg))
+    nlon_b = int(math.ceil(360.0 / box_deg))
+    # padding slots carry lat/lon = 1e10 -- the clamp keeps their (unused)
+    # box index in range; their weight is zeroed by m anyway
+    ilat = torch.clamp(torch.floor((lat + 90.0) / box_deg), 0, nlat_b - 1).to(torch.int64)
+    ilon = torch.clamp(torch.floor(torch.remainder(lon, 360.0) / box_deg), 0, nlon_b - 1).to(torch.int64)
+    box = ilat * nlon_b + ilon
+    counts = torch.zeros(nlat_b * nlon_b, dtype=torch.float32, device=m.device).scatter_add_(0, box, m)
+    area = torch.cos(torch.deg2rad(-90.0 + (ilat.to(torch.float32) + 0.5) * box_deg))
+    w = m * area / torch.clamp(counts[box], min=1.0)
+    return w * m.sum() / torch.clamp(w.sum(), min=1e-30)
+
+
 def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif_ic,
                        psobs_traj, epoch, exp, grid_interp, print_every, interp_specs,
                        keep_mask=None, ref_state1=None, jc_ref=None):
@@ -1357,17 +1405,24 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
 
     do_print = print_every > 0 and (epoch % print_every == 0 or epoch == 1)
     Jol = [None] * n_obs
+    obs_density_box_deg = float(exp.get('obs_density_box_deg', 0.0))
 
     def _obs_term(j, decoded_j):
         innovation, model_equivalent, effective_error, available, used, qc_flag = \
             _compute_ps_observation_diagnostics_at_time(model, decoded_j, verif_ic, psobs_traj, exp, j, grid_interp)
         innov = torch.where(used, innovation, torch.zeros_like(innovation))
         oberr_stdev = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
-        Jt = ((innov / oberr_stdev) ** 2).sum()
+        if obs_density_box_deg > 0:
+            # area-weighted Jo (see _obs_density_weights); sum(w) = n_used
+            w = _obs_density_weights(used, psobs_traj['lat'][j, :], psobs_traj['lon'][j, :], obs_density_box_deg)
+            Jt = (w * (innov / oberr_stdev) ** 2).sum()
+        else:
+            Jt = ((innov / oberr_stdev) ** 2).sum()
         if do_print:
+            wtag = f", max ob weight {w.max().item():.2f}" if obs_density_box_deg > 0 else ''
             tag = ' [background, uncorrected]' if (step_lo[j] == 0 and alpha[j] == 0.0) else ''
             print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): J {Jt.item()}, "
-                  f"{int(used.sum().item())} obs used (out of {int(psobs_traj['n_valid'][j])}){tag}")
+                  f"{int(used.sum().item())} obs used (out of {int(psobs_traj['n_valid'][j])}){wtag}{tag}")
         return Jt
 
     jc_sp = {}
