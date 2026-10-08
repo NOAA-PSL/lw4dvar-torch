@@ -25,6 +25,13 @@ documented in `config.yml.template`.
   under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2ic` is a
   login-node-only env for ACE2 IC/verification fetching. Backend modules are
   imported lazily so a process never needs another backend's dependencies.
+  Exception: `aifs2-1.0deg-v1.0` (a user-trained checkpoint, still
+  `model_backend: aifs`) needs its own env (`lwaifs2`, `run_aifs2-1.0deg-
+  v1.0.sh`) because of a dependency pin gap in the shared `aifs2` env that
+  this account can't fix in place (not group-writable) -- see
+  `integrate_aifs2-1deg-v1.0_backend.md`. The conda env is really keyed by
+  *checkpoint*, not strictly by *backend*, whenever two checkpoints of the
+  same backend need genuinely different pins.
 - **Compute (GPU) nodes have no internet.** Every IC, verification file,
   checkpoint and forcing file must be prefetched from a login node first
   (`backends/<name>/*_prefetch_*.py`, `backends/ace2/ace2_ic.py`).
