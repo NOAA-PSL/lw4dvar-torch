@@ -115,6 +115,18 @@ exp:
   # unless set. (Replaces the removed jc_ps_sigma: sigma = s corresponds to
   # kappa = n_points / (s^2 * N_obs).)
   #jc_ps_weight: 30.
+  # obs_density_box_deg (degrees): optional observation-density weighting of
+  # Jo, giving more weight to obs in sparsely observed regions (SH, oceans).
+  # At each obs time the used obs are binned into box x box degree lat-lon
+  # boxes and each ob is weighted by cos(box-centre latitude) / (used obs in
+  # its box), rescaled so the weights sum to the number of used obs (Jo keeps
+  # its scale against Jc). Jo becomes an area-weighted rather than an
+  # obs-weighted sum; a weight w acts like an ob error sigma / sqrt(w)
+  # (10-degree boxes, Jan 2015: NH ~79% of obs -> ~38% of the weight, SH
+  # ~9% -> ~30%, largest weight ~34). Weights follow the dynamic background
+  # check; QC itself is unchanged. Ported from the JAX ensemble branch, where
+  # 10 degrees cut 60-cycle z500 RMSE ~7% (SH ~10%). 0 / unset = off.
+  #obs_density_box_deg: 10.
 
   # The 4D-Var control variable is a one-time latent-space increment
   # injected at the first rollout step -- NOT a physical-space
@@ -234,14 +246,22 @@ exp:
   # 'aifs_autocast_dtype' is a deprecated alias for this key.
   #autocast_dtype: 'bfloat16'
 
-  # grid_interp: FCN3 and Aurora only (default 'bilinear', meaningless for
-  # AIFS -- AIFS's irregular N320 octahedral grid always uses the k-d-tree
-  # approach, no config key needed). How ps-obs are interpolated to/from
-  # the model's regular 0.25deg grid. 'bilinear' (BilinearGridInterpolator,
+  # grid_interp: how ps-obs are interpolated from the model grid.
+  # AIFS (default 'bilinear' since 2026-10-08): 'bilinear' is closed-form
+  # bilinear on the N320 reduced Gaussian grid
+  # (aifs_grid.ReducedGaussianBilinearInterpolator: linear in longitude
+  # along the two bracketing latitude rows, then linear in latitude) --
+  # exact for linear fields, 5-100x smaller interpolation error than
+  # 'kdtree' on smooth test fields, same per-epoch cost, and slightly
+  # lower cycled z500 error (mainly SH). 'kdtree' is the k=4
+  # inverse-distance-weighted k-NN scheme (aifs_grid.GridInterpolator)
+  # that every earlier AIFS result used -- set it to reproduce those.
+  # FCN3/Aurora/SFNO/ACE2 (default 'bilinear'): how ps-obs are interpolated
+  # to/from the model's regular grid. 'bilinear' (BilinearGridInterpolator,
   # backends/fcn3/fcn3_grid.py -- Aurora reuses this directly, see
   # get_grid_interpolator) is exact and ~50x faster per obs slot than
   # 'kdtree' (GridInterpolator, the k=4 inverse-distance-weighted k-NN
-  # approach AIFS always uses) -- see the original repo's
+  # approach) -- see the original repo's
   # verify_bilinear_grid_interp.py. 'kdtree' is kept only as an A/B
   # fallback; there is no reason to set this for either backend's regular
   # grid.

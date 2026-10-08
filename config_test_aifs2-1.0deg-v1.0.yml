@@ -1,13 +1,13 @@
 exp:
   model_backend: aifs
   nhrs_back: 48
-  restart: True
+  restart: False
   rpath: './output/<previous_exp_name>/'
   obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
   nobs_max: 15000
   ic_suffix: '120h_100it'
   sdate: '2015-01-01T00'
-  n_init: 100
+  n_init: 2
   dt_init: 12
   save_levs: [1000,850,500,250,50]
   cycle: True
