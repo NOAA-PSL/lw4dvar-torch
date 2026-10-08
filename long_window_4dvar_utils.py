@@ -49,10 +49,10 @@ Where the three backends genuinely differ, and how this file handles it:
     `_resolve_control_mask` / `_apply_control_mask`), it branches on
     `model.state_layout` rather than assuming any one packing.
   - **Grid regularity.** AIFS's grid is the N320 reduced Gaussian grid
-    (640 rows of 18..1280 points), interpolated by default via a
-    k-d-tree/inverse-distance scheme (`aifs_grid.GridInterpolator`), or
-    row-wise bilinear (`aifs_grid.ReducedGaussianBilinearInterpolator`,
-    `grid_interp: 'bilinear'`). FCN3's and Aurora's
+    (640 rows of 18..1280 points), interpolated by default via row-wise
+    bilinear (`aifs_grid.ReducedGaussianBilinearInterpolator`), or the
+    k-d-tree/inverse-distance scheme (`aifs_grid.GridInterpolator`,
+    `grid_interp: 'kdtree'`). FCN3's and Aurora's
     grids are both regular 0.25 deg equiangular lat/lon grids (FCN3:
     721x1440, including both poles; Aurora: 720x1440, `Batch.crop()` drops
     the South Pole row), so both additionally support an exact,
@@ -414,9 +414,9 @@ def log_window(exp, logger):
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
+    logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
-        logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
     if 'bg_check' in exp: logger.info('   bg_check: ' + str(exp['bg_check']))
     if 'zthresh' in exp: logger.info('   zthresh: ' + str(exp['zthresh']))
     if 'zconst' in exp: logger.info('   zconst: ' + str(exp['zconst']))
@@ -490,10 +490,11 @@ def get_model(exp):
 
 
 def get_grid_interpolator(model, exp):
-    """AIFS's N320 reduced Gaussian grid defaults to the k-d-tree/k-NN
-    inverse-distance scheme; `grid_interp: 'bilinear'` selects
+    """AIFS's N320 reduced Gaussian grid defaults to
     aifs_grid.ReducedGaussianBilinearInterpolator (row-wise bilinear,
-    exact for linear fields, ~5-100x smaller error on smooth fields). FCN3's and Aurora's regular grids both
+    exact for linear fields, ~5-100x smaller error on smooth fields);
+    `grid_interp: 'kdtree'` selects the k-d-tree/k-NN inverse-distance
+    scheme used by every AIFS result before 2026-10-08. FCN3's and Aurora's regular grids both
     default to the exact, ~50x-faster BilinearGridInterpolator -- see
     fcn3_grid.py's module docstring and verify_bilinear_grid_interp.py (in
     the original long-window-4dvar-fcstnetv3 repo) for the
@@ -505,9 +506,9 @@ def get_grid_interpolator(model, exp):
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
         import aifs_grid
-        # default stays 'kdtree' (the scheme every AIFS result so far used);
-        # 'bilinear' is the row-wise reduced-Gaussian bilinear scheme
-        kind = exp.get('grid_interp', 'kdtree')
+        # default 'bilinear' (row-wise reduced-Gaussian) since 2026-10-08;
+        # set 'kdtree' to reproduce earlier AIFS results
+        kind = exp.get('grid_interp', 'bilinear')
         if kind == 'bilinear':
             return aifs_grid.ReducedGaussianBilinearInterpolator(model.lons, model.lats)
         if kind == 'kdtree':
