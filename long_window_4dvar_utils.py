@@ -121,6 +121,7 @@ purely through `model.advance`/`model.decode_state`).
 """
 
 import copy
+import importlib
 import json
 import logging
 import math
@@ -446,8 +447,18 @@ def get_model(exp):
     backend = exp['model_backend']
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
-        import aifs_model
-        return aifs_model.AIFSModel(
+        # The aifs3 env (anemoi-inference >= 0.12, multi-dataset API; e.g. the
+        # 1-degree aifs2-1deg-ic1 checkpoint) needs AIFS3Model; the aifs1/aifs2
+        # envs keep AIFSModel. Chosen by the installed API, since each
+        # checkpoint only loads in its own env anyway.
+        import importlib.util
+        if importlib.util.find_spec('anemoi.inference.tensors') is not None:
+            import aifs3_model as aifs_model
+            model_class = aifs_model.AIFS3Model
+        else:
+            import aifs_model
+            model_class = aifs_model.AIFSModel
+        return model_class(
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
@@ -587,7 +598,7 @@ def get_input(exp, model, logger):
         back_dt = _to_utc_datetime(back_date, backend)
         if backend == 'aifs':
             _ensure_backend_on_path('aifs')
-            import aifs_ic
+            aifs_ic = importlib.import_module(getattr(model, 'ic_module', 'aifs_ic'))  # aifs3_ic for AIFS3Model
             input_state = aifs_ic.build_input_state(model.runner, back_dt, cache_dir, lagged=True)
         elif backend == 'fcn3':
             _ensure_backend_on_path('fcn3')
@@ -648,7 +659,7 @@ def get_verif(exp, model, logger, date_override=None):
     verif_ic = {}
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
-        import aifs_ic
+        aifs_ic = importlib.import_module(getattr(model, 'ic_module', 'aifs_ic'))  # aifs3_ic for AIFS3Model
         raw_fields = aifs_ic.read_single_date_fields(model.runner, date_dt, cache_dir)
         # Single-date snapshot: pack directly rather than through
         # model.prepare_initial_state() (which expects a full

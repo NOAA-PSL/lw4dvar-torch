@@ -1,0 +1,22 @@
+description: |
+  Static anemoi-inference config for the user-trained 1-degree (O96,
+  40320-point) AIFS checkpoint `aifs2-1deg-ic1` (one input time level),
+  trained with the multi-dataset anemoi API (anemoi-models 0.19,
+  anemoi-training 0.17) -- loaded by aifs3_model.AIFS3Model in the `aifs3`
+  conda env (run_aifs3.sh). The checkpoint path here is a placeholder:
+  config.yml's path_model/model_name override it.
+
+  `input`/`output`/`date`/`lead_time` are placeholders required for the
+  config to load and are never exercised: the driver builds the input
+  state itself (aifs3_ic.py) and calls the TensorHandler/model directly,
+  never runner.run(). Constant forcings (lsm/sdor/slor/z) come from that
+  input state, so the runner never reads its own `input`.
+
+checkpoint: /scratch4/BMC/gsienkf/Sergey.Frolov/eagle/latent/EAGLE/run/aifs2-1deg-ic1/training/outputs/checkpoint/8a8641f4213949afb3c68365ea7d1e63/inference-last.ckpt
+
+date: 2015-01-01T00
+lead_time: 6
+input: empty
+output:
+  grib:
+    path: /dev/null

@@ -1647,6 +1647,84 @@ obs are NH and ~9% SH, so the SH carried little of the loss.
   down to ~0.18x) is the main risk -- a cap w <= 1 (thinning only) is the
   untested fallback.
 
+## AIFS on the multi-dataset anemoi API: `aifs3` env, `AIFS3Model` (2026-10-08)
+
+S. Frolov's 1-degree checkpoint `aifs2-1deg-ic1` (O96, 40320 points, ONE
+input time level, one output level per 6h step, 89 inputs / 76 prognostic /
+17 diagnostic, hidden mesh 10944 x 1024, `latent_skip` on) was trained with
+anemoi-models 0.19.0.post35 / anemoi-training 0.17.0.post35 / torch 2.10.
+It cannot run in the `aifs1`/`aifs2` envs: anemoi-utils 0.4 looks for
+`ai-models.json` (now `anemoi-metadata/anemoi.json`), and unpickling fails
+on `anemoi.models.layers.graph_provider` (new classes) -- checked in the
+`aifs2` env, not a shim-able gap. The first symptom (`get_shard_shapes`
+import error) was only the tip: the API is multi-dataset throughout.
+
+- **Env `aifs3`** (`/scratch4/BMC/gsienkf/whitaker/conda/envs/aifs3`): a
+  rebuild of Frolov's `anemoi-dev` env (package lists identical except his
+  local `eagle-tools`), with anemoi pinned to NOAA-PSL fork commits instead of
+  his editable trees: anemoi-core@7b53fcb5f, anemoi-inference@2169c56 (both
+  dated before training started). Recipe and pins in `aifs3-requirements.txt`
+  / `aifs3-spec.txt`. Pitfalls hit building it: the rdhpcs-conda module's
+  system `.condarc` pins `pkgs_dirs` to `~/.conda/pkgs` with `#!final`, so
+  `CONDA_PKGS_DIRS` is ignored and the ~14 GB download filled the 30 GB home
+  quota -- build with a conda that lacks that config; setuptools_scm can't
+  derive the monorepo's per-package versions from a clone (gave
+  `0.0.0.post1357`), so install with `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_*`
+  set to the versions the checkpoint records (anemoi-inference's
+  `validate_environment` then returns True). Triton JIT-compiles a CUDA
+  helper with the system gcc on first use and needs `cuda.h`, which the env
+  lacks -- `run_aifs3.sh` loads `cuda/12.8.1` for its CPATH.
+- **Code** (`model_backend: aifs` unchanged; `get_model()` picks
+  `aifs3_model.AIFS3Model` when `anemoi.inference.tensors` exists, i.e. by
+  env): `AIFS3Model(AIFSModel)` overrides only `__init__`, state preparation,
+  and stepping. Per-variable metadata moved from `Checkpoint` to
+  `runner.tensor_handlers[ds].metadata` (same attribute names --
+  `AIFSModel._init_variable_index(md)` now serves both); stepping mirrors
+  anemoi-inference's own `Runner.forecast` via the handler's
+  `copy_prognostic_fields_to_input_tensor` / `add_dynamic_forcings_to_input_tensor`
+  (on a clone -- they write in place). `predict_step` still runs under
+  `torch.no_grad()`, so `_predict_step_with_grad` re-implements its
+  unsharded body and calls the model's own `forward()` unchanged. **The latent
+  increment is a forward hook on `model.latent_aggregator`** (output +
+  increment) instead of AIFSModel's manual encoder/processor/decoder unroll:
+  with one dataset `SumAggregator` returns the encoder latent as-is, so the
+  processor and the latent skip both see the increment, as before -- and no
+  model internals are copied. Single-dataset, one-output-step checkpoints
+  only (raises otherwise); `compile_wrapper` not implemented.
+  `aifs3_ic.py` (selected through `AIFS3Model.ic_module`) builds the State
+  straight from cached ERA5 GRIBs (`era5_<date>.grib` or `_lagged.grib`),
+  read-only. Bo Huang's O96 cache `ic_cache_aifs2-1.0deg-v1.0` matches this
+  checkpoint exactly (grid identical to 0.0; supplies all 80 non-computed
+  inputs). `aifs_inference_aifs2-1deg-ic1.yaml` uses `input: empty` (the new
+  runner instantiates its input at startup and has no `opendata`).
+- **Validation** (`backends/aifs/probe_aifs3_validate.py`, H100, untracked):
+  4-step rollout vs `runner.run()` (anemoi-inference's own forecast)
+  **bit-identical** (max diff 0.0, six fields, every step); zero increment vs
+  plain step 1.4e-5 relative (adding an fp32 increment promotes the fp16
+  latent -- AIFSModel's `x_latent + latent_increment` does the same; casting
+  the increment to the latent's dtype would round small increments away);
+  gradients finite, 2 steps forward+backward ~2 s, 3.7 GiB; fp16 finite
+  differences (loss x 1e6) match autograd to 0.4%. Driver smoke test (1
+  cycle, 5-day window, 5 iterations, bf16): Jtot 337172 -> 290696, ~5 s per
+  iteration, all outputs written, no errors.
+- **Gradient accuracy -- precision, not code** (`probe_aifs3_gradfactor.py`):
+  autograd vs central differences of a small test J (rms sp response 0.035
+  hPa after 2 steps) disagreed by 2-3x in fp16 with every attention-backend
+  combination. In fp32 they agree to <1% (0.994 with PyG + SDPA, 0.996 and
+  1.000 with the Triton kernel + SDPA; fp32 needs
+  `ANEMOI_INFERENCE_TRANSFORMER_ATTENTION_BACKEND=scaled_dot_product_attention`,
+  since the processor's FlashAttention is fp16/bf16-only). fp16 with the loss
+  scaled by 1e6 agrees too (0.996 / 0.978) -> the fp16 error was gradient
+  underflow at this test's tiny J; real 4D-Var losses (~3e5) are far from it.
+  bf16 (the driver's AIFS default): its forward rounding noise (~0.05 hPa rms
+  in sp) swamps this J, so finite differences are meaningless there, but bf16
+  autograd is within 4% / 1% of the fp32 gradients.
+- **Not yet done**: a full 50-iteration cycle and cycling; `learn_rate` /
+  `latent_scale` untuned for this checkpoint (smaller hidden mesh than the
+  0.25deg AIFS); fetching ICs for dates outside Bo's cache (aifs3_ic only
+  reads; `aifs_prefetch_ic.py` in his `lwaifs2` env + aifs2-1.0deg-v1.0
+  checkpoint writes the same O96 files).
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
