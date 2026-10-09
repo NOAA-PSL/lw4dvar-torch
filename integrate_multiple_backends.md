@@ -1593,6 +1593,60 @@ cycles where bilinear is lower/higher:
   (slightly negative in the tropics) -- a much bigger issue than the
   interpolation choice.
 
+## Observation-density weighted Jo (`obs_density_box_deg`, 2026-10-07/08)
+
+Ported from the JAX ensemble branch (`../lw4dvar-torch-frolovsa`,
+`_obs_density_weights` / `_jo_obs_weights`). Motivation there: ~79% of used ps
+obs are NH and ~9% SH, so the SH carried little of the loss.
+
+- **Method** (`_obs_density_weights`, applied in `compute_loss_4dvar`'s
+  `_obs_term`): at each obs slot the USED obs are binned into box x box degree
+  lat-lon boxes; each gets cos(box-centre lat) / (used obs in its box),
+  rescaled so the weights sum to n_used (Jo keeps its scale against Jc, which
+  is normalized by N_obs). Jo per slot = sum(w * (innov/sigma)^2), so w acts
+  like an ob error sigma/sqrt(w). Weights follow the dynamic background check
+  each epoch (QC itself unchanged), carry no gradient, and depend only on ob
+  locations -- so it is model-grid independent (works unchanged on AIFS's
+  reduced grid; cos(lat) is right here because the boxes are a regular
+  lat-lon binning, not model grid cells). `exp`-level key (a window key on the
+  JAX branch); 0/unset = off. If the box size doesn't divide 180/360, the last
+  row/column box is narrower but weighted as full -- use 5/10/15/20.
+- **Weight distribution** (10 deg, `psobs1_2015011500`, 10821 obs): NH (>20N)
+  77.5% of obs -> 38.3% of weight (median w 0.24), tropics 13.4% -> 31.7%
+  (1.13), SH (<20S) 9.1% -> 30.0% (1.83); max w 31.7 (effective sigma ~0.18x).
+  Matches the JAX branch's numbers (NH 79 -> 38%, SH 9 -> 30%, max ~34).
+- **JAX branch result** (deterministic control, 60 cycles, 12h windows; their
+  report `reports/weighted_control_4dvar_v1`): z500 RMSE -7.5% global (NH
+  -5.2, tropics -2.8, SH -9.8); q850 +3.0% global (tropics +6.0).
+- **ACE2 cycled result** (2026-10-08): `test_ace2_6h3h_50it_5day_lr1e-3_jc25`
+  (this branch, `obs_density_box_deg: 10`) vs the same-named control in
+  `../lw4dvar-torch/output/` -- configs identical otherwise (6h cycling,
+  5-day window, `dt_obs: 3`, 50 epochs, lr 1e-3, `jc_ps_weight: 25`,
+  `checkpoint_stride: 2`). z500 at 24h lead, mean over the 313 common cycles
+  (2015-01-01 - 03-20; the control runs on to 04-30):
+
+  | Region | Control (m) | Weighted (m) | Change |
+  |---|---|---|---|
+  | NH | 14.68 | 13.23 | -9.9% |
+  | Tropics | 7.32 | 6.97 | -4.8% |
+  | SH | 20.91 | 16.62 | -20.5% |
+  | Global | 15.31 | 12.91 | -15.7% |
+
+  (analysis; background within 0.03 m -- with 6h cycling of a 5-day window
+  one cycle barely changes the 24h forecast). Much larger than the JAX
+  branch's gains, and NH improves too (they saw NH ps fits slightly worse).
+  SH: the control climbs to ~21-27 m through January and stays high; the
+  weighted run mostly stays at 13-18 m, with the two close only ~Jan 20-30
+  and from ~Mar 15. Tropics mixed: clearly better early Feb and around
+  Feb 10 / Mar 7, slightly worse at times mid-Feb. Plot
+  `z500err_ts_obsdensity_24h.png` (untracked, repo root).
+- **Caveats / not yet done**: one run each, one start date -- cycle-to-cycle
+  noise of the difference not estimated (no block bootstrap yet); only z500
+  at 24h checked (other leads, wind/q, and O-A/O-B fits not yet -- the JAX
+  branch saw q850 degrade); the up-weighting of isolated obs (effective sigma
+  down to ~0.18x) is the main risk -- a cap w <= 1 (thinning only) is the
+  untested fallback.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
