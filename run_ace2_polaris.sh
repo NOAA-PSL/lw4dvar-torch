@@ -4,7 +4,7 @@
 #PBS -q capacity
 #PBS -l select=1:system=polaris
 #PBS -l place=scatter
-#PBS -l walltime=04:00:00
+#PBS -l walltime=24:00:00
 #PBS -l filesystems=home:eagle
 #PBS -o lw4dvar_ace2.out
 #PBS -e lw4dvar_ace2.err
@@ -22,6 +22,7 @@ cd ${PBS_O_WORKDIR}
 # against it and resolve libcudart.so.12 from the loaded toolkit (matches
 # the torch==2.7.1+cu128 pin).  Load it AFTER conda: the conda module puts
 # CUDA 12.9.1's libraries on the path, overriding an earlier 12.8.1 load.
+module purge
 module use /soft/modulefiles
 module load conda
 module load cudatoolkit-standalone/12.8.1

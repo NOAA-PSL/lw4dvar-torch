@@ -2,13 +2,13 @@ exp:
   model_backend: ace2
 
   nhrs_back: 48
-  restart: False
+  restart: True
   rpath: './output/test_ace2_6h_5d_50it/'
   obspath: '/lus/eagle/projects/moonshot-reanalysis/jwhitaker/psobs'
   nobs_max: 15000
   ic_suffix: '120h_50it'
-  sdate: '2015-01-01T00'
-  n_init: 2
+  sdate: '2015-03-02T00'
+  n_init: 240
   dt_init: 6
   save_levs: [1000, 850, 500, 250, 50]
   cycle: True
@@ -25,7 +25,8 @@ exp:
   # ps_operator defaults to 'ps_native' for ACE2
   checkpoint_stride: 1 # 2 runs out of memory on a 40 GB A100 (Polaris); 0 runs out of memory on H100
   control_variables: [air_temperature, specific_total_water, eastward_wind, northward_wind, PRESsfc, surface_temperature, TMP2m, Q2m, UGRD10m, VGRD10m] # this is the full list, nothing excluded (the default)
-  jc_ps_weight: 32
+  jc_ps_weight: 25
+  obs_density_box_deg: 10.
 
 windows:
   '5':
