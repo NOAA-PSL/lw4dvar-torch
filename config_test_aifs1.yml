@@ -3,8 +3,13 @@ exp:
   nhrs_back: 48
   restart: False
   rpath: './output/<previous_exp_name>/'
-  obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
-  nobs_max: 15000
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/longWin4DVar/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      use_source_error: True  # no oberrstart below (defaults to 0, i.e. file error) -- matches the legacy .txt column-7 per-ob error
+    raobs:
+      enabled: False
   ic_suffix: '12h_5it'
   sdate: '2015-01-01T00'
   n_init: 1

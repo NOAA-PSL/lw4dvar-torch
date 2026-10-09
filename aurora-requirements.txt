@@ -64,6 +64,7 @@ nvidia-nvtx-cu12==12.8.55
 packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1785888127/work
 pandas==3.0.6
 pillow==12.3.0
+pyarrow==25.0.1
 pycparser==3.0
 pydantic==2.13.5
 pydantic_core==2.46.5

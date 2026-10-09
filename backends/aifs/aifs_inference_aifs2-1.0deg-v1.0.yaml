@@ -1,0 +1,54 @@
+description: |
+  Static anemoi-inference config for the user-trained AIFS-single-2.0, 1-degree
+  (O96, 40320-point reduced-Gaussian grid) checkpoint `aifs2-1.0deg-v1.0`
+  (aifs_model.py) -- the 1-degree-specific counterpart to aifs_inference.yaml
+  (the official 0.25deg/N320 AIFS-single-2.0 checkpoint) and
+  aifs_inference_v1p1.yaml (AIFS-single-1.1).
+
+  Why a separate file rather than reusing aifs_inference.yaml: this checkpoint
+  has zero wave variables and no `snowc`/`sd` at all (confirmed directly by
+  probing the checkpoint: 89 input features, no mwd/swh/snowc/sd) -- the same
+  situation as AIFS-single-1.1 (see aifs_inference_v1p1.yaml's own docstring).
+  Reusing aifs_inference.yaml's v2.0-specific wave `typed_variables`/
+  `pre_processors`/`post_processors` fails Pydantic validation
+  (`Extra inputs are not permitted`) when pointed at this checkpoint.
+
+  `input`/`output`/`date`/`lead_time` below are placeholders required for the
+  config to load and are never exercised -- only checkpoint/pre_processors/
+  post_processors/patch_metadata/typed_variables are actually used (the driver
+  never calls runner.execute()/run(), only the lower-level pieces: runner.model,
+  runner.checkpoint, runner.prepare_input_tensor, runner.create_*_input(),
+  runner.copy_prognostic_fields_to_input_tensor(), ...).
+
+  anemoi-inference/anemoi-models API-wise this checkpoint matches aifs2's
+  newer pins (anemoi-inference==0.8.3, anemoi-models==0.9.3) exactly --
+  `select_variables_and_masks`, `runner.device` already a `torch.device`, the
+  newer `_assemble_input`/`_run_mapper`/forward() signatures all present, so
+  none of aifs_model.py's aifs1-compat fallback branches are exercised for
+  this checkpoint. The only real incompatibility found is NOT an API gap but a
+  pickled-object one: this checkpoint's saved model object references
+  `hydra._internal.target_policy` (a hydra-core 1.3.6/1.3.7 security-hardening
+  module for declarative `instantiate()` sandboxing), which the repo's shared
+  `aifs2` conda env (hydra-core==1.3.5) does not have -- `torch.load()` fails
+  with `ModuleNotFoundError`. Every other package in the user's own working
+  inference env (`lwaifs2`, used by this checkpoint's own training-repo
+  inference scripts) is byte-identical to aifs2-requirements.txt. See
+  run_aifs2-1.0deg-v1.0.sh (activates `lwaifs2`, not the shared `aifs2` env)
+  and aifs2-1.0deg-v1.0-requirements.txt/aifs2-1.0deg-v1.0-spec.txt.
+
+#checkpoint: backends/aifs/aifs2-1.0deg-v1.0/aifs-single-mse-2.0-1.0deg-v1.0.ckpt
+checkpoint: backends/aifs/aifs2-1.0deg-v1.0/aifs-single-mse-2.0-1.0deg-v1.0-pretraining.ckpt
+
+date: 2015-01-01T00
+lead_time: 6
+input: opendata
+output:
+  grib:
+    path: /dev/null
+
+patch_metadata:
+  dataset:
+    constant_fields: [z, sdor, slor, lsm]
+
+use_grib_paramid: false
+allow_nans: true

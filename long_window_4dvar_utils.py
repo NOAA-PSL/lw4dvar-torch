@@ -208,6 +208,20 @@ PSOBS_QC_FLAG_MEANINGS = (
     'orography_difference background_gross_check'
 )
 
+# raobs (radiosonde profile) obs-variable name -> model packed-state base
+# name. AIFS and Aurora share this base-name convention ('t'/'u'/'v'/'q' --
+# see this module's docstring); FCN3/ACE2 have not been checked and
+# load_config() rejects raobs_enabled for them until they have been (see
+# RAOBS_SUPPORTED_BACKENDS below). 'specific_humidity' (q) has no
+# reference-repo precedent -- see raobs_parquet.py's module docstring.
+RAOBS_VARIABLE_MODEL_BASE = {
+    'temperature': 't',
+    'u_component_of_wind': 'u',
+    'v_component_of_wind': 'v',
+    'specific_humidity': 'q',
+}
+RAOBS_SUPPORTED_BACKENDS = ('aifs', 'aurora')
+
 
 # ---------------------------------------------------------------------------
 # logging / dates / config
@@ -255,6 +269,93 @@ def _to_utc_datetime(date_str, backend, date_format='%Y-%m-%dT%H'):
     return dt
 
 
+# Nested `exp.observations.psobs.<key>` / `exp.observations.raobs.<key>` ->
+# flat internal `exp[<value>]` key it's resolved into (see
+# `_resolve_observations_config` and config.yml.template). Grouping each
+# observation type's path/QC/error settings together on disk -- `path`
+# included, exactly like `report_types`/`error_std_hpa`/etc. -- mirrors the
+# sibling JAX/NeuralGCM solver's config.yml.template (greg-long-window-4dvar/
+# long-window-4dvar's `observations:` block, where every stream carries its
+# own `path:` with no shared top-level fallback -- see integrate_prepbufr_obs.md
+# "How the reference repo does this") -- but this repo has no fixed-shape/
+# capacity-manifest machinery to canonicalize streams through (PyTorch, not
+# JAX), so there's nothing to gain from threading a second, nested
+# representation through the rest of the solver too: this mapping is applied
+# once, at load time, and everything downstream still reads the flat keys it
+# always has.
+_PSOBS_CONFIG_KEYS = {
+    'path': 'obspath',
+    'nobs_max': 'nobs_max',
+    'prepbufr_classes': 'psobs_prepbufr_classes',
+    'report_types': 'psobs_report_types',
+    'quality_mark_max': 'psobs_quality_mark_max',
+    'time_tolerance_hours': 'psobs_time_tolerance_hours',
+    'use_source_error': 'psobs_use_source_error',
+    'error_std_hpa': 'surface_pressure_error_std_hpa',
+}
+_RAOBS_CONFIG_KEYS = {
+    'path': 'raobs_path',
+    'variables': 'raobs_variables',
+    'prepbufr_classes': 'raobs_prepbufr_classes',
+    'time_tolerance_hours': 'raobs_time_tolerance_hours',
+    'quality_mark_max': 'raobs_quality_mark_max',
+    'pressure_match_tolerance_hpa': 'raobs_pressure_match_tolerance_hpa',
+    'height_min_m': 'raobs_height_min_m',
+    'height_max_m': 'raobs_height_max_m',
+    'below_station_tolerance_m': 'raobs_below_station_tolerance_m',
+    'error_std': 'raobs_error_std',
+    'q_error_fraction': 'raobs_q_error_fraction',
+    'q_error_floor_kg_kg': 'raobs_q_error_floor_kg_kg',
+    'humidity_min_pressure_hpa': 'raobs_humidity_min_pressure_hpa',
+    'station_capacity': 'raobs_station_capacity',
+}
+
+
+def _resolve_observations_config(exp):
+    """Parse `exp['observations']` (`psobs:`/`raobs:` blocks) into the flat
+    `obspath`/`nobs_max`/`psobs_*`/`raobs_*`/`surface_pressure_error_std_hpa`
+    keys the rest of this module reads -- see the module-level key-mapping
+    tables above and config.yml.template.
+
+    `observations.psobs.path` is required (there is no top-level `obspath`
+    fallback -- every stream names its own archive path, same as the
+    reference repo's `observations:` streams). `observations.raobs.path` is
+    optional and defaults to `psobs`'s resolved path, since both normally
+    read the same parquet archive (just different PREPBUFR classes) -- set
+    it explicitly only if raobs ever needs to diverge from psobs.
+
+    Both blocks are optional in the sense that an absent/empty `raobs` block
+    (or `enabled: False`) leaves `raobs_enabled` False, same as before this
+    config was nested.
+    """
+    observations = exp.get('observations', {}) or {}
+    unknown = set(observations) - {'psobs', 'raobs'}
+    if unknown:
+        raise ValueError(f"exp.observations has unknown keys {sorted(unknown)} (expected 'psobs' and/or 'raobs')")
+
+    psobs = observations.get('psobs', {}) or {}
+    unknown_psobs = set(psobs) - set(_PSOBS_CONFIG_KEYS)
+    if unknown_psobs:
+        raise ValueError(f"exp.observations.psobs has unknown keys {sorted(unknown_psobs)}")
+    if 'path' not in psobs:
+        raise ValueError("exp.observations.psobs.path is required (the parquet archive root)")
+    for src_key, dst_key in _PSOBS_CONFIG_KEYS.items():
+        if src_key in psobs:
+            exp[dst_key] = psobs[src_key]
+
+    raobs = observations.get('raobs', {}) or {}
+    unknown_raobs = set(raobs) - set(_RAOBS_CONFIG_KEYS) - {'enabled'}
+    if unknown_raobs:
+        raise ValueError(f"exp.observations.raobs has unknown keys {sorted(unknown_raobs)}")
+    exp['raobs_enabled'] = bool(raobs.get('enabled', False))
+    if exp['raobs_enabled']:
+        for src_key, dst_key in _RAOBS_CONFIG_KEYS.items():
+            if src_key in raobs:
+                exp[dst_key] = raobs[src_key]
+        exp.setdefault('raobs_variables', ['temperature', 'u_component_of_wind', 'v_component_of_wind', 'specific_humidity'])
+        exp.setdefault('raobs_path', exp['obspath'])
+
+
 def load_config(config_path='config.yml'):
     """Loads configuration from a YAML file and returns exp and windows dictionaries."""
     try:
@@ -270,6 +371,7 @@ def load_config(config_path='config.yml'):
     exp = config.get('exp', {})
     windows = config.get('windows', {})
     exp['path_output'] = exp['path_output'] + exp['exp_name'] + '/'
+    _resolve_observations_config(exp)
 
     backend = exp.get('model_backend')
     if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno'):
@@ -366,6 +468,29 @@ def load_config(config_path='config.yml'):
             f"ps_operator='ps_native' is only supported for model_backend 'ace2', got {backend!r} "
             "(it needs decode_state's lowest-native-level t_lowest/q_lowest/p_lowest fields)."
         )
+    # raobs (radiosonde profiles): off by default -- surface-pressure-only
+    # configs are untouched by any of this (see integrate_prepbufr_obs.md).
+    # `_resolve_observations_config` (above) already applied the
+    # `raobs_variables` default and the `raobs_path` fallback to `obspath`;
+    # this just enforces the backend/variable support guard.
+    if exp.get('raobs_enabled', False):
+        if backend not in RAOBS_SUPPORTED_BACKENDS:
+            raise ValueError(
+                f"observations.raobs.enabled is only supported for model_backend in "
+                f"{RAOBS_SUPPORTED_BACKENDS}, got {backend!r} -- the 't'/'u'/'v'/'q' base-name "
+                "forward operator has only been exercised for AIFS/Aurora so far "
+                "(see RAOBS_VARIABLE_MODEL_BASE)."
+            )
+        variables = exp['raobs_variables']
+        unsupported = set(variables) - set(RAOBS_VARIABLE_MODEL_BASE)
+        if unsupported:
+            raise ValueError(
+                f"observations.raobs.variables entries must be a subset of "
+                f"{sorted(RAOBS_VARIABLE_MODEL_BASE)}, got unsupported entries {sorted(unsupported)}"
+            )
+        if not variables:
+            raise ValueError("observations.raobs.variables must be non-empty when observations.raobs.enabled is True")
+        exp['raobs_variables'] = list(variables)
     return exp, windows
 
 
@@ -412,6 +537,7 @@ def log_window(exp, logger):
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
+    logger.info('   raobs_enabled: ' + (str(exp['raobs_variables']) if exp.get('raobs_enabled', False) else '(off, psobs only)'))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
         logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
@@ -776,7 +902,10 @@ def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5):
 
 
 def get_psobs(exp, model, logger, grid_interp):
-    """Read the ps observation files spanning the window.
+    """Read the ps observations spanning the window from the normalized
+    PREPBUFR parquet archive (`exp['obspath']` points at the archive root,
+    e.g. `.../prepbufr_to_parquet/data/prepbufr_parquet/`; see
+    `psobs_parquet.py` and `integrate_prepbufr_obs.md`).
 
     Entirely backend-agnostic (only uses `model.device`/`model.timestep`/
     `grid_interp.weights`). Obs are sampled every `dt_obs` hours (default
@@ -806,22 +935,31 @@ def get_psobs(exp, model, logger, grid_interp):
     psobs_traj = {}
     psobs_datestrings = []
     vdate = copy.copy(date)
-
-    if 'nobs_max' in exp:
-        nobs_max = exp['nobs_max']
-    else:
-        nobs_max = -1
-    nobs_list = []
+    verification_times = []
     for j in range(n_obs):
         yyyymmddhh = get_YYYYMMDDHH(vdate)
         psobs_datestrings.append(yyyymmddhh)
-        psobs_filename = os.path.join(obspath, 'psobs1_%s.txt' % yyyymmddhh)
-        logger.info('reading ' + str(psobs_filename))
-        with open(psobs_filename, 'r') as f:
-            nobs = sum(1 for line in f)
-        if nobs > nobs_max: nobs_max = nobs
-        nobs_list.append(nobs)
+        verification_times.append(vdate)
         vdate = add_hours(vdate, dt_obs)
+
+    from psobs_parquet import load_psobs_parquet
+    time_tolerance_hours = exp.get('psobs_time_tolerance_hours', dt_obs / 2.)
+    parquet_data = load_psobs_parquet(
+        obspath,
+        verification_times,
+        time_tolerance_hours,
+        prepbufr_classes=exp.get('psobs_prepbufr_classes', ('ADPSFC', 'SFCSHP')),
+        report_types=exp.get('psobs_report_types', (180, 181, 187)),
+        quality_mark_max=exp.get('psobs_quality_mark_max', 3),
+        observation_error_std_hpa=exp.get('surface_pressure_error_std_hpa', 1.),
+        use_source_error=exp.get('psobs_use_source_error', False),
+        logger=logger,
+    )
+    nobs_list = [arr.size for arr in parquet_data['ob']]
+    if 'nobs_max' in exp:
+        nobs_max = exp['nobs_max']
+    else:
+        nobs_max = max(nobs_list)
     logger.info('max number of obs at each slot in window:' + str(nobs_max))
 
     for k in ['obtype', 'lon', 'lat', 'elev', 'ob', 'oberr', 'oberr_qc']:
@@ -834,21 +972,22 @@ def get_psobs(exp, model, logger, grid_interp):
     psobs_traj['n_valid'] = torch.as_tensor(nobs_list, dtype=torch.int32, device=device)
 
     for j in range(n_obs):
-        yyyymmddhh = psobs_datestrings[j]
-        psobs_filename = os.path.join(obspath, 'psobs1_%s.txt' % yyyymmddhh)
-        with open(psobs_filename) as f:
-            psobs_data = np.loadtxt((line[8:] for line in f))
-        nobs = psobs_data.shape[0]
-        psobs_traj['obtype'][j, :nobs] = torch.as_tensor(psobs_data[:, 0], device=device)
-        psobs_traj['lon'][j, :nobs] = torch.as_tensor(psobs_data[:, 1], dtype=torch.float32, device=device)
-        psobs_traj['lat'][j, :nobs] = torch.as_tensor(psobs_data[:, 2], dtype=torch.float32, device=device)
-        psobs_traj['elev'][j, :nobs] = torch.as_tensor(psobs_data[:, 3], dtype=torch.float32, device=device)
-        psobs_traj['ob'][j, :nobs] = torch.as_tensor(psobs_data[:, 5], dtype=torch.float32, device=device)
+        nobs = nobs_list[j]
+        if nobs > nobs_max:
+            raise ValueError(
+                'psobs slot '+str(j)+' has '+str(nobs)
+                +' observations, exceeding configured nobs_max '+str(nobs_max)+'.'
+            )
+        psobs_traj['obtype'][j, :nobs] = torch.as_tensor(parquet_data['obtype'][j], device=device)
+        psobs_traj['lon'][j, :nobs] = torch.as_tensor(parquet_data['lon'][j], dtype=torch.float32, device=device)
+        psobs_traj['lat'][j, :nobs] = torch.as_tensor(parquet_data['lat'][j], dtype=torch.float32, device=device)
+        psobs_traj['elev'][j, :nobs] = torch.as_tensor(parquet_data['elev'][j], dtype=torch.float32, device=device)
+        psobs_traj['ob'][j, :nobs] = torch.as_tensor(parquet_data['ob'][j], dtype=torch.float32, device=device)
         tday = j * dt_obs / 24.
         if oberrstart > 0:
             base_err = torch.full((nobs,), float(oberrstart), dtype=torch.float32, device=device)
         else:
-            base_err = torch.as_tensor(psobs_data[:, 7], dtype=torch.float32, device=device)
+            base_err = torch.as_tensor(parquet_data['oberr'][j], dtype=torch.float32, device=device)
         psobs_traj['oberr'][j, :nobs] = base_err + oberrdeltaperday * tday
         # start-of-window error, without the oberrdeltaperday growth -- used by
         # the gross check instead of 'oberr' when qc_fixed_oberr is set
@@ -889,6 +1028,123 @@ def get_psobs(exp, model, logger, grid_interp):
     psobs_traj['interp_wts'] = torch.stack(wts_list, dim=0)
 
     return psobs_traj
+
+
+def get_raobs(exp, model, logger, grid_interp, psobs_traj):
+    """Read radiosonde (ADPUPA) profile observations for the SAME obs-slot
+    grid `get_psobs` already built (`psobs_traj['step_lo']`/`['alpha']`,
+    same `dt_obs`-spaced verification times) -- real ADPUPA launches are
+    synoptic (00/06/12/18Z), matching the slot times `dt_obs` is normally
+    set to anyway, so this piggybacks on psobs's rollout/time-bracketing
+    instead of needing a second one (see `_resolve_loss_interp_specs`,
+    `compute_loss_4dvar`). Returns `None` if `exp['raobs_enabled']` is not
+    True -- callers (`compute_optimal`, `compute_loss_4dvar`,
+    `compute_ps_observation_hx`, `save_trajectory_diagnostics`) all accept
+    `raobs_traj=None` and skip the raobs term entirely, so a config that
+    never sets `raobs_enabled` assimilates surface pressure only, exactly as
+    before.
+
+    Mandatory-level matching (see raobs_parquet.py and integrate_prepbufr_obs.md):
+    each requested variable is matched against the MODEL's own pressure
+    levels for that variable's family (`model.pressure_levels(base)`), so
+    the forward operator is a plain horizontal-interp + level-index gather,
+    no vertical interpolation.
+    """
+    if not exp.get('raobs_enabled', False):
+        return None
+    from raobs_parquet import load_raobs_parquet
+
+    variables = exp['raobs_variables']
+    bases = [RAOBS_VARIABLE_MODEL_BASE[v] for v in variables]
+    levels_hpa = {base: model.pressure_levels(base) for base in bases}
+
+    dt_obs = exp['dt_obs']
+    date = exp['date']
+    vdate = copy.copy(date)
+    verification_times = []
+    for _ in range(len(psobs_traj['step_lo'])):
+        verification_times.append(vdate)
+        vdate = add_hours(vdate, dt_obs)
+
+    time_tolerance_hours = exp.get('raobs_time_tolerance_hours', dt_obs / 2.)
+    data = load_raobs_parquet(
+        exp.get('raobs_path', exp['obspath']),
+        verification_times,
+        time_tolerance_hours,
+        levels_hpa,
+        bases,
+        prepbufr_classes=exp.get('raobs_prepbufr_classes', ('ADPUPA',)),
+        quality_mark_max=exp.get('raobs_quality_mark_max', 3),
+        geopotential_height_min_m=exp.get('raobs_height_min_m', -1000.),
+        geopotential_height_max_m=exp.get('raobs_height_max_m', 60000.),
+        below_station_tolerance_m=exp.get('raobs_below_station_tolerance_m', 100.),
+        pressure_match_tolerance_hpa=exp.get('raobs_pressure_match_tolerance_hpa', 0.05),
+        humidity_min_pressure_hpa=exp.get('raobs_humidity_min_pressure_hpa', 300.),
+        logger=logger,
+    )
+
+    device = model.device
+    n_obs = len(verification_times)
+    station_capacity = [arr.size for arr in data['lat']]
+    capacity = exp.get('raobs_station_capacity', max(station_capacity))
+    if max(station_capacity) > capacity:
+        raise ValueError(
+            f"raobs station count {max(station_capacity)} exceeds configured "
+            f"raobs_station_capacity {capacity}"
+        )
+
+    raobs_traj = {
+        'n_valid': torch.as_tensor(station_capacity, dtype=torch.int32, device=device),
+        'levels_hpa': {base: torch.as_tensor(levels_hpa[base], dtype=torch.float32, device=device) for base in bases},
+    }
+    for name in ('lat', 'lon', 'elev'):
+        padded = torch.zeros((n_obs, capacity), dtype=torch.float32, device=device)
+        for j in range(n_obs):
+            padded[j, :data[name][j].size] = torch.as_tensor(data[name][j], device=device)
+        raobs_traj[name] = padded
+
+    # t/u/v: a fixed absolute error (K, m/s). q: error scales with the
+    # observed value instead -- a flat absolute error makes no physical
+    # sense across q's full range (near-zero in the upper troposphere,
+    # several g/kg at the surface) -- so 'q' is a FRACTION of |observation|
+    # (floored, to avoid a near-zero effective error whenever q itself is
+    # near zero). No reference-repo precedent for any of q's handling here.
+    error_std = exp.get('raobs_error_std', {'t': 1.0, 'u': 2.0, 'v': 2.0})
+    q_error_fraction = exp.get('raobs_q_error_fraction', 0.2)
+    q_error_floor = exp.get('raobs_q_error_floor_kg_kg', 1.e-5)
+
+    for base in bases:
+        n_levels = levels_hpa[base].size
+        values = torch.zeros((n_obs, n_levels, capacity), dtype=torch.float32, device=device)
+        mask = torch.zeros((n_obs, n_levels, capacity), dtype=torch.bool, device=device)
+        for j in range(n_obs):
+            n = data['values_'+base][j].shape[-1]
+            values[j, :, :n] = torch.as_tensor(data['values_'+base][j], device=device)
+            mask[j, :, :n] = torch.as_tensor(data['mask_'+base][j], device=device)
+        raobs_traj['values_'+base] = values
+        raobs_traj['mask_'+base] = mask
+        if base == 'q':
+            raobs_traj['error_q_fraction'] = float(q_error_fraction)
+            raobs_traj['error_q_floor'] = float(q_error_floor)
+        else:
+            raobs_traj['error_'+base] = float(error_std[base])
+
+    # Shared k-NN horizontal interpolation (same mechanism as psobs, same
+    # station locations across every variable in a slot).
+    idx_list, wts_list = [], []
+    lon_np = raobs_traj['lon'].detach().cpu().numpy()
+    lat_np = raobs_traj['lat'].detach().cpu().numpy()
+    for j in range(n_obs):
+        idx, wts = grid_interp.weights(lon_np[j], lat_np[j], k=4, device=device)
+        idx_list.append(idx)
+        wts_list.append(wts)
+    raobs_traj['interp_idx'] = torch.stack(idx_list, dim=0)
+    raobs_traj['interp_wts'] = torch.stack(wts_list, dim=0)
+    raobs_traj['variables'] = bases
+    raobs_traj['n_steps'] = psobs_traj['n_steps']
+    raobs_traj['step_lo'] = psobs_traj['step_lo']
+    raobs_traj['alpha'] = psobs_traj['alpha']
+    return raobs_traj
 
 
 # ---------------------------------------------------------------------------
@@ -1061,6 +1317,44 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
     return innovation, model_equivalent, effective_error, available, used, qc_flag
 
 
+def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, grid_interp, oind):
+    """Evaluate radiosonde H(x) for every configured variable at slot `oind`.
+
+    No vertical interpolation (see get_raobs/raobs_parquet.py's module
+    docstrings): `raobs_traj['values_<base>'][oind]`'s level axis was
+    matched against `model.pressure_levels(base)` AT READ TIME, in the same
+    order `decoded[base]`'s rows are in -- so the forward operator is just
+    horizontal interpolation, no level gather needed.
+
+    Returns `{base: (innovation, model_equivalent, effective_error, used)}`,
+    one entry per `raobs_traj['variables']`. Unlike the ps forward
+    operator, there is no orography/background-gross-error QC here (just
+    read-time QC, already folded into `mask_<base>`) and no elevation-based
+    reduction -- each variable is compared against the model's own native
+    level directly.
+    """
+    idx = raobs_traj['interp_idx'][oind]
+    wts = raobs_traj['interp_wts'][oind]
+    results = {}
+    for base in raobs_traj['variables']:
+        model_obspace = grid_interp.interp(idx, wts, decoded[base])  # (n_levels, capacity)
+        observation = raobs_traj['values_'+base][oind]
+        mask = raobs_traj['mask_'+base][oind]
+        interpolation_failed = ~torch.isfinite(model_obspace)
+        used = mask & ~interpolation_failed
+        safe_model_obspace = torch.where(interpolation_failed, torch.zeros_like(model_obspace), model_obspace)
+        innovation = observation - safe_model_obspace
+        if base == 'q':
+            effective_error = torch.clamp(
+                raobs_traj['error_q_fraction'] * observation.abs(),
+                min=raobs_traj['error_q_floor'],
+            )
+        else:
+            effective_error = torch.full_like(observation, raobs_traj['error_'+base])
+        results[base] = (innovation, safe_model_obspace, effective_error, used)
+    return results
+
+
 def _resolve_loss_interp_specs(model, exp):
     """Which decoded fields must be linearly time-interpolated between the two
     bracketing 6h model states for a sub-6h obs slot.
@@ -1090,6 +1384,11 @@ def _resolve_loss_interp_specs(model, exp):
                 f"required by ps_operator={ps_operator!r}"
             )
     names |= {'z'}
+    # raobs variable bases ('t'/'u'/'v'/'q') need the same time-interpolated
+    # decode -- folded in here rather than a second decode_state call, since
+    # raobs observations share psobs's obs-slot grid (see get_raobs).
+    if exp.get('raobs_enabled', False):
+        names |= {RAOBS_VARIABLE_MODEL_BASE[v] for v in exp['raobs_variables']}
     specs = []
     for base in sorted(names):
         if not model.is_known_variable(base):
@@ -1165,17 +1464,19 @@ def _resolve_control_mask(model, exp, n_vars, device):
 
 @torch.no_grad()
 def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, grid_interp,
-                              interp_specs, step_start=0):
+                              interp_specs, step_start=0, raobs_traj=None):
     """Evaluate a trajectory at every surface-pressure observation slot.
     Post-optimization diagnostics only -- no gradients anywhere here.
 
-    Returns two output grids.
+    Returns two or three output grids.
       - `model_trajectory`: the decoded model state at every 6h step, from
         `step_start` to `n_steps` inclusive (native rollout cadence).
       - `obs_trajectory`: H(x)/QC at every obs slot `j` with
         `step_lo[j] >= step_start`, using the same time-interpolation as the
         loss (`_interp_decoded` over `interp_specs`). Slots earlier than
         `step_start` are omitted -- the caller pads them.
+      - `raobs_trajectory` (only when `raobs_traj` is not None): the same
+        shape of thing, per raobs variable -- see `_record_raobs`.
 
     `step_start`: the 6h-step index `model_state` sits at. 0 for the
     background; `dt_verif // 6` for a latent analysis (valid at
@@ -1200,6 +1501,7 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
 
     diagnostics = {}
     model_outputs = {}
+    raobs_diagnostics = {base: {} for base in raobs_traj['variables']} if raobs_traj is not None else None
 
     def _record_obs(j, decoded_j):
         innovation, model_equivalent, effective_error, available, used, qc_flag = \
@@ -1212,6 +1514,17 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
             'qc_flag': qc_flag,
         }.items():
             diagnostics.setdefault(name, []).append(value.detach().cpu().numpy())
+        if raobs_traj is not None:
+            raobs_results = _compute_raobs_observation_diagnostics_at_time(
+                model, decoded_j, raobs_traj, grid_interp, j
+            )
+            for base, (innovation_r, model_equivalent_r, effective_error_r, used_r) in raobs_results.items():
+                for name, value in {
+                    'model_equivalent': model_equivalent_r,
+                    'effective_error': effective_error_r,
+                    'used': used_r,
+                }.items():
+                    raobs_diagnostics[base].setdefault(name, []).append(value.detach().cpu().numpy())
 
     f_state = model_state
     decoded_prev = model.decode_state(f_state)
@@ -1245,7 +1558,13 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
         name: (np.stack(v, axis=0) if v else np.empty((0, nobs_max)))
         for name, v in diagnostics.items()
     }
-    return obs_trajectory, model_trajectory
+    raobs_trajectory = None
+    if raobs_traj is not None:
+        raobs_trajectory = {
+            base: {name: np.stack(v, axis=0) for name, v in fields.items()}
+            for base, fields in raobs_diagnostics.items()
+        }
+    return obs_trajectory, model_trajectory, raobs_trajectory
 
 
 # ---------------------------------------------------------------------------
@@ -1272,7 +1591,7 @@ def _apply_control_mask(state, keep_mask, ref_state, state_layout):
 
 def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif_ic,
                        psobs_traj, epoch, exp, grid_interp, print_every, interp_specs,
-                       keep_mask=None, ref_state1=None, jc_ref=None):
+                       keep_mask=None, ref_state1=None, jc_ref=None, raobs_traj=None):
     """Latent-space 4D-Var cost function, with sub-6h observations.
 
     `latent_increment` lives in the model's latent space -- AIFS's hidden-
@@ -1313,6 +1632,13 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     window; validate with the usual "does AdamW still monotonically reduce
     the loss" check before trusting a non-default value on a new window
     length.
+
+    `raobs_traj` (from `get_raobs`, present iff `exp['raobs_enabled']` is
+    True): radiosonde temperature/wind/humidity terms, added to `J` the same
+    way as the ps term, using the SAME obs-slot grid/time-interpolated
+    `decoded_j` (see get_raobs's docstring for why no second rollout is
+    needed) -- `None` (the default) assimilates surface pressure only,
+    unchanged from before raobs existed.
 
     `jc_ref` (from `compute_optimal`, present iff `exp['jc_ps_weight']` is
     set): `(field, bg_p_6h, bg_p_12h, weights, factor)` -- the pressure
@@ -1357,6 +1683,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
 
     do_print = print_every > 0 and (epoch % print_every == 0 or epoch == 1)
     Jol = [None] * n_obs
+    Jraobs = [None] * n_obs if raobs_traj is not None else None
 
     def _obs_term(j, decoded_j):
         innovation, model_equivalent, effective_error, available, used, qc_flag = \
@@ -1368,6 +1695,20 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             tag = ' [background, uncorrected]' if (step_lo[j] == 0 and alpha[j] == 0.0) else ''
             print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): J {Jt.item()}, "
                   f"{int(used.sum().item())} obs used (out of {int(psobs_traj['n_valid'][j])}){tag}")
+        return Jt
+
+    def _raobs_term(j, decoded_j):
+        results = _compute_raobs_observation_diagnostics_at_time(model, decoded_j, raobs_traj, grid_interp, j)
+        Jt = 0.
+        counts = {}
+        for base, (innovation, model_equivalent, effective_error, used) in results.items():
+            innov = torch.where(used, innovation, torch.zeros_like(innovation))
+            err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
+            Jt = Jt + ((innov / err) ** 2).sum()
+            counts[base] = int(used.sum().item())
+        if do_print:
+            print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): raobs J {Jt.item() if torch.is_tensor(Jt) else Jt}, "
+                  f"obs used {counts}")
         return Jt
 
     jc_sp = {}
@@ -1398,9 +1739,13 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             else:
                 decoded_j = _interp_decoded(decoded_prev, decoded_cur, a, interp_specs)
             Jol[j] = _obs_term(j, decoded_j)
+            if raobs_traj is not None:
+                Jraobs[j] = _raobs_term(j, decoded_j)
         decoded_prev = decoded_cur
 
     J = sum(Jol)
+    if raobs_traj is not None:
+        J = J + sum(Jraobs)
     if jc_ref is not None:
         jc_field, bg1, bg2, jc_w, jc_factor = jc_ref
         delta = ((jc_sp[2] - bg2) - (jc_sp[1] - bg1)) / 100.0   # hPa
@@ -1416,7 +1761,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     return J, Jol_np
 
 
-def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger):
+def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj=None):
     """Optimize a latent-space increment against the ps obs.
 
     No backend's encoder/decoder is used to produce a corrected t=0
@@ -1574,7 +1919,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # loss surface for the fixed `increment`. No-op for AIFS.
         model._prime_noise()
         optimizer.zero_grad()
-        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref)
+        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, raobs_traj)
 
         if not torch.isfinite(loss):
             logger.warning(f'epoch={epoch}: non-finite loss ({loss.item()}), stopping optimization early')
@@ -1702,15 +2047,16 @@ def _pad_leading(arr, n_lead, fill):
     return np.concatenate([pad, arr], axis=0)
 
 
-def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif_ic, psobs_traj, save_levs, grid_interp, logger):
+def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif_ic, psobs_traj, save_levs, grid_interp, logger, raobs_traj=None):
     interp_specs = _resolve_loss_interp_specs(model, exp)
     timestep_h = int(round(model.timestep.total_seconds() / 3600))
     dt_obs = exp['dt_obs']
     n_obs = int(psobs_traj['n_valid'].shape[0])
     step_lo = psobs_traj['step_lo'].tolist()
 
-    background, initial_traj = compute_ps_observation_hx(
-        model, input_encoded, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=0
+    background, initial_traj, raobs_background = compute_ps_observation_hx(
+        model, input_encoded, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=0,
+        raobs_traj=raobs_traj,
     )
 
     # The latent analysis_state is valid at input_encoded.date + dt_verif
@@ -1721,12 +2067,17 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
     shift_hours = (analysis_state.date - input_encoded.date).total_seconds() / 3600.0
     step_start = int(round(shift_hours / timestep_h))
     j_start = sum(1 for s in step_lo if s < step_start)
-    analysis, final_traj = compute_ps_observation_hx(
-        model, analysis_state, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=step_start
+    analysis, final_traj, raobs_analysis = compute_ps_observation_hx(
+        model, analysis_state, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=step_start,
+        raobs_traj=raobs_traj,
     )
     analysis['model_equivalent'] = _pad_leading(analysis['model_equivalent'], j_start, np.nan)
     analysis['used'] = _pad_leading(analysis['used'], j_start, False)
     analysis['qc_flag'] = _pad_leading(analysis['qc_flag'], j_start, 0)
+    if raobs_traj is not None:
+        for base in raobs_traj['variables']:
+            raobs_analysis[base]['model_equivalent'] = _pad_leading(raobs_analysis[base]['model_equivalent'], j_start, np.nan)
+            raobs_analysis[base]['used'] = _pad_leading(raobs_analysis[base]['used'], j_start, False)
 
     available = background['available'].astype(bool)
     used = background['used'].astype(bool)
@@ -1805,6 +2156,15 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
     ds.to_netcdf(ofile1, encoding=encoding)
     logger.info('saved observation diagnostics: ' + ofile1)
 
+    if raobs_traj is not None:
+        ofile_raobs = (
+            exp['path_output'] + exp['date'] + '_raobs_diagnostics_' + exp['window_name'] + 'h'
+            + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
+        )
+        save_raobs_diagnostics(
+            exp, raobs_traj, raobs_background, raobs_analysis, valid_times, lead_hours, ofile_raobs, logger,
+        )
+
     ofile2 = exp['path_output'] + exp['date'] + '_control_forecast_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
     ofile3 = exp['path_output'] + exp['date'] + '_optimal_forecast_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
     _ = save_xr_trajectory(model, initial_traj, save_levs, ofile2, start_date=str(input_encoded.date))
@@ -1817,6 +2177,75 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
     logger.info('saved final trajectory: ' + ofile3)
 
     return ofile1, ofile2, ofile3
+
+
+_RAOBS_BASE_LONG_NAME = {v: k for k, v in RAOBS_VARIABLE_MODEL_BASE.items()}
+_RAOBS_BASE_UNITS = {'t': 'K', 'u': 'm s-1', 'v': 'm s-1', 'q': 'kg kg-1'}
+
+
+def save_raobs_diagnostics(exp, raobs_traj, background, analysis, valid_times, lead_hours, ofile, logger):
+    """Save per-variable radiosonde O-B/O-A diagnostics, mirroring the ps
+    obs diagnostics netCDF but with an extra per-variable pressure-level
+    dimension (no vertical interpolation -- see get_raobs) and no
+    cross-time station identity (`station_slot` is a plain index, same
+    convention as psobs's `observation_slot`).
+    """
+    dt_obs = exp['dt_obs']
+    n_obs, _, capacity = raobs_traj['values_'+raobs_traj['variables'][0]].shape
+    ds = xarray.Dataset(
+        coords={
+            'time': ('time', valid_times),
+            'station_slot': ('station_slot', np.arange(capacity, dtype=np.int32)),
+            'lead_time_hours': ('time', lead_hours),
+        },
+        attrs={
+            'title': f'4D-Var radiosonde observation diagnostics ({", ".join(raobs_traj["variables"])})',
+            'window_start': str(exp['date']),
+            'window_length_hours': int(exp['n_verif'] * exp['dt_verif']),
+            'dt_obs_hours': int(dt_obs),
+            'innovation_convention': 'observation_minus_model',
+            'forward_operator': 'horizontal interpolation only -- obs matched to model pressure levels at read time, no vertical interpolation',
+            'history': 'Created by long_window_4dvar.py',
+        },
+    )
+    for name in ('lat', 'lon', 'elev'):
+        ds['station_'+name] = (('time', 'station_slot'), raobs_traj[name].detach().cpu().numpy().astype(np.float32))
+
+    for base in raobs_traj['variables']:
+        level_dim = 'level_'+base
+        ds = ds.assign_coords({level_dim: raobs_traj['levels_hpa'][base].detach().cpu().numpy().astype(np.float32)})
+        dims = ('time', level_dim, 'station_slot')
+        long_name = _RAOBS_BASE_LONG_NAME[base]
+        units = _RAOBS_BASE_UNITS[base]
+
+        observation = raobs_traj['values_'+base].detach().cpu().numpy().astype(np.float32)
+        mask = raobs_traj['mask_'+base].detach().cpu().numpy().astype(bool)
+        background_hx = background[base]['model_equivalent'].astype(np.float32)
+        analysis_hx = analysis[base]['model_equivalent'].astype(np.float32)
+        background_used = background[base]['used'].astype(bool)
+        analysis_used = analysis[base]['used'].astype(bool)
+
+        ds[base+'_observation'] = (dims, np.where(mask, observation, np.nan))
+        ds[base+'_observation'].attrs.update({'long_name': long_name+' observation', 'units': units})
+        ds[base+'_background'] = (dims, np.where(mask, background_hx, np.nan))
+        ds[base+'_background'].attrs.update({'long_name': long_name+' background model equivalent H(x_b)', 'units': units})
+        ds[base+'_analysis'] = (dims, np.where(mask, analysis_hx, np.nan))
+        ds[base+'_analysis'].attrs.update({'long_name': long_name+' analysis model equivalent H(x_a)', 'units': units})
+        ds[base+'_omb'] = (dims, np.where(mask, observation - background_hx, np.nan))
+        ds[base+'_omb'].attrs.update({'long_name': long_name+' observation minus background', 'units': units})
+        ds[base+'_oma'] = (dims, np.where(mask, observation - analysis_hx, np.nan))
+        ds[base+'_oma'].attrs.update({'long_name': long_name+' observation minus analysis', 'units': units})
+        ds[base+'_available'] = (dims, mask.astype(np.int8))
+        ds[base+'_available'].attrs.update({'long_name': long_name+' valid source observation after read-time QC', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+        ds[base+'_used'] = (dims, background_used.astype(np.int8))
+        ds[base+'_used'].attrs.update({'long_name': long_name+' observation used in the background loss', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+        ds[base+'_analysis_used'] = (dims, analysis_used.astype(np.int8))
+        ds[base+'_analysis_used'].attrs.update({'long_name': long_name+' observation used when reevaluated at the analysis', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+
+    encoding = {name: {'zlib': True, 'complevel': 2} for name in ds.data_vars}
+    ds.to_netcdf(ofile, encoding=encoding)
+    logger.info('saved raobs diagnostics: ' + ofile)
+    return ofile
 
 
 def save_xr_trajectory(model, model_trajectory, olevels, ofile, save=True, start_date=None):

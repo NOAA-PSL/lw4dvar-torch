@@ -1527,6 +1527,76 @@ a 240-cycle SFNO run the "2015-01-25T00" cycle verified a Jan 13 state (z500
   itself is unrelated to dates, but that run's cycle-2 setup was not what
   it was thought to be.
 
+## A second AIFS checkpoint, `aifs2-1.0deg-v1.0`: own conda env, no code changes (2026-10-02)
+
+User trained AIFS-single-2.0 at 1-degree resolution and asked for it to be
+wired in as a third checkpoint alongside the official 0.25deg AIFS-single-2.0
+and AIFS-single-1.1, reusing the existing `aifs` backend (`model_backend:
+aifs`) -- not a new backend. Full detail (checkpoint identity probing,
+conda-env root-cause, file list) is in `integrate_aifs2-1deg-v1.0_backend.md`;
+summary here since it's a CLAUDE.md-indexed backend-specific change:
+
+- **API-wise this checkpoint is aifs2-generation, not aifs1's** -- confirmed
+  by directly probing it (CPU, `SimpleRunner` then the real
+  `RunConfiguration.load()`/`create_runner()` path `aifs_model.py` itself
+  uses): `select_variables_and_masks` exists, `runner.device` is a real
+  `torch.device`, none of `aifs_model.py`'s 8 aifs1-compat fallback branches
+  are exercised. **No code changes were needed in
+  `aifs_model.py`/`aifs_ic.py`/`aifs_grid.py`** -- only a new anemoi-inference
+  yaml (`backends/aifs/aifs_inference_aifs2-1.0deg-v1.0.yaml`, patterned on
+  v1.1's -- no wave/snow vars, confirmed absent) and a new experiment
+  config/env/launcher, all data, not code.
+- 89 input variables / 76 prognostic, native grid 40320-point O96 (same point
+  count as the official 0.25deg checkpoint's HIDDEN mesh -- this checkpoint's
+  full data grid is roughly that checkpoint's internal encoder-bottleneck
+  resolution). Hidden mesh for this checkpoint: 10944 nodes x 1024 channels,
+  ~3.7x smaller than the official checkpoint's 40320 -- the
+  `latent_scale`/`learn_rate` a 4D-Var config needs is not assumed to
+  transfer and has not been separately tuned.
+- **Needs its own conda env, `lwaifs2`** (not the shared `aifs2` env) --
+  root-caused to a `hydra-core` 1.3.5 (repo's `aifs2` env) vs. 1.3.7 (the
+  user's existing `lwaifs2` env) pin gap: `torch.load`-time unpickling of the
+  checkpoint needs `hydra._internal.target_policy`, a real 1.3.6/1.3.7
+  security-hardening module (sandboxes what `hydra.utils.instantiate`'s
+  `_target_` configs can resolve to/call), absent from 1.3.5 -- not something
+  to stub/shim. Every other pinned package is byte-identical between the two
+  envs. The shared `aifs2` env isn't group-writable by this account, so
+  bumping `hydra-core` there wasn't an option; reused the user's own
+  already-working `lwaifs2` env instead rather than cloning+patching a new
+  one. **This makes CLAUDE.md's "one conda env per backend" rule
+  checkpoint-keyed, not strictly backend-keyed, as a documented partial
+  exception**: two checkpoints of the same `model_backend` can need genuinely
+  different pins.
+- New files follow the existing per-checkpoint/per-env conventions:
+  `run_aifs2-1.0deg-v1.0.sh` (SLURM launcher activating `lwaifs2`),
+  `aifs2-1.0deg-v1.0-requirements.txt`/`-spec.txt` (the `lwaifs2` env's
+  `pip freeze`/`conda list --explicit`), `config_test_aifs2-1.0deg-v1.0.yml`
+  (untuned smoke-test shape, own `ic_cache_aifs2-1.0deg-v1.0/` -- the ERA5
+  GRIB cache is keyed only by date, not checkpoint, so caches are never
+  shared across checkpoints with different grids), and a prefetch launcher on
+  `u1-service` for `aifs_prefetch_ic.py` (unmodified, already generic).
+  Checkpoint file itself is a gitignored symlink to the user's own training
+  output on scratch (not an HF repo, so not submodule-vendored like the other
+  checkpoints).
+- **Known gaps as of 2026-10-02**: no real GPU run yet at the time the
+  conda-env work was done (CPU-only checkpoint load/instantiation verified);
+  `learn_rate`/`latent_scale` carried over untuned from `config_test_aifs1.yml`;
+  whether `hydra-core` 1.3.7's runtime sandboxing (not just load-time) affects
+  anything anemoi-inference relies on was unchecked at the time. **Since then,
+  a real cycled `long_window_4dvar.py` run completed with no hydra-related
+  errors** -- the runtime-sandboxing gap is effectively closed by that
+  evidence, though not yet written back into the dedicated checkpoint doc.
+  Z500 error from that cycled run grows steadily (NH/SH/tropics/global all
+  show the same shape) where the official 0.25deg checkpoint's stays flat --
+  current leading hypotheses are an intrinsic forecast bias/drift in this
+  checkpoint (it runs at the official checkpoint's internal
+  encoder-bottleneck resolution, is missing snow/soil-moisture variables, and
+  is a custom retrain with likely far less training compute than the
+  operational checkpoint) combined with the untuned `learn_rate`/
+  `latent_scale` making the 4D-Var analysis correction too weak to counteract
+  it (background and analysis z500 error track each other almost exactly
+  throughout the cycled run). Not yet root-caused.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle

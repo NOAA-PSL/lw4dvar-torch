@@ -215,13 +215,19 @@ for k in range(exp_config['n_init']):
         # get real ps observations
         logger.info('reading observations...')
         psobs_traj = utils.get_psobs(exp_config, model, logger, grid_interp)
+        # radiosonde (temperature/wind/humidity) profiles -- None unless
+        # exp.raobs_enabled is True, in which case every call below just
+        # assimilates surface pressure, unchanged (see get_raobs).
+        raobs_traj = utils.get_raobs(exp_config, model, logger, grid_interp, psobs_traj)
 
         # call the optimization routine
-        analysis_state, lsave = utils.compute_optimal(exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger)
+        analysis_state, lsave = utils.compute_optimal(
+            exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj,
+        )
         # save initial and final trajectory in model and observation space.
         utils.save_trajectory_diagnostics(
             exp_config, model, input_encoded, analysis_state, verif_ic, psobs_traj,
-            exp_config['save_levs'], grid_interp, logger,
+            exp_config['save_levs'], grid_interp, logger, raobs_traj,
         )
         # print z500 error before and after optimization. The latent
         # analysis_state is always valid at window_start + dt_verif, not

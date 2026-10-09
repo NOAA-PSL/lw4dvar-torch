@@ -1,0 +1,55 @@
+exp:
+  model_backend: aifs
+  nhrs_back: 48
+  restart: True
+  rpath: './output/smoke_test_aifs2-1.0deg-v1.0-pretraining-ps-parquet/'
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      use_source_error: True  # oberrstart: -1 below -- matches the legacy .txt column-7 per-ob error
+    raobs:
+      enabled: False
+  ic_suffix: '120h_100it'
+  sdate: '2015-03-07T12'
+  n_init: 100
+  dt_init: 12
+  save_levs: [1000,850,500,250,50]
+  cycle: True
+  exp_name: 'smoke_test_aifs2-1.0deg-v1.0-pretraining-ps-parquet'
+
+  model_name: 'aifs-single-mse-2.0-1.0deg-v1.0-pretraining.ckpt'
+  path_model: './backends/aifs/aifs2-1.0deg-v1.0/'
+  aifs_config: 'backends/aifs/aifs_inference_aifs2-1.0deg-v1.0.yaml'
+  device: 'cuda'
+  path_output: './output/'
+  # separate from ic_cache/ic_cache_aifs1/ -- this checkpoint's native grid
+  # (O96, 40320 points) and variable set (89 vars, no wave/snow) differ from
+  # both the official 0.25deg AIFS-single-2.0 and AIFS-single-1.1 checkpoints;
+  # the ERA5 GRIB cache is keyed only by date, not by checkpoint (see
+  # integrate_multiple_backends.md's aifs1 "stale-cache gotcha"), so reusing
+  # either existing cache would silently serve the wrong grid/variables.
+  ic_cache: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/ic_cache/ic_cache_aifs2-1.0deg-v1.0/'
+  print_every: 10
+  oberrstart: -1
+  oberrdeltaperday: 0
+  control_variables: [u, v, t, z, q, sp, msl, 2t, 2d, 10u, 10v, tcw]
+  checkpoint_stride: 0
+  reset_skt_ocean: True
+  skt_ocean_lsm_threshold: 0.5
+
+windows:
+  '5':
+    n_verif: 20
+    dt_verif: 6
+    dt_obs: 6
+    learn_rate: 2.0e-3
+    weight_decay: 1.0e-3
+    max_epoch: 100
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 0.1
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''

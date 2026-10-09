@@ -1,9 +1,8 @@
 exp:
-  model_backend: fcn3
-
+  model_backend: aifs
   nhrs_back: 48
   restart: False
-  rpath: './output/<previous_exp_name>/'
+  rpath: './output/smoke_test_aifs2-1.0deg-v1.0-pretraining/'
   observations:
     psobs:
       path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/longWin4DVar/prepbufr_to_parquet/data/prepbufr_parquet'
@@ -13,29 +12,32 @@ exp:
       enabled: False
   ic_suffix: '120h_100it'
   sdate: '2015-01-01T00'
-  n_init: 1
+  n_init: 100
   dt_init: 12
   save_levs: [1000,850,500,250,50]
-  cycle: False
-  exp_name: 'test_fcn3_5d_12h_100it'
+  cycle: True
+  exp_name: 'smoke_test_aifs2-1.0deg-v1.0-pretraining'
 
-  path_model: './backends/fcn3/fourcastnet3/'
+  model_name: 'aifs-single-mse-2.0-1.0deg-v1.0-pretraining.ckpt'
+  path_model: './backends/aifs/aifs2-1.0deg-v1.0/'
+  aifs_config: 'backends/aifs/aifs_inference_aifs2-1.0deg-v1.0.yaml'
   device: 'cuda'
   path_output: './output/'
-  # reuse the original fcstnetv3 repo's already-warmed ERA5 cache -- avoids
-  # needing internet from this (offline) H100 compute node for a smoke test
-  ic_cache: '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-fcstnetv3/ic_cache/'
+  ic_cache: './ic_cache_aifs2-1.0deg-v1.0/'
   print_every: 10
   oberrstart: -1
   oberrdeltaperday: 0
-  control_variables: [u, v, t, z, q, msl, t2m, u10m, v10m, u100m, v100m, tcwv]
-  checkpoint_stride: 1
+  control_variables: [u, v, t, z, q, sp, msl, 2t, 2d, 10u, 10v, tcw]
+  checkpoint_stride: 0
+  reset_skt_ocean: True
+  skt_ocean_lsm_threshold: 0.5
 
 windows:
   '5':
     n_verif: 20
     dt_verif: 6
-    learn_rate: 2.5e-3
+    dt_obs: 6
+    learn_rate: 2.0e-3
     weight_decay: 1.0e-3
     max_epoch: 100
     warmup_steps: 10

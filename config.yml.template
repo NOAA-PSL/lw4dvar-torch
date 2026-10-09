@@ -18,8 +18,96 @@ exp:
   #restart: True # restart from a previous experiment
   restart: False
   rpath: './output/<previous_exp_name>/' # only read if restart: True -- the previous experiment's output dir
-  obspath: './psobs' # path to ps observation text files
-  nobs_max: 15000
+
+  # Each observation type gets its own block here, grouping that type's own
+  # path/QC/error settings together -- mirrors the sibling JAX/NeuralGCM
+  # solver's config.yml.template (greg-long-window-4dvar/long-window-4dvar's
+  # `observations:` block, where every stream names its own `path:` with no
+  # shared top-level fallback -- see integrate_prepbufr_obs.md "How the reference
+  # repo does this"). Unlike that solver, this repo has no fixed-shape/
+  # capacity-manifest machinery to canonicalize streams through (PyTorch
+  # doesn't need JAX's retracing-safe padded arrays), so there is exactly
+  # one implementation per type below, not a pluggable source/stream list.
+  observations:
+    # --- psobs (surface pressure) parquet reader settings ---
+    psobs:
+      # Root of the normalized, cycle-partitioned PREPBUFR parquet archive
+      # (see psobs_parquet.py / integrate_prepbufr_obs.md) -- NOT the old
+      # `psobs1_<YYYYMMDDHH>.txt`-file directory. Expects
+      # `<path>/<YYYY-MM-DD>/<HH>/{reports,levels}/<CLASS>/part-00000.parquet`,
+      # one six-hourly cycle directory per CLASS (e.g. ADPSFC, SFCSHP), as
+      # produced by the `prepbufr_to_parquet` converter. Requires pyarrow in
+      # the run's conda env (not installed in aifs1/aifs2/fcstnet3/aurora/
+      # ace2 by default -- install it into whichever env you actually run
+      # with). Required.
+      path: './psobs_parquet'
+      nobs_max: 15000  # fixed per-slot padding capacity (max obs kept per slot)
+      #time_tolerance_hours: 3.0  # default dt_obs/2 -- max |report_time - slot_time| kept; also widened to resolve which 6h cycle directories are needed
+      #prepbufr_classes: [ADPSFC, SFCSHP]  # PREPBUFR report classes to read
+      # Report types kept, within the classes above. Default (180, 181, 187)
+      # reproduces the legacy `.txt`-file psobs network (confirmed by counting
+      # obtype codes in a full day of /scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs
+      # files) -- the normalized archive also carries 183/281/282/284/287 for
+      # the same two classes, which widens the network if included (see
+      # prepbufr_to_parquet's prepbufr_parquet.md).
+      #report_types: [180, 181, 187]
+      #quality_mark_max: 3  # max accepted PREPBUFR quality mark (source QC)
+      #use_source_error: False  # True: use each report's own pressure_error_mb instead of error_std_hpa
+      #error_std_hpa: 1.0  # assigned ob error when use_source_error is False (or oberrstart <= 0)
+
+    # --- raobs (radiosonde profile) settings -- omit this whole block (the
+    # default) or leave `enabled: False` to assimilate surface pressure
+    # only, unchanged. Only model_backend aifs/aurora are supported so far
+    # (see RAOBS_SUPPORTED_BACKENDS) -- the 't'/'u'/'v'/'q' base-name forward
+    # operator has only been exercised for those two. See integrate_prepbufr_obs.md.
+    raobs:
+      enabled: False
+      # Which variables to assimilate -- any subset of these four; OMIT an
+      # entry (e.g. drop specific_humidity) to turn just that one off without
+      # disabling raobs entirely. Default (if enabled but this key is
+      # omitted): all four, including specific_humidity -- humidity has no
+      # reference-repo precedent (see integrate_prepbufr_obs.md) but is
+      # implemented/QC'd (300 hPa floor) and was exercised together with
+      # t/u/v in the full-pipeline smoke test; omit it explicitly below if
+      # you want the old temperature+u+v-only default back.
+      #variables: [temperature, u_component_of_wind, v_component_of_wind, specific_humidity]
+      #path: same as observations.psobs.path by default -- the same parquet archive, ADPUPA class
+      #prepbufr_classes: [ADPUPA]
+      #time_tolerance_hours: 3.0  # default dt_obs/2, same convention as observations.psobs.time_tolerance_hours
+      #quality_mark_max: 3
+      # Mandatory-level matching tolerance (hPa): an obs level is kept only if
+      # its reported pressure is within this of one of the MODEL's own pressure
+      # levels (model.pressure_levels('t'/'u'/'v'/'q')) -- no vertical
+      # interpolation. 0.05 hPa comfortably separates true mandatory-level
+      # reports (recorded at exact round pressures) from significant levels.
+      #pressure_match_tolerance_hpa: 0.05
+      # Height-based QC (ported from the reference repo's bufr_radiosonde.py,
+      # applied here per matched level): reject levels outside this physical
+      # height range, or below the station's own elevation (by more than the
+      # tolerance), or where height is non-monotonic with pressure.
+      #height_min_m: -1000.
+      #height_max_m: 60000.
+      #below_station_tolerance_m: 100.
+      # Observation-error standard deviations for temperature (K) and wind
+      # components (m/s) -- NOT specific humidity, see below.
+      #error_std: {t: 1.0, u: 2.0, v: 2.0}
+      # Specific humidity has no fixed physical error scale (near zero in the
+      # upper troposphere, several g/kg at the surface) -- its error is a
+      # FRACTION of the observed value instead, floored so it never collapses
+      # to ~0 wherever the observation itself is tiny. No reference-repo
+      # precedent for any of this -- greg-long-window-4dvar never assimilated
+      # moisture at all.
+      #q_error_fraction: 0.2
+      #q_error_floor_kg_kg: 1.e-5
+      # Radiosonde humidity sensors are unreliable above the lower/mid
+      # troposphere -- mask 'q' at any matched level with pressure below this
+      # (set null to disable the floor entirely).
+      #humidity_min_pressure_hpa: 300.
+      # Fixed per-slot station capacity (padding size) -- by default (this key
+      # omitted) sized to the largest slot actually read; set an explicit
+      # integer only if you need a stable shape across configs/runs.
+      #station_capacity: 1000
+
   ic_suffix: '96h_100it' # pkl file info for restart
   sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
   n_init: 24 # number of DA cycles
@@ -88,7 +176,7 @@ exp:
   print_every: 10
   # optionally increase ob error linearly through window to give more weight to
   # loss at beginning of window (crude treatment of model error).
-  oberrstart: 1.0 # ob error at start of window (-1 to use values in obs file)
+  oberrstart: 1.0 # ob error at start of window (-1 to use surface_pressure_error_std_hpa / per-report source error instead)
   oberrdeltaperday: 0.25 # ob error increase (per day) within window.
   # qc_fixed_oberr: gross check (bg_check) uses the START-of-window ob error
   # instead of the grown one, so down-weighting late-window obs via
