@@ -47,6 +47,7 @@ documented in `config.yml.template`.
 | Document | Read it when working on |
 |---|---|
 | `running_at_alcf.md` | running on ALCF Polaris (PBS): building envs there, `run_ace2_polaris.sh`, A100 memory limits, Eagle data paths |
+| `ace2-training.md` | training our own ACE2 checkpoint: building the training dataset from public ARCO-ERA5 (`backends/ace2/ace2_dataset.py`, `run_ace2_dataset_polaris.sh`), CO2, normalization stats, training configs, adding vertical layers for radiances |
 | `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,

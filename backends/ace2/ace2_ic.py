@@ -173,17 +173,26 @@ def _make_source_grid() -> xr.Dataset:
 _REGRIDDER = None
 
 
-def _regrid(ds):
-    """Conservative 0.25 deg -> F90 regrid (vendored `_regrid`, grid fixed)."""
+def make_regridder(weights: str | None = None):
+    """Set (and return) the module's 0.25 deg -> F90 conservative regridder.
+    `weights`: a file written by `make_regridder().to_netcdf(path)`, so
+    worker processes skip the ESMF weight computation."""
     global _REGRIDDER
     import xesmf as xe
 
+    _REGRIDDER = xe.Regridder(_make_source_grid(), _make_target_grid(), "conservative", periodic=True, weights=weights)
+    return _REGRIDDER
+
+
+def _regrid(ds, **regridder_kwargs):
+    """Conservative 0.25 deg -> F90 regrid (vendored `_regrid`, grid fixed).
+    `regridder_kwargs` go to the xESMF call (e.g. skipna=True, na_thres=1.0)."""
     if _REGRIDDER is None:
-        _REGRIDDER = xe.Regridder(_make_source_grid(), _make_target_grid(), "conservative", periodic=True)
+        make_regridder()
     ds = ds.rename({"latitude": "lat", "longitude": "lon"})
     if ds.lat.values[0] > ds.lat.values[-1]:
         ds = ds.sortby("lat")
-    out = _REGRIDDER(ds, keep_attrs=True)
+    out = _REGRIDDER(ds, keep_attrs=True, **regridder_kwargs)
     return out.rename({"lat": "latitude", "lon": "longitude"})
 
 
