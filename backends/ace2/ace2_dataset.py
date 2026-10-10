@@ -35,6 +35,13 @@ Differences from Ai2's datasets, all deliberate:
   xESMF regridding, coarsening at 0.25 deg). A model trained here and
   ACE2-ERA5 see slightly different data (ace2_ic.py quantifies the IC
   differences); recompute normalization statistics from this dataset.
+- PRESsfc and PRESsfc_mean are made valid at HGTsfc: each 0.25-deg ps is
+  reduced hydrostatically to its F90 cell's HGTsfc BEFORE the conservative
+  average (`_presfc_at_hgtsfc`), instead of averaging pressures valid at
+  different heights (biased high over steep terrain, up to ~1.3 hPa). Q2m and
+  Q2m_mean still use the plain average. Files carry the global attribute
+  `presfc_reduced_to_hgtsfc=1`; `--no_reduce_presfc` gives the plain regrid,
+  and `fix_presfc` mode patches months built without it.
 
 Vertical resolution: `--layer_indices` takes the L137 interface indices of the
 coarse layers (default ACE2's 8: 0 48 67 79 90 100 109 119 137); any
@@ -57,6 +64,7 @@ CLI (repo root):
     python backends/ace2/ace2_dataset.py build OUTDIR 1979-01 2022-12 \\
         --co2 OUTDIR/co2.nc --workers 8 [--layer_indices ...] \\
         [--extra_layer_vars specific_humidity ozone_mass_mixing_ratio]
+    python backends/ace2/ace2_dataset.py fix_presfc OUTDIR 1979-01 1988-12 --workers 16
 `build` skips months whose file exists (resumable; files are written to .tmp
 and renamed), so disjoint month ranges can run as separate jobs into one
 OUTDIR.
@@ -459,13 +467,76 @@ def _pressure_levels(ds: xr.Dataset) -> xr.Dataset:
 
 
 # ---------------------------------------------------------------------------
+# Surface pressure at HGTsfc
+# ---------------------------------------------------------------------------
+
+PRESSURE_REDUCTION_VARS = ["surface_pressure", "2m_temperature", "2m_dewpoint_temperature"]
+PRESFC_ATTR = "presfc_reduced_to_hgtsfc"  # global attribute, as in ace2_ic.py's ICs
+
+
+def _load_regrid_pairs(weights: str) -> tuple:
+    """(row, col, S), 0-based, of the 0.25 deg -> F90 conservative regridder's
+    sparse weights: F90 cell row[k] gets S[k] x 0.25-deg cell col[k], both
+    grids flattened (latitude ascending, longitude) as `_regrid` sees them."""
+    with xr.open_dataset(weights) as w:
+        return (w["row"].values.astype(np.int64) - 1, w["col"].values.astype(np.int64) - 1, w["S"].values.astype(np.float64))
+
+
+def _apply_pairs(field: np.ndarray, pairs: tuple, n_out: int) -> np.ndarray:
+    """Conservative regrid of one flattened 0.25-deg field (= `_regrid`)."""
+    row, col, S = pairs
+    return np.bincount(row, S * field[col], minlength=n_out)
+
+
+def _surface_height(f37: xr.Dataset, t64, pairs: tuple, hgtsfc: xr.DataArray) -> np.ndarray:
+    """ERA5 0.25-deg surface height (m), flattened like `_load_regrid_pairs`;
+    raises unless it regrids to HGTsfc (guards the flattening order)."""
+    z = f37["geopotential_at_surface"].sel(time=t64).load().sortby("latitude")
+    h = z.values.astype(np.float64).ravel() / GRAVITY
+    err = np.abs(_apply_pairs(h, pairs, hgtsfc.size) - hgtsfc.values.ravel()).max()
+    if not err < 1.0:
+        raise ValueError(f"0.25-deg surface height regrids to HGTsfc only within {err:.1f} m")
+    return h
+
+
+def _presfc_at_hgtsfc(ds: xr.Dataset, h: np.ndarray, hgtsfc: xr.DataArray, pairs: tuple) -> xr.DataArray:
+    """F90 surface pressure valid at HGTsfc, from the 0.25-deg
+    PRESSURE_REDUCTION_VARS in `ds` (optionally with a leading time dim) and
+    the 0.25-deg surface height `h` (from `_surface_height`).
+
+    The plain conservative regrid averages pressures valid at different
+    heights, and since ps falls off ~exponentially with height that average
+    exceeds the pressure at the cell's mean height (HGTsfc, the same regrid of
+    the ERA5 orography) over steep terrain: measured (1985) ~20 Pa where the
+    sub-grid height std is 100-300 m, ~90 Pa at 300-600 m, ~350 Pa above
+    600 m, 1.3 hPa at most; ~1 Pa over the 89% of the globe below 100 m.
+    Here each 0.25-deg ps is first reduced hydrostatically from its own
+    height to the HGTsfc of each F90 cell it overlaps
+    (`ace2_ic._reduce_surface_pressure`, 6.5 K/km from the 2-m virtual
+    temperature), then averaged with the same weights."""
+    row, col, S = pairs
+    ds = ds[PRESSURE_REDUCTION_VARS].sortby("latitude").transpose(..., "latitude", "longitude")
+    lead_dims = ds["surface_pressure"].dims[:-2]
+    n_fine = ds.sizes["latitude"] * ds.sizes["longitude"]
+    ps, t, dpt = (ds[v].values.astype(np.float64).reshape(-1, n_fine) for v in PRESSURE_REDUCTION_VARS)
+    tv = t * (1.0 + (461.5 / ic.RDGAS - 1.0) * _specific_humidity_from_dewpoint(dpt, ps))
+    h_from, h_to = h[col], hgtsfc.values.astype(np.float64).ravel()[row]
+    out = np.stack(
+        [np.bincount(row, S * ic._reduce_surface_pressure(ps[i, col], tv[i, col], h_from, h_to), minlength=hgtsfc.size) for i in range(ps.shape[0])]
+    )
+    shape = tuple(ds.sizes[d] for d in lead_dims) + hgtsfc.shape
+    coords = {**{d: ds[d] for d in lead_dims if d in ds.coords}, **{d: hgtsfc[d] for d in hgtsfc.dims}}
+    return xr.DataArray(out.reshape(shape), dims=lead_dims + hgtsfc.dims, coords=coords)
+
+
+# ---------------------------------------------------------------------------
 # Per-time-step driver (worker processes)
 # ---------------------------------------------------------------------------
 
 _W: dict = {}
 
 
-def _init_worker(weights: str, invariant_path: str, layer_indices, extra_layer_vars, top_interface_midpoint, check):
+def _init_worker(weights: str, invariant_path: str, layer_indices, extra_layer_vars, top_interface_midpoint, check, reduce_presfc):
     xr.set_options(keep_attrs=True)
     ic.make_regridder(weights)
     ml = xr.open_zarr(URL_MODEL_LEVEL, chunks=None, storage_options=STORAGE_OPTIONS)
@@ -483,7 +554,19 @@ def _init_worker(weights: str, invariant_path: str, layer_indices, extra_layer_v
         families=families,
         invariant=invariant,
         check=check,
+        pairs=_load_regrid_pairs(weights) if reduce_presfc else None,
+        h=None,  # 0.25-deg surface height, read on first use (`_presfc`)
     )
+
+
+def _presfc(ds: xr.Dataset, t64) -> xr.DataArray:
+    """`_presfc_at_hgtsfc` with this worker's weights, HGTsfc and (cached)
+    0.25-deg surface height."""
+    w = _W
+    hgtsfc = w["invariant"]["HGTsfc"]
+    if w["h"] is None:
+        w["h"] = _surface_height(w["f37"], t64, w["pairs"], hgtsfc)
+    return _presfc_at_hgtsfc(ds, w["h"], hgtsfc, w["pairs"])
 
 
 def process_time(t: pd.Timestamp) -> xr.Dataset:
@@ -500,13 +583,23 @@ def process_time(t: pd.Timestamp) -> xr.Dataset:
         return ds
 
     sfc = read(FULL_37_MODEL_LEVEL_SURFACE_VARS, t64)
-    parts = [_model_level(w["ml"], t64, sfc, w["ak"], w["bk"], w["layer_indices"], w["families"], w["check"])]
+    model_level = _model_level(w["ml"], t64, sfc, w["ak"], w["bk"], w["layer_indices"], w["families"], w["check"])
+    # Q2m / Q2m_mean stay computed from the plain regridded ps, consistent
+    # with where DPT2m is valid (as in ace2_ic.py)
+    if w["pairs"] is not None:
+        model_level["PRESsfc"] = _presfc(sfc, t64)
+    parts = [model_level]
     flux = read(FULL_37_MEAN_FLUX_VARS, window)
     if flux.sizes["time"] != 6:
         raise ValueError(f"{when}: expected 6 hourly means, got {flux.sizes['time']}")
     parts.append(_mean_flux(flux.mean("time")))
     del flux
-    parts.append(_surface_mean(read(FULL_37_SURFACE_MEAN_VARS, window)))
+    sfc_hourly = read(FULL_37_SURFACE_MEAN_VARS, window)
+    surface_mean = _surface_mean(sfc_hourly)
+    if w["pairs"] is not None:
+        surface_mean["PRESsfc_mean"] = _presfc(sfc_hourly, t64).mean("time")
+    parts.append(surface_mean)
+    del sfc_hourly
     parts.append(_surface_analysis(read(FULL_37_SURFACE_ANALYSIS_VARS, t64), w["invariant"]))
     parts.append(_pressure_levels(read(FULL_37_PRESSURE_LEVEL_VARS, t64)))
     out = xr.merge([_only_horizontal_coords(p) for p in parts], compat="override")
@@ -582,9 +675,10 @@ def build(args) -> None:
         "extra_layer_vars": " ".join(args.extra_layer_vars),
         "top_interface_midpoint": int(not args.model_top_zero),
         "global_mean_co2_source": os.path.abspath(args.co2),
+        PRESFC_ATTR: int(not args.no_reduce_presfc),
     }
     ctx = mp.get_context("spawn")  # gcsfs/zarr event loops are not fork-safe
-    initargs = (weights, invariant_path, layer_indices, args.extra_layer_vars, not args.model_top_zero, not args.no_check)
+    initargs = (weights, invariant_path, layer_indices, args.extra_layer_vars, not args.model_top_zero, not args.no_check, not args.no_reduce_presfc)
     with ctx.Pool(args.workers, initializer=_init_worker, initargs=initargs) as pool:
         for m in todo:
             times = month_times(m)
@@ -607,6 +701,98 @@ def build(args) -> None:
             ds.to_netcdf(tmp, unlimited_dims=["time"], encoding=enc)
             os.replace(tmp, path)
             logging.info(f"wrote {path}: {len(times)} times in {(_time.time() - t0) / 60:.1f} min")
+
+
+# ---------------------------------------------------------------------------
+# Patch PRESsfc in files built without the reduction
+# ---------------------------------------------------------------------------
+
+
+def _init_fix_worker(weights: str, invariant_path: str, check: bool):
+    xr.set_options(keep_attrs=True)
+    with xr.open_dataset(invariant_path) as inv:
+        invariant = inv.load()
+    _W.update(
+        f37=xr.open_zarr(URL_FULL_37, chunks=None, storage_options=STORAGE_OPTIONS),
+        invariant=invariant,
+        check=check,
+        pairs=_load_regrid_pairs(weights),
+        h=None,
+    )
+
+
+def _fix_presfc_time(t: pd.Timestamp) -> tuple:
+    """(plain PRESsfc, plain PRESsfc_mean, PRESsfc, PRESsfc_mean) at output
+    time `t` as F90 float64 arrays; "plain" = no reduction, i.e. what `build`
+    wrote before it (used to check the file being patched)."""
+    w = _W
+    when, t64 = f"{t:%Y-%m-%dT%H}", np.datetime64(t, "ns")
+    window = slice(np.datetime64(t - pd.Timedelta(hours=5), "ns"), t64)
+    sfc = w["f37"][PRESSURE_REDUCTION_VARS].sel(time=t64).load()
+    hourly = w["f37"][PRESSURE_REDUCTION_VARS].sel(time=window).load()
+    if w["check"]:
+        _check_data_validity(sfc, when)
+        _check_data_validity(hourly, when)
+    if hourly.sizes["time"] != 6:
+        raise ValueError(f"{when}: expected 6 hourly values, got {hourly.sizes['time']}")
+    hgtsfc = w["invariant"]["HGTsfc"]
+
+    def plain(ps):
+        ps = ps.sortby("latitude").transpose(..., "latitude", "longitude").values.astype(np.float64)
+        flat = ps.reshape(-1, ps.shape[-2] * ps.shape[-1])
+        return np.stack([_apply_pairs(f, w["pairs"], hgtsfc.size) for f in flat]).reshape(-1, *hgtsfc.shape)
+
+    return (
+        plain(sfc["surface_pressure"])[0],
+        plain(hourly["surface_pressure"]).mean(0),
+        _presfc(sfc, t64).values,
+        _presfc(hourly, t64).mean("time").values,
+    )
+
+
+def fix_presfc(args) -> None:
+    """Rewrite PRESsfc and PRESsfc_mean in place, reduced to HGTsfc
+    (`_presfc_at_hgtsfc`), in the monthly files of OUTDIR built without the
+    reduction (global attribute PRESFC_ATTR absent or 0); all other fields are
+    untouched. Each month is first checked against a recomputation of the
+    plain regrid (< 1 Pa) so that a file whose times or grid don't match is
+    never patched. Reads only the 3 surface fields per hour (~1/30 of
+    `build`'s reads). Files are found by name only once complete (`build`
+    writes .tmp and renames), so this can run beside a `build` job."""
+    import netCDF4
+
+    weights = os.path.join(args.outdir, "regrid_weights_0p25deg_to_F90.nc")
+    invariant_path = os.path.join(args.outdir, "invariant.nc")
+    todo = []
+    for m in pd.date_range(pd.Timestamp(args.start), pd.Timestamp(args.end), freq="MS"):
+        path = os.path.join(args.outdir, f"{m:%Y%m%d%H}.nc")
+        if not os.path.exists(path):
+            continue
+        with xr.open_dataset(path) as ds:
+            if int(ds.attrs.get(PRESFC_ATTR, 0)):
+                continue
+            todo.append((path, pd.DatetimeIndex(ds.time.values)))
+    logging.info(f"{len(todo)} months to patch in {args.outdir}")
+    if not todo:
+        return
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(args.workers, initializer=_init_fix_worker, initargs=(weights, invariant_path, not args.no_check)) as pool:
+        for path, times in todo:
+            t0 = _time.time()
+            plain, plain_mean, new, new_mean = (np.stack(a) for a in zip(*pool.imap(_fix_presfc_time, times)))
+            with xr.open_dataset(path) as ds:
+                err = max(np.abs(ds["PRESsfc"].values - plain).max(), np.abs(ds["PRESsfc_mean"].values - plain_mean).max())
+            if not err < 1.0:
+                raise ValueError(f"{path}: plain PRESsfc recomputed differs from the file by {err:.2f} Pa; not patching")
+            with netCDF4.Dataset(path, "r+") as nc:
+                nc["PRESsfc"][:] = new.astype(np.float32)
+                nc["PRESsfc_mean"][:] = new_mean.astype(np.float32)
+                nc.setncattr(PRESFC_ATTR, 1)
+            d = new - plain
+            logging.info(
+                f"patched {path}: {len(times)} times in {(_time.time() - t0) / 60:.1f} min "
+                f"(check {err:.3f} Pa; change mean {d.mean():.1f}, min {d.min():.0f}, max {d.max():.0f} Pa)"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +833,14 @@ if __name__ == "__main__":
     b.add_argument("--model_top_zero", action="store_true", help="model top 0 Pa (ACE2-ERA5) instead of ~1 Pa (upstream, default)")
     b.add_argument("--complevel", type=int, default=0, help="zlib level for time-varying fields (0: uncompressed, like Ai2's)")
     b.add_argument("--no_check", action="store_true", help="skip the NaN checks on the ARCO inputs")
+    b.add_argument("--no_reduce_presfc", action="store_true", help="plain regrid of PRESsfc(_mean), not reduced to HGTsfc (pre-2026-10-10 files)")
     b.add_argument("--overwrite", action="store_true")
+    f = sub.add_parser("fix_presfc", help="reduce PRESsfc(_mean) to HGTsfc in place in months built without it")
+    f.add_argument("outdir")
+    f.add_argument("start", help="first month, YYYY-MM")
+    f.add_argument("end", help="last month, YYYY-MM (inclusive)")
+    f.add_argument("--workers", type=int, default=4)
+    f.add_argument("--no_check", action="store_true", help="skip the NaN checks on the ARCO inputs")
     c = sub.add_parser("co2", help="extract ACE2-ERA5's global_mean_co2 from the HF forcing files")
     c.add_argument("path")
     c.add_argument("first_year", type=int)
@@ -655,5 +848,7 @@ if __name__ == "__main__":
     args = p.parse_args()
     if args.mode == "co2":
         fetch_co2(args.path, args.first_year, args.last_year)
+    elif args.mode == "fix_presfc":
+        fix_presfc(args)
     else:
         build(args)

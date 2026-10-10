@@ -66,6 +66,29 @@ vendored helpers.
   equals coarsening the sum), and dp is built one coarse layer at a time:
   one 3D float32 field in memory at a time, ~2.2 GB peak per time step
   (first version: ~10 GB).
+- **PRESsfc valid at HGTsfc (2026-10-10).** HGTsfc is the conservative
+  regrid of ERA5's orography, the same regrid as PRESsfc -- so `ace2_ic.py`'s
+  reduction (from that regridded orography to Ai2's HGTsfc) would be a no-op
+  here. The real inconsistency is sub-grid: the plain regrid averages
+  pressures valid at different heights, and since ps falls off ~exponentially
+  with height that average exceeds ps at the cell-mean height. Now each
+  0.25-deg ps is reduced to its F90 cell's HGTsfc *before* averaging
+  (`_presfc_at_hgtsfc`; `ace2_ic._reduce_surface_pressure`, 6.5 K/km from the
+  2-m virtual temperature), for PRESsfc and each hour of PRESsfc_mean. Effect
+  (1985-01-01T00 and 1985-07-01T12): global mean -6 Pa, rms 31-35 Pa; by
+  sub-grid height std: <100 m (89% of the globe) ~1 Pa, 100-300 m -19 Pa
+  mean, 300-600 m -90 Pa, >600 m (Andes, Himalaya, Antarctic margin) -320
+  to -370 Pa, extremes -1.2 to -1.3 hPa. Q2m/Q2m_mean still use the plain
+  average (as `ace2_ic.py` does, where DPT2m is valid). Files carry
+  `presfc_reduced_to_hgtsfc=1`; `build --no_reduce_presfc` restores the
+  plain regrid. Validated: a full `process_time` changes only PRESsfc and
+  PRESsfc_mean vs a file built before (other 153 fields bit-identical).
+- **`fix_presfc` mode** patches PRESsfc/PRESsfc_mean in place in months
+  built before 2026-10-10 (no attribute): reads only surface ps/T2m/Td2m
+  (~2 s/time/worker), first checks its plain-regrid recomputation against
+  the file (< 1 Pa, measured 0.018) and refuses otherwise; idempotent
+  (skips months with the attribute). Validated on a 3-time copy of 1985-01:
+  patched = direct computation exactly, nothing else changed.
 
 ## Validation (2026-10-09, 2020-01-01T00, 8 layers, model top 0 Pa)
 
@@ -109,6 +132,35 @@ HGTsfc, not the HF forcing files.
 from `ace2ic-spec.txt` (`module use /soft/modulefiles; module load conda;
 conda create --name ace2ic --file ace2ic-spec.txt`).
 
+On Ursa (NOAA RDHPCS) the existing `ace2ic` env
+(`/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2ic`, same package versions
+as the spec) runs `ace2_dataset.py build` unchanged; `co2` mode runs in the
+`ace2` env there too (`ace2ic` lacks `h5netcdf`). No new env was needed.
+
+## Ursa (2026-10-10)
+
+- Ursa compute nodes have no internet; the `u1-service` partition
+  (ufe05-14: 384 CPUs, 755 GB; 1 node, 24 h per job) reaches GCS directly,
+  no proxy. Launcher: `run_ace2_dataset_ursa.sh` (account `gsienkf`, 32 CPUs,
+  128 GB, WORKERS=16 default).
+- Default OUTDIR `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`;
+  `co2.nc` (1940-2022) built there on a login node in 3.4 min.
+- One-month test (job 23427483, 2020-01, 16 workers): exit 0, 124 times in
+  10.7 min, **~4-5 s/time steady** (vs ~20 s on Polaris -- ~4x faster),
+  ~30 GB RSS total (~1.9 GB/worker). 5.0 GB/month with the 13+1 pressure
+  levels (184 vars, 156 time-varying). At this rate 1979-2022 (~64k times)
+  is ~80 h on one node, i.e. ~4 concurrent 24-h jobs over disjoint ranges
+  (e.g. one decade each) finish in about a day, if u1-service throughput
+  scales -- not yet tested, nor WORKERS>16.
+- Checked 2020-01-01T00 vs `ic_cache_ace2/ace2_ic_2020010100.nc`: layer
+  T/total water/u (layers 1-7), TMP2m, Q2m, surface_temperature
+  bit-identical; air_temperature_0 0.008 K rms (model top ~1 Pa here vs
+  0 Pa in the IC cache); PRESsfc 412 Pa rms because the IC cache reduces
+  PRESsfc to Ai2's HGTsfc and the dataset does not (by design; this check
+  predates the dataset's own reduction to HGTsfc, below). No
+  non-finite values except `sea_surface_temperature` over land (NaN by
+  design; `merged_sea_surface_and_skin_temperature` fills it).
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -125,9 +177,15 @@ over 1990-2019 in their ERA5 stats config.
 python backends/ace2/ace2_dataset.py co2 $OUTDIR/co2.nc 1940 2022
 # compute node(s)
 qsub -v START=1979-01,END=1989-12 run_ace2_dataset_polaris.sh
+# Ursa: u1-service partition
+sbatch --export=ALL,START=1979-01,END=1989-12 run_ace2_dataset_ursa.sh
+# Ursa: patch PRESsfc in months built before 2026-10-10 (own log files)
+sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
+    --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_ursa.sh
 ```
-Default OUTDIR `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_8layer`
-(co2.nc staged there).
+Default OUTDIR on Polaris `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_8layer`,
+on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
+(co2.nc staged in both).
 
 ## Status / next steps
 
@@ -146,7 +204,12 @@ Default OUTDIR `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg
       16 workers, THREADS=1, 21:35: 42 (7731860, killed).
       Confounded by time of day (shared proxy/network load?) -- baseline
       rerun (16 workers, default threads) as job 7731906 to separate them.
-- [ ] Full 8-layer build.
+- [ ] Full 8-layer build, Ursa (2026-10-10): job 23429181 (1979-1988,
+      running; 1979-1985 done by 15:20, ~10 min/month) built WITHOUT the
+      PRESsfc reduction; queued 23431267 (1989-1998) and 23431519
+      (1999-2008) will import the new code and build with it. Patch job
+      23465227 (`fix_presfc` 1979-1988, after 23429181 ends) brings the
+      first decade in line. 2009-2022 not yet submitted.
 - [ ] Normalization stats (centering, scaling-full-field, scaling-residual,
       time-mean; cf. `../ace/scripts/data_process/get_stats.py`). Upstream
       takes PLAIN (not area-weighted) mean/std over (time, lat, lon);
