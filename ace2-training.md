@@ -137,6 +137,21 @@ On Ursa (NOAA RDHPCS) the existing `ace2ic` env
 as the spec) runs `ace2_dataset.py build` unchanged; `co2` mode runs in the
 `ace2` env there too (`ace2ic` lacks `h5netcdf`). No new env was needed.
 
+On Hercules (MSU) `ace2ic` was built 2026-10-10 at
+`/work2/noaa/gsienkf/whitaker/conda/envs/ace2ic` from `ace2ic-spec.txt`
+plus `h5netcdf` (conda-forge), so `co2` mode runs in it too. Login nodes
+have direct internet. Activate it (or set
+`ESMFMKFILE=$ENV/lib/esmf.mk`) before running: a stale `ESMFMKFILE` from
+another conda install gives ESMPy's "ESMF installation version ... differs"
+error. `run_ace2_dataset_hercules.sh` runs on the `service` partition
+(hercules-dtn-[1-4], internet verified 2026-10-10); it exports ESMFMKFILE
+itself because the `.bashrc` conda init re-activates base on the node.
+The default `batch` QOS caps jobs at 8 h. Measured (1979-01, 16 workers,
+8 layers): ~5 s/time, 10.1 min/month, 38 GB peak RSS, 5.0 GB/month output
+(~2.6 TB for 1979-2022) -- unchanged with 4 jobs on 4 DTN nodes at once.
+1979-2022 was submitted as 22 two-year jobs in 4 `--dependency=singleton`
+chains (`-J ace2ds_chain<N>`) into `/work2/noaa/gsienkf/whitaker/ace2-training`.
+
 ## Ursa (2026-10-10)
 
 - Ursa compute nodes have no internet; the `u1-service` partition
