@@ -205,7 +205,12 @@ series, and logs per-variable min/max/non-finite counts.
   250.9) -- consistent with the pipeline differences above.
 - ERA5 oddities, not pipeline bugs: specific_total_water_1 max 4.9 g/kg and a
   residual std above its full std (the checkpoint's stats show the same);
-  negative Q100/Q150 (min ~ -1e-4).
+  negative Q100/Q150 (min ~ -1e-4); and one bad-wind event, the only one in
+  1979-2022 with |VGRD10m| or |VGRD1000| > 60 m/s at 1 deg: 2004-07-11T18 at
+  40.4N 87.5E (Tarim Basin), VGRD10m 115.6 / VGRD1000 119.4 m/s (-0.9 and
+  -0.3 m/s 6 h before/after). It is in ARCO-ERA5 itself (0.25 deg: 10-m v
+  154 m/s, 30 points > 50 m/s; 73 m/s at 19Z, < 3 m/s at 17Z; u and ps
+  normal), so Ai2's data has it too. Left in; negligible for the stats.
 
 ## Cost estimates
 
