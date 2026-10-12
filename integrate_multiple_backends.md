@@ -1795,6 +1795,50 @@ import error) was only the tip: the API is multi-dataset throughout.
   reads; `aifs_prefetch_ic.py` in his `lwaifs2` env + aifs2-1.0deg-v1.0
   checkpoint writes the same O96 files).
 
+## AIFS dry-air mass fixer (`dry_mass_fixer`, 2026-10-12)
+
+**Why.** Cycled 1-degree AIFS runs drift: the 24-h z500 analysis error grows
+about +2.7 m/30d for Bo's single-rollout aifs2-1.0deg-v1.0 checkpoint and
++5.0 m/30d for Sergey's single-time-level aifs2-1deg-ic1 (Jan-Apr 2015),
+while ACE2 stays level. Diagnosing Bo's run (717 cycles, Jan-Jun 2015) gave:
+- The global-mean dry surface pressure `sp - g*tcw` of the analyses fell
+  almost linearly by 522 Pa (about -85 Pa/30d, -0.7 Pa per cycle). ACE2,
+  which has a dry-air fixer, held it to 0.07 Pa. The water load g*tcw
+  behaved like ACE2's (+38 vs +30 Pa, seasonal), and integrating q on
+  pressure levels instead of tcw gives the same loss (-531 Pa).
+- `sp` itself drifted low against ERA5 everywhere: -507 Pa global by late
+  June, -932 Pa over Antarctica, -1434 Pa above 1500 m. ERA5's own dry
+  pressure stayed at 983.17-983.20 hPa.
+- But the surface-pressure O-B stayed unbiased (within +-0.1 hPa all run, rms
+  1.1-1.3 hPa, about 93% used). The default `ps_operator: 'logpinterp'` uses
+  only the pressure-level geopotential, never `sp`, so in AIFS (where `sp` and
+  `z` are separate outputs) `sp` is unobserved and free to drift. ACE2's `z`
+  is derived hydrostatically from PRESsfc, so its ps is observed.
+- The z500 global-mean bias trended +1.6 m/30d (+8 m by June), not the -7.3
+  m/30d a real mass loss would imply hydrostatically, and is small next to the
+  rms growth (about 9 to 28 m). So the `sp` drift is not what moves z500. Whether
+  feeding the drifting `sp` back in as an input degrades the forecasts is
+  what this fixer tests.
+
+**What it does.** `dry_mass_fixer: true` switches it on; `dry_mass_target_hpa`
+sets the target (default 983.2 hPa, ERA5 Jan-Mar 2015, the same on the
+1-degree O96 and 0.25-degree N320 grids). After every
+forecast step, in `_advance_one_step` (both `AIFSModel` and `AIFS3Model`;
+covers background, analysis and the increment-carrying step),
+`AIFSModel._fix_dry_mass` shifts `sp` uniformly so the area-weighted global
+mean of `sp - g*tcw` equals the target, like ACE2's additive fixer; `tcw` is
+unchanged. The shift is affine, so gradients pass through, with the
+global-mean `sp` component projected out. `load_config` rejects it for other
+backends; `log_window` logs the target.
+
+**Smoke test** (branch `AIFS-drymassfixer`, 2 cycles x 5 iterations from
+2015-01-01, the production configs otherwise): every saved state of both
+checkpoints holds 983.2000 +- 0.0001 hPa. The loss decreases normally, and
+first-cycle Jtot is comparable to the unfixed runs (Bo 284829 vs 285674,
+Sergey 299671 vs 293925). Not yet run: a multi-week cycling comparison with
+the unfixed runs. Alternatives not tried: `ps_operator: 'ps'` (observes `sp`
+directly, region by region) and `jc_ps_weight`.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle

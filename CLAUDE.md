@@ -55,7 +55,7 @@ documented in `config.yml.template`.
 
 | Document | Read it when working on |
 |---|---|
-| `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics |
+| `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), the AIFS dry-air mass fixer (`dry_mass_fixer`), area weights, the z500 diagnostics |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.

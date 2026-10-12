@@ -336,6 +336,8 @@ def load_config(config_path='config.yml'):
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
     if float(exp.get('obs_density_box_deg', 0.0)) < 0:
         raise ValueError(f"obs_density_box_deg must be >= 0 (degrees; 0 = off), got {exp['obs_density_box_deg']!r}")
+    if _dry_mass_fixer_hpa(exp) is not None and backend != 'aifs':
+        raise ValueError(f"dry_mass_fixer is only implemented for model_backend 'aifs', got {backend!r}")
     # More than one DA cycle requires cycle: True. With cycle: False the driver
     # never advances the previous analysis (valid at window_start + dt_verif)
     # to the next cycle time -- it falls through to the next-window-in-the-
@@ -420,6 +422,9 @@ def log_window(exp, logger):
                                         if exp.get('jc_ps_weight') else '(off)'))
     logger.info('   obs_density_box_deg: ' + (str(exp['obs_density_box_deg']) + ' (area-weighted Jo)'
                                                if exp.get('obs_density_box_deg') else '(off)'))
+    if exp['model_backend'] == 'aifs':
+        pdry = _dry_mass_fixer_hpa(exp)
+        logger.info('   dry_mass_fixer: ' + (f'{pdry} hPa (global-mean sp - g*tcw)' if pdry is not None else '(off)'))
     logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
@@ -443,6 +448,24 @@ def log_window(exp, logger):
 # model / grid
 # ---------------------------------------------------------------------------
 
+DEFAULT_DRY_MASS_TARGET_HPA = 983.2  # ERA5 global-mean sp - g*tcw, Jan-Mar 2015, 1-deg and 0.25-deg grids
+
+
+def _dry_mass_fixer_hpa(exp):
+    """The dry-mass fixer's target in hPa, or None when off: `dry_mass_fixer`
+    (true/false, default false) switches it on, `dry_mass_target_hpa` sets the
+    global-mean dry surface pressure (default DEFAULT_DRY_MASS_TARGET_HPA)."""
+    on = exp.get('dry_mass_fixer', False)
+    if not isinstance(on, bool):
+        raise ValueError(f"dry_mass_fixer must be true or false (set the value with dry_mass_target_hpa), got {on!r}")
+    if not on:
+        return None
+    pdry = float(exp.get('dry_mass_target_hpa', DEFAULT_DRY_MASS_TARGET_HPA))
+    if not 900.0 <= pdry <= 1050.0:
+        raise ValueError(f"dry_mass_target_hpa must be a dry surface pressure in hPa (~983), got {pdry!r}")
+    return pdry
+
+
 def get_model(exp):
     backend = exp['model_backend']
     if backend == 'aifs':
@@ -458,13 +481,15 @@ def get_model(exp):
         else:
             import aifs_model
             model_class = aifs_model.AIFSModel
-        return model_class(
+        model = model_class(
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
             autocast_dtype=_autocast_torch_dtype(exp, 'aifs'),
             compile_wrapper=exp.get('compile_wrapper', False),
         )
+        model.set_dry_mass_fixer(_dry_mass_fixer_hpa(exp))
+        return model
     elif backend == 'fcn3':
         _ensure_backend_on_path('fcn3')
         import fcn3_model

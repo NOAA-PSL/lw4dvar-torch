@@ -159,6 +159,7 @@ class AIFS3Model(AIFSModel):
             y_pred = self._predict_step_with_grad(state)
         else:
             y_pred = self._predict_step_with_grad_latent(state, latent_increment)
+        y_pred = self._fix_dry_mass(y_pred)
 
         check = self._reset.copy()
         # TensorHandler writes into its input in place; clone so the previous

@@ -131,6 +131,17 @@ exp:
   # check; QC itself is unchanged. Ported from the JAX ensemble branch, where
   # 10 degrees cut 60-cycle z500 RMSE ~7% (SH ~10%). 0 / unset = off.
   #obs_density_box_deg: 10.
+  # dry_mass_fixer (AIFS only, true/false, default false): after every
+  # forecast step, shift sp uniformly so the area-weighted global mean of
+  # sp - g*tcw (dry surface pressure) equals dry_mass_target_hpa, as ACE2's
+  # own dry-air fixer does. Under the default ps_operator 'logpinterp' the obs
+  # never see sp, and in the cycled 1-degree aifs2 run (Jan-Jun 2015) it
+  # drifted 5 hPa low vs ERA5 while the ps O-B stayed unbiased.
+  #dry_mass_fixer: true
+  # dry_mass_target_hpa: the fixer's global-mean dry surface pressure (hPa).
+  # Default 983.2, estimated from ERA5 for Jan-Mar 2015 (983.17-983.20 hPa on
+  # both the 1-degree O96 and 0.25-degree N320 AIFS grids).
+  #dry_mass_target_hpa: 983.2
 
   # The 4D-Var control variable is a one-time latent-space increment
   # injected at the first rollout step -- NOT a physical-space

@@ -57,6 +57,8 @@ except ImportError:
 
 import forecast_model
 
+GRAVITY = 9.80665  # m/s**2
+
 
 def _select_variables_and_masks(checkpoint, include):
     """`checkpoint.select_variables_and_masks(include=[...])` (aifs2's pin,
@@ -541,6 +543,50 @@ class AIFSModel(forecast_model.LatentForecastModel):
         return (int(n_hidden), int(m.num_channels))
 
     # ------------------------------------------------------------------
+    # Dry-air mass fixer
+    # ------------------------------------------------------------------
+
+    _dry_mass_target = None  # Pa; None = fixer off (set_dry_mass_fixer)
+
+    def set_dry_mass_fixer(self, pdry_hpa: Optional[float]) -> None:
+        """Hold the global-mean dry surface pressure `sp - g*tcw` of every
+        forecast step's output at `pdry_hpa` (hPa), or switch the fixer off
+        (`None`). ERA5's value is 983.2 hPa (983.17-983.20 hPa, Jan-Mar 2015,
+        on both the 1-degree O96 and the 0.25-degree N320 grids).
+
+        Why: with the default `ps_operator: 'logpinterp'` the ps observations
+        only see the pressure-level geopotential, never `sp`, so `sp` is
+        unconstrained in cycling. In the cycled 1-degree aifs2 run (Jan-Jun
+        2015) it drifted 5 hPa low vs ERA5 (14 hPa above 1500 m) while the
+        ps O-B stayed unbiased. Like ACE2's own fixer, the correction is a
+        uniform additive shift of `sp` (tcw is left alone); it is affine, so
+        gradients flow through it unchanged except that the global-mean `sp`
+        component is projected out."""
+        if pdry_hpa is None:
+            self._dry_mass_target = None
+            return
+        out_idx = {name: i for i, name in self.idx_to_var.items()}
+        missing = [n for n in ("sp", "tcw") if n not in out_idx]
+        if missing:
+            raise ValueError(f"dry-mass fixer needs output variables {missing}, not in this checkpoint")
+        self._sp_out, self._tcw_out = out_idx["sp"], out_idx["tcw"]
+        w = torch.as_tensor(self.area_weights, dtype=torch.float32, device=self.device)
+        self._dry_mass_weights = w / w.sum()
+        self._dry_mass_target = 100.0 * float(pdry_hpa)
+
+    def _fix_dry_mass(self, y: torch.Tensor) -> torch.Tensor:
+        """Shift `sp` in a step's post-processed output `y` (variables last,
+        grid points second to last) so its area-weighted global-mean dry
+        pressure equals the target; identity when the fixer is off."""
+        if self._dry_mass_target is None:
+            return y
+        sp = y[..., self._sp_out]
+        pdry = ((sp - GRAVITY * y[..., self._tcw_out]) * self._dry_mass_weights).sum(dim=-1, keepdim=True)
+        y = y.clone()
+        y[..., self._sp_out] = sp + (self._dry_mass_target - pdry)
+        return y
+
+    # ------------------------------------------------------------------
     # Differentiable rollout
     # ------------------------------------------------------------------
 
@@ -639,6 +685,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
             y_pred = self._predict_step_with_grad(state)
         else:
             y_pred = self._predict_step_with_grad_latent(state, latent_increment)
+        y_pred = self._fix_dry_mass(y_pred)
 
         check = self._reset.copy()
         new_state = self.runner.copy_prognostic_fields_to_input_tensor(state, y_pred, check)
