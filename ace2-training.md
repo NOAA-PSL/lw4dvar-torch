@@ -176,6 +176,37 @@ chains (`-J ace2ds_chain<N>`) into `/work2/noaa/gsienkf/whitaker/ace2-training`.
   non-finite values except `sea_surface_temperature` over land (NaN by
   design; `merged_sea_surface_and_skin_temperature` fills it).
 
+## Normalization statistics (2026-10-12)
+
+`ace2_dataset.py stats OUTDIR STATSDIR [1990-01 2019-12]` (Polaris:
+`qsub -q debug -l walltime=01:00:00 -o ace2_stats.out -e ace2_stats.err -v
+MODE=stats run_ace2_dataset_polaris.sh`) writes `centering.nc`,
+`scaling-full-field.nc`, `scaling-residual.nc`, `time-mean.nc` as upstream's
+`scripts/data_process/get_stats.py` does on one contiguous series: PLAIN (not
+area-weighted) NaN-skipping mean/std (ddof 0) over (time, lat, lon), residual
+= std of `diff("time")` (including the diffs across month boundaries),
+time-mean per grid point; static fields get their spatial mean/std, their
+spatial std as the residual scale and themselves as the time mean (what xarray
+does there); ak/bk dropped. One streaming pass, a month per worker, float64
+accumulation (Chan's pairwise mean/M2), output cast to each variable's dtype.
+It refuses months without `presfc_reduced_to_hgtsfc=1` or a gap in the 6-h
+series, and logs per-variable min/max/non-finite counts.
+
+- Validated against upstream's xarray calls (float64) on a 16-time,
+  month-boundary-crossing subset: max relative error 6e-8 (float32 rounding;
+  upstream's own float32 computation is off by up to 6e-7), same 166
+  variables, same NaN pattern.
+- 1990-2019 (43828 times = 30 x 1460 + 7 leap days x 4): Polaris debug node,
+  16 workers, 23 min (~4 s/month). Only non-finite values: SST over land.
+- vs the ACE2-ERA5 checkpoint's normalizer (56 shared variables; its
+  `loss_normalizer` stds are the residual stds for prognostic variables and the
+  full stds otherwise): means agree to ~4 significant figures, full and
+  residual stds to within ~1% (e.g. PRESsfc 9464 vs 9485, residual 250.4 vs
+  250.9) -- consistent with the pipeline differences above.
+- ERA5 oddities, not pipeline bugs: specific_total_water_1 max 4.9 g/kg and a
+  residual std above its full std (the checkpoint's stats show the same);
+  negative Q100/Q150 (min ~ -1e-4).
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -219,17 +250,14 @@ on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
       16 workers, THREADS=1, 21:35: 42 (7731860, killed).
       Confounded by time of day (shared proxy/network load?) -- baseline
       rerun (16 workers, default threads) as job 7731906 to separate them.
-- [ ] Full 8-layer build, Ursa (2026-10-10): job 23429181 (1979-1988,
-      running; 1979-1985 done by 15:20, ~10 min/month) built WITHOUT the
-      PRESsfc reduction; queued 23431267 (1989-1998) and 23431519
-      (1999-2008) will import the new code and build with it. Patch job
-      23465227 (`fix_presfc` 1979-1988, after 23429181 ends) brings the
-      first decade in line. 2009-2022 not yet submitted.
-- [ ] Normalization stats (centering, scaling-full-field, scaling-residual,
-      time-mean; cf. `../ace/scripts/data_process/get_stats.py`). Upstream
-      takes PLAIN (not area-weighted) mean/std over (time, lat, lon);
-      residual = std of `diff("time")`; drops ak/bk/pressure_thickness;
-      time_means = mean over time only. Match that, not our area-weight rule.
+- [x] Full 8-layer build, 1979-01..2022-12 (finished 2026-10-12, mostly on
+      Hercules; copied to Eagle `ace2_era5_1deg_8layer/`, 2.4 TB): 528
+      months, 64284 contiguous 6-h times, one variable set (187 vars),
+      every file `presfc_reduced_to_hgtsfc=1`, `top_interface_midpoint=1`,
+      layers 0 48 67 79 90 100 109 119 137. File sizes exact per month
+      length.
+- [x] Normalization stats: `ace2_era5_1deg_8layer/stats-1990-01-2019-12/`
+      (see "Normalization statistics" above).
 - [ ] Training config from scratch (start from
       `../ACE2.1-ERA5-AIMIP/configs/ace-train-config.yaml` + the ACE2-ERA5
       checkpoint's in/out names, which add global_mean_co2, TMP2m, Q2m,

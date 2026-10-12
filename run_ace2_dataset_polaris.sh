@@ -14,7 +14,10 @@
 # user at 8 GB / 8 CPUs, too small for this. Submit from the repo root:
 #   qsub -v START=2020-01,END=2020-01 run_ace2_dataset_polaris.sh
 #   qsub -q debug -l walltime=01:00:00 -v START=2020-01,END=2020-01 run_ace2_dataset_polaris.sh
-# Optional -v: OUTDIR, CO2, WORKERS, EXTRA (extra `build` flags, e.g.
+# MODE=stats computes the normalization statistics instead (own log files):
+#   qsub -q debug -l walltime=01:00:00 -o ace2_stats.out -e ace2_stats.err \
+#       -v MODE=stats run_ace2_dataset_polaris.sh
+# Optional -v: OUTDIR, CO2, WORKERS, STATSDIR, EXTRA (extra `build` flags, e.g.
 # "--layer_indices 0 48 ... 137"). Months already in OUTDIR are skipped, so
 # jobs over disjoint month ranges can share one OUTDIR.
 # The CO2 series must exist first (login node, ace2 env -- needs h5netcdf):
@@ -40,6 +43,15 @@ OUTDIR=${OUTDIR:-/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1de
 # compute, are expected to bound throughput -- tune from the s/time log lines.
 WORKERS=${WORKERS:-16}
 
-/home/jwhitaker/.conda/envs/ace2ic/bin/python -u backends/ace2/ace2_dataset.py build \
-    ${OUTDIR} ${START:?set START=YYYY-MM} ${END:?set END=YYYY-MM} \
-    --co2 ${CO2:-${OUTDIR}/co2.nc} --workers ${WORKERS} ${EXTRA}
+PY=/home/jwhitaker/.conda/envs/ace2ic/bin/python
+if [ "${MODE:-build}" = "stats" ]; then
+    # Normalization stats over START..END (default 1990-01..2019-12, as
+    # upstream) into STATSDIR; reads only Eagle, no internet needed.
+    ${PY} -u backends/ace2/ace2_dataset.py stats ${OUTDIR} \
+        ${STATSDIR:-${OUTDIR}/stats-${START:-1990-01}-${END:-2019-12}} \
+        ${START:-1990-01} ${END:-2019-12} --workers ${WORKERS}
+else
+    ${PY} -u backends/ace2/ace2_dataset.py build \
+        ${OUTDIR} ${START:?set START=YYYY-MM} ${END:?set END=YYYY-MM} \
+        --co2 ${CO2:-${OUTDIR}/co2.nc} --workers ${WORKERS} ${EXTRA}
+fi

@@ -65,6 +65,7 @@ CLI (repo root):
         --co2 OUTDIR/co2.nc --workers 8 [--layer_indices ...] \\
         [--extra_layer_vars specific_humidity ozone_mass_mixing_ratio]
     python backends/ace2/ace2_dataset.py fix_presfc OUTDIR 1979-01 1988-12 --workers 16
+    python backends/ace2/ace2_dataset.py stats OUTDIR STATSDIR 1990-01 2019-12 --workers 16
 `build` skips months whose file exists (resumable; files are written to .tmp
 and renamed), so disjoint month ranges can run as separate jobs into one
 OUTDIR.
@@ -818,6 +819,167 @@ def fetch_co2(path: str, first_year: int, last_year: int) -> None:
     logging.info(f"wrote {path}")
 
 
+# ---------------------------------------------------------------------------
+# Normalization statistics (`stats` mode)
+# ---------------------------------------------------------------------------
+# Matches upstream scripts/data_process/get_stats.py on one contiguous series:
+# centering = mean, scaling-full-field = std, scaling-residual = std of
+# diff("time"), all PLAIN (not area-weighted) over (time, latitude, longitude),
+# NaN-skipping, ddof=0; time-mean = mean over time per grid point. Variables
+# without a time dim (HGTsfc, land_fraction, ...) get their spatial mean/std,
+# their spatial std as the residual scale, and themselves as the time mean, as
+# xarray does there. Streamed one month and one variable at a time.
+
+STATS_DROP = {"land_sea_mask"}  # plus ak_*/bk_*, as upstream's DROP_VARIABLES
+
+
+def _moments(x: np.ndarray) -> tuple:
+    """(count, mean, sum of squared deviations) of the finite values, float64."""
+    x = np.asarray(x, dtype=np.float64)
+    ok = np.isfinite(x)
+    n = int(ok.sum())
+    if n == 0:
+        return 0, 0.0, 0.0
+    mean = float(x[ok].mean())
+    return n, mean, float(((x[ok] - mean) ** 2).sum())
+
+
+def _combine(a: tuple, b: tuple) -> tuple:
+    """Chan et al.'s pairwise combination of (count, mean, M2)."""
+    na, ma, m2a = a
+    nb, mb, m2b = b
+    n = na + nb
+    if n == 0:
+        return a
+    d = mb - ma
+    return n, ma + d * nb / n, m2a + m2b + d * d * na * nb / n
+
+
+def _month_stats(path: str) -> dict:
+    """Per-variable partial statistics of one month file."""
+    import netCDF4
+
+    out = {}
+    with netCDF4.Dataset(path) as d:
+        d.set_auto_mask(False)
+        attrs = {k: getattr(d, k) for k in ("presfc_reduced_to_hgtsfc", "top_interface_midpoint") if hasattr(d, k)}
+        t = d["time"][:]
+        for name, v in d.variables.items():
+            if "time" not in v.dimensions or name == "time" or name in STATS_DROP:
+                continue
+            x = v[:].astype(np.float64)
+            ok = np.isfinite(x)
+            out[name] = dict(
+                full=_moments(x),
+                diff=_moments(np.diff(x, axis=0)),
+                tsum=np.where(ok, x, 0.0).sum(axis=0),
+                tcount=ok.sum(axis=0).astype(np.int64),
+                first=x[0],
+                last=x[-1],
+                vmin=float(np.nanmin(x)) if ok.any() else np.nan,
+                vmax=float(np.nanmax(x)) if ok.any() else np.nan,
+                nonfinite=int(x.size - ok.sum()),
+            )
+    return dict(path=path, time=t, attrs=attrs, vars=out)
+
+
+def stats(args) -> None:
+    """Write centering.nc, scaling-full-field.nc, scaling-residual.nc and
+    time-mean.nc for the months START..END of OUTDIR into STATSDIR."""
+    import netCDF4
+
+    months = pd.date_range(args.start, args.end, freq="MS")
+    paths = [os.path.join(args.outdir, f"{m:%Y%m%d%H}.nc") for m in months]
+    missing = [p for p in paths if not os.path.exists(p)]
+    if missing:
+        raise FileNotFoundError(f"{len(missing)} months missing, e.g. {missing[:3]}")
+    with netCDF4.Dataset(paths[0]) as d:
+        static = {
+            n: (v.dimensions, v[:].astype(np.float64), v.dtype, dict(v.__dict__))
+            for n, v in d.variables.items()
+            if "time" not in v.dimensions and v.dimensions and n not in ("latitude", "longitude") and n not in STATS_DROP
+        }
+        dtypes = {n: v.dtype for n, v in d.variables.items()}
+        var_attrs = {n: dict(v.__dict__) for n, v in d.variables.items()}
+        lat, lon = d["latitude"][:], d["longitude"][:]
+        lat_attrs, lon_attrs = dict(d["latitude"].__dict__), dict(d["longitude"].__dict__)
+    acc, prev_time, prev, n_samples = {}, None, None, 0
+    ctx = mp.get_context("spawn")
+    t0 = _time.time()
+    with ctx.Pool(args.workers) as pool:
+        for i, r in enumerate(pool.imap(_month_stats, paths), 1):
+            if not args.allow_mixed and r["attrs"].get("presfc_reduced_to_hgtsfc") != 1:
+                raise ValueError(f"{r['path']}: presfc_reduced_to_hgtsfc != 1 ({r['attrs']}); --allow_mixed overrides")
+            dt = np.diff(r["time"])
+            if (dt != 6).any() or (prev_time is not None and r["time"][0] - prev_time != 6):
+                raise ValueError(f"{r['path']}: time not contiguous 6-hourly")
+            prev_time = r["time"][-1]
+            n_samples += len(r["time"])
+            for name, s in r["vars"].items():
+                a = acc.get(name)
+                if a is None:
+                    if i > 1:
+                        raise ValueError(f"{r['path']}: variable {name} not in earlier months")
+                    acc[name] = a = dict(full=(0, 0.0, 0.0), diff=(0, 0.0, 0.0), tsum=0.0, tcount=0, vmin=np.inf, vmax=-np.inf, nonfinite=0)
+                a["full"] = _combine(a["full"], s["full"])
+                a["diff"] = _combine(a["diff"], s["diff"])
+                if prev is not None:  # the diff across the month boundary
+                    a["diff"] = _combine(a["diff"], _moments(s["first"] - prev[name]))
+                a["tsum"] = a["tsum"] + s["tsum"]
+                a["tcount"] = a["tcount"] + s["tcount"]
+                a["vmin"], a["vmax"] = min(a["vmin"], s["vmin"]), max(a["vmax"], s["vmax"])
+                a["nonfinite"] += s["nonfinite"]
+            if set(r["vars"]) != set(acc):
+                raise ValueError(f"{r['path']}: variables differ from earlier months")
+            prev = {n: s["last"] for n, s in r["vars"].items()}
+            if i % 12 == 0 or i == len(paths):
+                logging.info(f"stats: {i}/{len(paths)} months, {(_time.time() - t0) / i:.1f} s/month")
+    coords = dict(
+        latitude=xr.Variable("latitude", lat, lat_attrs),
+        longitude=xr.Variable("longitude", lon, lon_attrs),
+    )
+    center, full, resid, tmean = {}, {}, {}, {}
+    for name, a in acc.items():
+        dt_ = dtypes[name]
+        center[name] = xr.Variable((), np.asarray(a["full"][1], dtype=dt_), var_attrs[name])
+        full[name] = xr.Variable((), np.asarray(np.sqrt(a["full"][2] / a["full"][0]), dtype=dt_), var_attrs[name])
+        resid[name] = xr.Variable((), np.asarray(np.sqrt(a["diff"][2] / a["diff"][0]), dtype=dt_), var_attrs[name])
+        with np.errstate(invalid="ignore", divide="ignore"):
+            tm = a["tsum"] / a["tcount"]
+        tm = np.where(np.asarray(a["tcount"]) > 0, tm, np.nan)
+        dims = () if np.ndim(tm) == 0 else ("latitude", "longitude")
+        tmean[name] = xr.Variable(dims, np.asarray(tm, dtype=dt_), var_attrs[name])
+    for name, (dims, x, dt_, attrs) in static.items():
+        m = _moments(x)
+        sd = np.sqrt(m[2] / m[0])
+        center[name] = xr.Variable((), np.asarray(m[1], dtype=dt_), attrs)
+        full[name] = xr.Variable((), np.asarray(sd, dtype=dt_), attrs)
+        resid[name] = xr.Variable((), np.asarray(sd, dtype=dt_), attrs)
+        tmean[name] = xr.Variable(dims, np.asarray(x, dtype=dt_), attrs)
+    history = (
+        f"Created by lw4dvar-torch backends/ace2/ace2_dataset.py stats (after ai2cm/ace "
+        f"scripts/data_process/get_stats.py). INPUT: {args.outdir}, START_DATE: {args.start}, END_DATE: {args.end}."
+    )
+    os.makedirs(args.statsdir, exist_ok=True)
+    for fname, vs, c in [
+        ("centering.nc", center, {}),
+        ("scaling-full-field.nc", full, {}),
+        ("scaling-residual.nc", resid, {}),
+        ("time-mean.nc", tmean, coords),
+    ]:
+        ds = xr.Dataset(vs, coords=c)
+        ds.attrs = {"history": history, "input_samples": n_samples}
+        ds.to_netcdf(os.path.join(args.statsdir, fname))
+    logging.info(f"wrote stats for {len(center)} variables ({n_samples} times) to {args.statsdir}")
+    logging.info(f"{'variable':48s} {'mean':>12s} {'std':>12s} {'resid std':>12s} {'min':>12s} {'max':>12s} nonfinite")
+    for name in sorted(acc):
+        a = acc[name]
+        logging.info(
+            f"{name:48s} {float(center[name].values):12.5g} {float(full[name].values):12.5g} "
+            f"{float(resid[name].values):12.5g} {a['vmin']:12.5g} {a['vmax']:12.5g} {a['nonfinite']}"
+        )
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
@@ -841,6 +1003,13 @@ if __name__ == "__main__":
     f.add_argument("end", help="last month, YYYY-MM (inclusive)")
     f.add_argument("--workers", type=int, default=4)
     f.add_argument("--no_check", action="store_true", help="skip the NaN checks on the ARCO inputs")
+    st = sub.add_parser("stats", help="normalization statistics (as upstream get_stats.py) over a month range")
+    st.add_argument("outdir", help="the dataset directory (monthly files)")
+    st.add_argument("statsdir", help="where centering.nc, scaling-*.nc, time-mean.nc are written")
+    st.add_argument("start", nargs="?", default="1990-01", help="first month (default 1990-01, as upstream)")
+    st.add_argument("end", nargs="?", default="2019-12", help="last month, inclusive (default 2019-12)")
+    st.add_argument("--workers", type=int, default=8, help="months read in parallel (~1 GB each)")
+    st.add_argument("--allow_mixed", action="store_true", help="accept months without presfc_reduced_to_hgtsfc=1")
     c = sub.add_parser("co2", help="extract ACE2-ERA5's global_mean_co2 from the HF forcing files")
     c.add_argument("path")
     c.add_argument("first_year", type=int)
@@ -848,6 +1017,8 @@ if __name__ == "__main__":
     args = p.parse_args()
     if args.mode == "co2":
         fetch_co2(args.path, args.first_year, args.last_year)
+    elif args.mode == "stats":
+        stats(args)
     elif args.mode == "fix_presfc":
         fix_presfc(args)
     else:
