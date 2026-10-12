@@ -212,6 +212,51 @@ series, and logs per-variable min/max/non-finite counts.
   154 m/s, 30 points > 50 m/s; 73 m/s at 19Z, < 3 m/s at 17Z; u and ps
   normal), so Ai2's data has it too. Left in; negligible for the stats.
 
+## Training (2026-10-12)
+
+Config `backends/ace2/training/ace2-era5-vars-train-config.yaml`, launcher
+`run_ace2_train_polaris.sh` (one Polaris node, 4 x 40 GB A100, `torchrun`
+through `backends/ace2/training/fme_train.py`, `ace2` env, fme 2026.5.1):
+
+- **Stepper = the ACE2-ERA5 checkpoint's**, extracted from
+  `ace2_era5_ckpt.tar`: SphericalFourierNeuralOperatorNet (embed_dim 384, 8
+  layers, dhconv, 3 spectral layers), in/out names incl. global_mean_co2,
+  TMP2m/Q2m/UGRD10m/VGRD10m (prognostic) and TMP850/h500 (diagnostic), its
+  loss weights and corrector -- so results compare directly with ACE2-ERA5
+  in lw4dvar. Training settings from ACE2.1-ERA5: 120 epochs, batch 16,
+  n_forward_steps 2, AdamW lr 1e-4 wd 0.01, EMA 0.999, validate with EMA.
+- **Data split (decided 2026-10-12): train 1979-2014 + 2016-2022, 2015
+  held out** (validation, step 3; inline inference). Subsets select sample
+  start times, so stops at T06 keep 3-time samples inside each range. Inline
+  inference: 4 ICs (fme needs a multiple of the 4 ranks), 2015-01-01..04
+  00Z, 1440 steps (all inside 2015). NB lw4dvar tests from 2020 ICs fall in
+  the training period; 2015 ones do not.
+- `file_pattern` `[12][0-9][0-9][0-9][01][0-9]0100.nc` keeps fme off
+  `co2.nc`, `invariant.nc` and the regrid weights in the data dir.
+- **Memory:** 4 samples/GPU does not fit a 40 GB A100 (OOM in the first
+  backward, 37.5 GB allocated). `checkpointing: 3` (gradient checkpointing
+  of every SFNO block) fits; same math, more compute. Batch 16 and fp32 kept.
+- **fme bug, worked around:** the modulus SFNO behind the
+  `SphericalFourierNeuralOperatorNet` builder calls
+  `torch.utils.checkpoint.checkpoint` without `use_reentrant` (reentrant in
+  torch 2.x); checkpointing the encoder on the raw input then gives its
+  weights no gradient and DDP fails ("Expected to have finished reduction
+  ... Parameter indices which did not receive grad: 1 2 3"). `fme_train.py`
+  rebinds those modules' `checkpoint` to `use_reentrant=False` (gradients
+  bit-identical to no checkpointing, checked on a small network). Upstream
+  fixed only conditional_sfno (#1493); reported as ai2cm/ace#1577. Drop the
+  wrapper once the env's fme has the fix.
+- **Smoke test** (job 7740494, debug, 2 epochs on 3 months, 80-step
+  inference): exit 0 in 7.5 min; loss 22 -> 13; checkpoints saved
+  (`ckpt.tar` 7.3 GB with optimizer state, best/best_inference 1.8 GB).
+  Steady 2.83 s/batch (1.42 samples/s/GPU); inference ~0.26 s/step.
+- **Cost:** ~62.8k training samples = ~3930 batches = ~3.1 h/epoch, plus
+  validation (~1-2 min) and the 1440-step inference (~6 min): ~3.2 h/epoch,
+  ~385 node-h for 120 epochs (~16 x 24-h jobs). ACE2-ERA5's checkpoint is
+  from epoch 58 (best inference error).
+- Earlier smoke-test failures, for the record: 1 inference IC with 4 ranks;
+  validation batch 128 (32/rank) larger than a one-month subset.
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -230,6 +275,10 @@ python backends/ace2/ace2_dataset.py co2 $OUTDIR/co2.nc 1940 2022
 qsub -v START=1979-01,END=1989-12 run_ace2_dataset_polaris.sh
 # Ursa: u1-service partition
 sbatch --export=ALL,START=1979-01,END=1989-12 run_ace2_dataset_ursa.sh
+# Polaris: normalization stats (debug node, ~25 min)
+qsub -q debug -l walltime=01:00:00 -o ace2_stats.out -e ace2_stats.err -v MODE=stats run_ace2_dataset_polaris.sh
+# Polaris: training (24-h jobs; resubmit/chain until max_epochs -- fme resumes)
+qsub run_ace2_train_polaris.sh
 # Ursa: patch PRESsfc in months built before 2026-10-10 (own log files)
 sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
     --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_ursa.sh
@@ -263,10 +312,16 @@ on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
       length.
 - [x] Normalization stats: `ace2_era5_1deg_8layer/stats-1990-01-2019-12/`
       (see "Normalization statistics" above).
-- [ ] Training config from scratch (start from
-      `../ACE2.1-ERA5-AIMIP/configs/ace-train-config.yaml` + the ACE2-ERA5
-      checkpoint's in/out names, which add global_mean_co2, TMP2m, Q2m,
-      UGRD10m, VGRD10m, h500, TMP850).
+- [ ] Training (see "Training" above): config + launcher done, smoke test
+      passed; resume test, then the full 120-epoch run.
 - [ ] Yearly forcing files from our dataset for inference in lw4dvar.
-- [ ] Higher vertical resolution + extra layer fields for radiances.
+- [ ] Higher vertical resolution + extra layer fields for radiances. First,
+      after the full training workflow runs: a GPU memory probe (build the
+      stepper with 16/32/64 layers' worth of channels and a few embed_dim
+      values, train steps on random data, record peak memory). Levels only
+      change SFNO's encoder/decoder channel counts, so memory should grow
+      only mildly with levels at fixed embed_dim (384); widening embed_dim
+      to use the extra levels is what costs (activations ~linear, spectral
+      weights + AdamW state ~quadratic) and may need 2 nodes or AMP on the
+      40 GB A100s.
 - [ ] CO2 after 2022.
