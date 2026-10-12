@@ -4,12 +4,15 @@
 # weights, corrector), so results compare directly with ACE2-ERA5 in lw4dvar.
 # Training settings from ACE2.1-ERA5 (../ACE2.1-ERA5-AIMIP/configs/
 # ace-train-config.yaml). Train 1979-2014 + 2016-2022; 2015 held out for
-# validation and inline inference (4 ICs, one per GPU rank as fme requires,
-# 1 day apart; 1440 steps from the last still ends inside 2015). Subsets
+# validation and inline inference (16 ICs, 6-hourly 2015-01-01T00..01-04T18:
+# a multiple of the GPU count as fme requires, for 4, 8 or 16 GPUs; 1440
+# steps from the last still ends inside 2015). Subsets
 # select sample START times; stops at T06 keep each 3-time sample
 # (n_forward_steps=2) inside its year range.
-# checkpointing: 3 (gradient checkpointing of every SFNO block; same math, more
-# compute) is needed to fit 4 samples/GPU on Polaris' 40 GB A100s.
+# Sized for 4 Polaris nodes (16 x 40 GB A100, 1 sample/GPU): no gradient
+# checkpointing, 0.60 s/batch. On 1 node (4 samples/GPU) it does not fit:
+# add --override stepper.step.config.builder.config.checkpointing=3 (same
+# math, ~30% more compute; 2.83 s/batch). See ace2-training.md.
 # fme (ace2 env, 2026.5.1): torchrun --nproc_per_node 4 -m fme.ace.train THIS.yaml
 experiment_dir: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-era5-vars-1979-2022-no2015
 save_checkpoint: true
@@ -25,9 +28,21 @@ inference:
     start_indices:
       times:
       - '2015-01-01T00:00:00'
+      - '2015-01-01T06:00:00'
+      - '2015-01-01T12:00:00'
+      - '2015-01-01T18:00:00'
       - '2015-01-02T00:00:00'
+      - '2015-01-02T06:00:00'
+      - '2015-01-02T12:00:00'
+      - '2015-01-02T18:00:00'
       - '2015-01-03T00:00:00'
+      - '2015-01-03T06:00:00'
+      - '2015-01-03T12:00:00'
+      - '2015-01-03T18:00:00'
       - '2015-01-04T00:00:00'
+      - '2015-01-04T06:00:00'
+      - '2015-01-04T12:00:00'
+      - '2015-01-04T18:00:00'
     dataset:
       data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_8layer
       file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
@@ -117,7 +132,7 @@ stepper:
           spectral_layers: 3
           spectral_transform: sht
           use_mlp: true
-          checkpointing: 3
+          checkpointing: 0
       normalization:
         network:
           global_means_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_8layer/stats-1990-01-2019-12/centering.nc

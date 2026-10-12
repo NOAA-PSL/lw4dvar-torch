@@ -250,10 +250,35 @@ through `backends/ace2/training/fme_train.py`, `ace2` env, fme 2026.5.1):
   inference): exit 0 in 7.5 min; loss 22 -> 13; checkpoints saved
   (`ckpt.tar` 7.3 GB with optimizer state, best/best_inference 1.8 GB).
   Steady 2.83 s/batch (1.42 samples/s/GPU); inference ~0.26 s/step.
-- **Cost:** ~62.8k training samples = ~3930 batches = ~3.1 h/epoch, plus
-  validation (~1-2 min) and the 1440-step inference (~6 min): ~3.2 h/epoch,
-  ~385 node-h for 120 epochs (~16 x 24-h jobs). ACE2-ERA5's checkpoint is
-  from epoch 58 (best inference error).
+- **Resume test** (job 7740554, `max_epochs=3` on the smoke run): resumed
+  from `ckpt.tar` at epoch 3 / step 45, same loss and rate. Chaining works.
+- **Multi-node** (`run_ace2_train_polaris.sh`: `mpiexec` one `torchrun`
+  per node, c10d rendezvous on the first node; NCCL over Slingshot via
+  `/soft/libraries/aws-ofi-nccl/v1.9.1-aws` with ALCF's settings). Global
+  batch stays 16, so 1-4 nodes train identically. Scaling test (job
+  7740610, debug-scaling, smoke config):
+
+  | nodes | samples/GPU | checkpointing | s/batch | node-s/batch |
+  |---|---|---|---|---|
+  | 1 | 4 | 3 | 2.83 | 2.83 |
+  | 2 | 2 | 3 | 1.43 | 2.86 |
+  | 2 | 2 | 0 | 1.09 | 2.18 |
+  | 4 | 1 | 3 | 0.76 | 3.04 |
+  | 4 | 1 | 0 | 0.60 | 2.38 |
+
+  Inter-node all-reduce is cheap (2 nodes scale perfectly; 4 nodes lose
+  ~7%). Without checkpointing 1-2 samples/GPU fit the 40 GB A100s, and
+  dropping its recompute more than pays for the communication: **4 nodes,
+  no checkpointing is ~4.8x faster than 1 node AND uses fewer node-hours.**
+  The config is set up for that (`checkpointing: 0`; 1 node needs
+  `--override stepper.step.config.builder.config.checkpointing=3`).
+  Inline inference: 16 ICs (a multiple of the GPU count), ~0.22 s/step at
+  4 nodes.
+- **Cost (4 nodes):** ~62.8k training samples = ~3930 batches x 0.60 s =
+  ~39 min/epoch, plus validation (a few min) and the 1440-step inference
+  (~5-6 min): ~48 min/epoch, **~4 days for 120 epochs** (~385 node-h) --
+  one 168-h `capacity` job. ACE2-ERA5's checkpoint is from epoch 58 (best
+  inference error).
 - Earlier smoke-test failures, for the record: 1 inference IC with 4 ranks;
   validation batch 128 (32/rank) larger than a one-month subset.
 
@@ -278,7 +303,7 @@ sbatch --export=ALL,START=1979-01,END=1989-12 run_ace2_dataset_ursa.sh
 # Polaris: normalization stats (debug node, ~25 min)
 qsub -q debug -l walltime=01:00:00 -o ace2_stats.out -e ace2_stats.err -v MODE=stats run_ace2_dataset_polaris.sh
 # Polaris: training (24-h jobs; resubmit/chain until max_epochs -- fme resumes)
-qsub run_ace2_train_polaris.sh
+qsub run_ace2_train_polaris.sh     # 4 nodes, <= 168 h
 # Ursa: patch PRESsfc in months built before 2026-10-10 (own log files)
 sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
     --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_ursa.sh
@@ -312,8 +337,8 @@ on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
       length.
 - [x] Normalization stats: `ace2_era5_1deg_8layer/stats-1990-01-2019-12/`
       (see "Normalization statistics" above).
-- [ ] Training (see "Training" above): config + launcher done, smoke test
-      passed; resume test, then the full 120-epoch run.
+- [ ] Training (see "Training" above): config, launcher, smoke, resume and
+      scaling tests done; next the full 120-epoch run on 4 nodes.
 - [ ] Yearly forcing files from our dataset for inference in lw4dvar.
 - [ ] Higher vertical resolution + extra layer fields for radiances. First,
       after the full training workflow runs: a GPU memory probe (build the
