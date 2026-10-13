@@ -89,7 +89,6 @@ opentelemetry-exporter-otlp-proto-http==1.44.0
 opentelemetry-proto==1.44.0
 opentelemetry-sdk==1.44.0
 opentelemetry-semantic-conventions==0.65b0
-packaging @ file:///home/conda/feedstock_root/build_artifacts/bld/rattler-build_packaging_1785888127/work
 pandas==3.0.6
 pillow==11.3.0
 platformdirs==4.11.12
