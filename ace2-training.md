@@ -215,7 +215,7 @@ series, and logs per-variable min/max/non-finite counts.
 ## Training (2026-10-12)
 
 Config `backends/ace2/training/ace2-era5-vars-train-config.yaml`, launcher
-`run_ace2_train_polaris.sh` (one Polaris node, 4 x 40 GB A100, `torchrun`
+`run_ace2_train_polaris.sh` (4 Polaris nodes, 4 x 40 GB A100 each, `torchrun`
 through `backends/ace2/training/fme_train.py`, `ace2` env, fme 2026.5.1):
 
 - **Stepper = the ACE2-ERA5 checkpoint's**, extracted from
@@ -282,6 +282,50 @@ through `backends/ace2/training/fme_train.py`, `ace2` env, fme 2026.5.1):
 - Earlier smoke-test failures, for the record: 1 inference IC with 4 ranks;
   validation batch 128 (32/rank) larger than a one-month subset.
 
+## Memory probe: layers vs embed_dim (2026-10-13)
+
+Job 7741018 (debug, 1 node; one-off untracked
+`backends/ace2/training/memory_probe.py` + `memory-probe.sh`): fme's SFNO
+(training-config architecture) built with 12+4L inputs and 18+4L outputs
+(4 layer variables per layer, as now), synthetic F90 data, fme's training
+step on one GPU (2 forward steps, backward after each with the state
+detached, fused AdamW, EMA, non-reentrant checkpointing). No DDP, which adds
+one gradient-sized buffer (+1.7/3.0 GB at embed 384/512). Peak allocated
+GB, s/batch:
+
+| embed_dim | params | ckpt | 1 sample/GPU | 2 | 4 |
+|---|---|---|---|---|---|
+| 384 | 456M | 0 | 16.7-17.0, 0.50 s | 24.9-25.4, 1.06 s | OOM |
+| 384 | 456M | 3 | 10.5-10.8, 0.66 s | 12.7-13.2, 1.40 s | 16.7-17.8, 2.86 s |
+| 512 | 799M | 0 | 25.7-26.0, 0.80 s | 36.6-37.2, 1.68 s | OOM |
+| 512 | 799M | 3 | 17.5-17.8, 1.07 s | 20.3-20.9, 2.22 s | 25.7-26.8, 4.45 s |
+| 768 | 1773M | 0 | OOM | - | - |
+| 768 | 1773M | 3 | 37.2-37.4, 2.14 s | OOM | - |
+
+Ranges are over L = 8, 16, 24, 32, 48: **layers are nearly free** (8 -> 48
+layers: +0.3 GB at 1 sample/GPU, +1.1 GB at 4; time unchanged). Channels
+only enter the encoder/decoder; the 8 SFNO blocks run at embed_dim.
+**embed_dim is what costs**: the dhconv spectral weights make params
+~quadratic in it, and params x 5 (weights, grads, 2 AdamW moments, EMA)
+= 8.5 / 15 / 33 GB at 384 / 512 / 768 before activations. Calibration
+against the real runs: embed 384, L=8, 4 samples/GPU, no checkpointing
+OOMs as in smoke test 3; with checkpointing 2.86 s vs 2.83 s measured; 1
+sample/GPU 0.50 s vs 0.60 s in the 4-node DDP run (data + all-reduce).
+
+So with the 40 GB A100s and global batch 16:
+- **embed 384, up to 48 layers:** as now (4 nodes, no checkpointing,
+  ~4 days for 120 epochs; 1 node fits with checkpointing).
+- **embed 512:** 4 nodes no checkpointing (26 GB + DDP): ~1.6x slower,
+  ~6.5 days -- just inside one 168-h job; 1 node with checkpointing fits
+  (27 GB) but ~4.5 s/batch, ~4 weeks.
+- **embed 768:** only 1 sample/GPU with checkpointing, at 37 GB before DDP's
+  6.6 GB buffer -- does not fit in practice without sharding the
+  optimizer state (ZeRO/FSDP) or bf16 AMP.
+Not covered: data loading (bytes per sample grow ~linearly with layers;
+8 loader workers per GPU read from Eagle) and whether embed 384 is wide
+enough to carry 4-6x more channels -- that is a skill question for a
+training run, not a memory one.
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -338,15 +382,13 @@ on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
 - [x] Normalization stats: `ace2_era5_1deg_8layer/stats-1990-01-2019-12/`
       (see "Normalization statistics" above).
 - [ ] Training (see "Training" above): config, launcher, smoke, resume and
-      scaling tests done; next the full 120-epoch run on 4 nodes.
+      scaling tests done; full 120-epoch run on 4 nodes submitted
+      2026-10-12 (job 7741004, capacity queue, seed 0). Upstream trains 4
+      seeds and picks one by multi-year evaluation (time-mean climate and
+      trends) -- a follow-on step if we need it.
 - [ ] Yearly forcing files from our dataset for inference in lw4dvar.
-- [ ] Higher vertical resolution + extra layer fields for radiances. First,
-      after the full training workflow runs: a GPU memory probe (build the
-      stepper with 16/32/64 layers' worth of channels and a few embed_dim
-      values, train steps on random data, record peak memory). Levels only
-      change SFNO's encoder/decoder channel counts, so memory should grow
-      only mildly with levels at fixed embed_dim (384); widening embed_dim
-      to use the extra levels is what costs (activations ~linear, spectral
-      weights + AdamW state ~quadratic) and may need 2 nodes or AMP on the
-      40 GB A100s.
+- [ ] Higher vertical resolution + extra layer fields for radiances. Memory
+      probe done (see "Memory probe" above): up to 48 layers fit at embed
+      384 on the current setup; embed 512 fits on 4 nodes; 768 needs
+      ZeRO/FSDP or AMP.
 - [ ] CO2 after 2022.
