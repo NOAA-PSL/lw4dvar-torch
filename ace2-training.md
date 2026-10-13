@@ -282,6 +282,52 @@ through `backends/ace2/training/fme_train.py`, `ace2` env, fme 2026.5.1):
 - Earlier smoke-test failures, for the record: 1 inference IC with 4 ranks;
   validation batch 128 (32/rank) larger than a one-month subset.
 
+## Training on Ursa (2026-10-13)
+
+The dataset is also on Ursa at `/scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer`
+(checked 2026-10-13: 528 months, 64284 6-h times, every file
+`presfc_reduced_to_hgtsfc=1`, `top_interface_midpoint=1`). Its normalization
+stats were computed there too (`run_ace2_dataset_ursa.sh` `MODE=stats`).
+
+- Config `backends/ace2/training/ace2-era5-vars-train-config-ursa.yaml`: the
+  Polaris config with Ursa paths only (keep the two in sync); experiment dir
+  `/scratch4/BMC/gsienkf/whitaker/ace2_training/ace2-era5-vars-1979-2022-no2015`.
+- Launcher `run_ace2_train_ursa.sh`: `u1-h100` (2 x 80 GB H100 per node),
+  account `gpu-ai4wp`, QOS `gpu` (<= 20 GPUs = 10 nodes per job, <= 7 days);
+  `srun` one `torchrun --nproc_per_node 2` per node, c10d rendezvous on the
+  first node, NCCL over InfiniBand with its defaults. Default 4 nodes (2
+  samples/GPU, ~25 GB by the memory probe); `-N 2` is 4 samples/GPU (est.
+  ~42 GB + DDP), `-N 8` is 1 sample/GPU. 1 node needs `checkpointing=3`.
+- **`--cpus-per-task=192` is essential.** Without it the job, even with
+  `--exclusive`, is bound to ONE core (`Cpus_allowed_list: 0`), shared by
+  both ranks and all 16 data-loader workers: 4.1-4.2 s/batch on 2 and on 4
+  nodes alike, loader-bound, and 24 loader workers per rank did not help.
+  (`nproc` reports 1 either way because it honours `OMP_NUM_THREADS`.)
+- Stats on Ursa: the first `MODE=stats` job hung -- 16 workers at ~14 GB
+  each against the 128 GB default, 259 OOM kills, and `Pool.imap` never
+  returns a killed worker's task. u1-service caps a user at 64 CPUs and 3.9
+  GB/CPU, so it runs with `-c 64 --mem=240g` and 12 workers: 19 min, ~3
+  s/month. Result identical to Polaris's (166 variables, 43828 times,
+  PRESsfc mean 96697, std 9464.1, residual std 250.43).
+- **Smoke test** (job 23664478, 2 nodes, `ace2-smoke-ursa.yaml`: 2 epochs on
+  2016-01..03, validation 2015-01..02 at batch 16, 80-step inference; run
+  with the 1-core binding): exit 0; train loss 23.09 -> 13.98, valid 22.92
+  -> 12.96, inference error 0.577 -> 0.456; ~49 GB/GPU at 4 samples/GPU.
+  Rerunning it gave bit-identical losses.
+- **Throughput** (one epoch on 2016-2017, 182-183 batches, 8 loader workers
+  per rank, with 192 CPUs; includes the first-batch warm-up):
+
+  | nodes | GPUs | samples/GPU | s/batch | node-s/batch |
+  |---|---|---|---|---|
+  | 2 | 4 | 4 | 1.30 | 2.6 |
+  | 4 | 8 | 2 | 0.97 | 3.9 |
+
+  Full run (~3930 batches/epoch plus validation and the 1440-step
+  inference): 4 nodes ~70 min/epoch, ~6 days for 120 epochs (one 7-day
+  job); 2 nodes ~95 min/epoch, ~8 days (two chained jobs, fewer
+  node-hours). Untested: more loader workers now that the CPUs are there;
+  8 nodes.
+
 ## Memory probe: layers vs embed_dim (2026-10-13)
 
 Job 7741018 (debug, 1 node; one-off untracked
@@ -348,6 +394,9 @@ sbatch --export=ALL,START=1979-01,END=1989-12 run_ace2_dataset_ursa.sh
 qsub -q debug -l walltime=01:00:00 -o ace2_stats.out -e ace2_stats.err -v MODE=stats run_ace2_dataset_polaris.sh
 # Polaris: training (24-h jobs; resubmit/chain until max_epochs -- fme resumes)
 qsub run_ace2_train_polaris.sh     # 4 nodes, <= 168 h
+# Ursa: normalization stats (u1-service), then training (u1-h100, <= 7 days)
+sbatch -t 02:00:00 -c 64 --mem=240g -o ace2_stats.out -e ace2_stats.err --export=ALL,MODE=stats,WORKERS=12 run_ace2_dataset_ursa.sh
+sbatch run_ace2_train_ursa.sh      # 4 nodes; -N 2..8
 # Ursa: patch PRESsfc in months built before 2026-10-10 (own log files)
 sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
     --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_ursa.sh
@@ -386,6 +435,9 @@ on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
       2026-10-12 (job 7741004, capacity queue, seed 0). Upstream trains 4
       seeds and picks one by multi-year evaluation (time-mean climate and
       trends) -- a follow-on step if we need it.
+- [ ] Ursa run (see "Training on Ursa"): config, launcher, stats, smoke and
+      throughput tests done; full run to be submitted after the Ursa
+      maintenance starting 2026-10-14T12:00 (`sbatch run_ace2_train_ursa.sh`).
 - [ ] Yearly forcing files from our dataset for inference in lw4dvar.
 - [ ] Higher vertical resolution + extra layer fields for radiances. Memory
       probe done (see "Memory probe" above): up to 48 layers fit at embed

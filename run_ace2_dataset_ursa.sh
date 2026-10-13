@@ -22,6 +22,13 @@
 # before the reduction to HGTsfc (2026-10-10); use its own log files:
 #   sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
 #       --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_ursa.sh
+# MODE=stats computes the normalization statistics (default 1990-01..2019-12
+# into OUTDIR/stats-START-END, or STATSDIR); reads only OUTDIR. Its workers
+# reach ~14 GB each: at the default 128 GB, 16 of them were OOM-killed and the
+# pool hung (2026-10-13). u1-service allows 64 CPUs per user and 3.9 GB per
+# CPU (~246 GB), so use 240 GB and 12 workers:
+#   sbatch -t 02:00:00 -c 64 --mem=240g -o ace2_stats.out -e ace2_stats.err \
+#       --export=ALL,MODE=stats,WORKERS=12 run_ace2_dataset_ursa.sh
 # The CO2 series must exist first (login node, ace2 env -- needs h5netcdf):
 #   python backends/ace2/ace2_dataset.py co2 $OUTDIR/co2.nc 1940 2022
 
@@ -35,7 +42,11 @@ OUTDIR=${OUTDIR:-/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer}
 WORKERS=${WORKERS:-16}
 
 PY=/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2ic/bin/python
-if [ "${MODE:-build}" = "fix_presfc" ]; then
+if [ "${MODE:-build}" = "stats" ]; then
+    ${PY} -u backends/ace2/ace2_dataset.py stats ${OUTDIR} \
+        ${STATSDIR:-${OUTDIR}/stats-${START:-1990-01}-${END:-2019-12}} \
+        ${START:-1990-01} ${END:-2019-12} --workers ${WORKERS}
+elif [ "${MODE:-build}" = "fix_presfc" ]; then
     ${PY} -u backends/ace2/ace2_dataset.py fix_presfc \
         ${OUTDIR} ${START:?set START=YYYY-MM} ${END:?set END=YYYY-MM} --workers ${WORKERS}
 else
