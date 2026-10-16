@@ -453,6 +453,7 @@ def get_model(exp):
             device=exp.get('device', 'cuda'),
             autocast_dtype=_autocast_torch_dtype(exp, 'aifs'),
             compile_wrapper=exp.get('compile_wrapper', False),
+            attention=exp.get('aifs_attention'),
         )
     elif backend == 'fcn3':
         _ensure_backend_on_path('fcn3')

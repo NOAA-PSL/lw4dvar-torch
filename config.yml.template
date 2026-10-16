@@ -245,6 +245,15 @@ exp:
   #   ace2, fcn3: not supported (fp32).
   # 'aifs_autocast_dtype' is a deprecated alias for this key.
   #autocast_dtype: 'bfloat16'
+  # aifs_attention: AIFS only. Unset (default) keeps the checkpoint's own
+  # attention (flash-attn). 'block_sliding_window' swaps in an exact
+  # flash-attn-free sliding-window attention
+  # (backends/aifs/aifs_attention.py), for platforms without flash-attn
+  # (ROCm/MI300X, env lwaifs2-rocm). 'flex_sliding_window' is the same
+  # function computed with compiled torch flex_attention: as fast as
+  # flash-attn on H100, ~6x faster than 'block_sliding_window' on MI300X,
+  # and light enough on memory for checkpoint_stride: 0.
+  #aifs_attention: 'block_sliding_window'
 
   # grid_interp: how ps-obs are interpolated from the model grid.
   # AIFS (default 'bilinear' since 2026-10-08): 'bilinear' is closed-form
