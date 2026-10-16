@@ -487,6 +487,7 @@ def get_model(exp):
             device=exp.get('device', 'cuda'),
             autocast_dtype=_autocast_torch_dtype(exp, 'aifs'),
             compile_wrapper=exp.get('compile_wrapper', False),
+            attention=exp.get('aifs_attention'),
         )
         model.set_dry_mass_fixer(_dry_mass_fixer_hpa(exp))
         return model
