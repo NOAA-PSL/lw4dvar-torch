@@ -333,6 +333,18 @@ def load_config(config_path='config.yml'):
         )
     if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
+    if exp.get('jb_samples'):
+        if backend != 'ace2':
+            raise ValueError("jb_samples (static-ensemble latent B) is only implemented for the ACE2 backend so far")
+        if float(exp.get('jb_loc_km', 1500.0)) <= 0:
+            raise ValueError(f"jb_loc_km must be > 0 (km), got {exp['jb_loc_km']!r}")
+        if float(exp.get('jb_weight', 1.0)) <= 0:
+            raise ValueError(f"jb_weight must be > 0, got {exp['jb_weight']!r}")
+        if float(exp.get('latent_scale', 1.0)) != 1.0:
+            raise ValueError("latent_scale has no effect with jb_samples (the control is B^-1/2-preconditioned) "
+                             "-- leave it unset or 1.0")
+    elif exp.get('jb_loc_km') is not None or exp.get('jb_weight') is not None:
+        raise ValueError("jb_loc_km / jb_weight are set but jb_samples is not -- no Jb term would be used")
     if float(exp.get('obs_density_box_deg', 0.0)) < 0:
         raise ValueError(f"obs_density_box_deg must be >= 0 (degrees; 0 = off), got {exp['obs_density_box_deg']!r}")
     # More than one DA cycle requires cycle: True. With cycle: False the driver
@@ -417,6 +429,11 @@ def log_window(exp, logger):
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
+    if exp.get('jb_samples'):
+        logger.info(f"   jb_samples: {exp['jb_samples']} (static-ensemble latent B), jb_loc_km: "
+                    f"{float(exp.get('jb_loc_km', 1500.0))}, jb_weight: {float(exp.get('jb_weight', 1.0))}")
+    else:
+        logger.info('   jb_samples: (off -- latent increment is the control, regularized by weight_decay)')
     logger.info('   obs_density_box_deg: ' + (str(exp['obs_density_box_deg']) + ' (area-weighted Jo)'
                                                if exp.get('obs_density_box_deg') else '(off)'))
     logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
@@ -1471,6 +1488,44 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     return J, Jol_np
 
 
+_JB_CACHE = {}
+
+
+def get_jb_operator(exp, model, logger):
+    """Static-ensemble latent B (`latent_b.EnsembleB`) from `exp['jb_samples']`
+    (built by diagnostics/build_latent_ens_b.py) with Gaussian horizontal
+    localization of scale `exp['jb_loc_km']` (default 1500 km). Loaded once
+    per process (~8 GB of fp16 samples on the GPU) and cached across cycles.
+    Refuses samples built for a different checkpoint or latent shape -- the
+    latent space is specific to the checkpoint."""
+    import hashlib
+    from latent_b import EnsembleB
+    path, loc = exp['jb_samples'], float(exp.get('jb_loc_km', 1500.0))
+    key = (path, loc)
+    if key not in _JB_CACHE:
+        d = torch.load(path, map_location='cpu', weights_only=False)
+        meta = d['meta']
+        ckpt = exp['path_model'] + exp.get('model_name', 'ace2_era5_ckpt.tar')
+        h = hashlib.sha256()
+        with open(ckpt, 'rb') as f:
+            while chunk := f.read(1 << 24):
+                h.update(chunk)
+        if meta.get('backend') != exp['model_backend'] or h.hexdigest() != meta['checkpoint_sha256']:
+            raise ValueError(f"jb_samples {path} was built for {meta.get('backend')} checkpoint "
+                             f"{meta['checkpoint']} (sha256 {meta['checkpoint_sha256'][:12]}), not the running "
+                             f"{ckpt} (sha256 {h.hexdigest()[:12]})")
+        if tuple(meta['latent_shape']) != tuple(model.latent_shape):
+            raise ValueError(f"jb_samples latent shape {meta['latent_shape']} != model {model.latent_shape}")
+        samples = d['samples'].to(model.device)
+        del d
+        _JB_CACHE.clear()   # one B at a time (GPU memory)
+        _JB_CACHE[key] = EnsembleB(samples, loc, meta['sht_grid']).to(model.device)
+        logger.info(f"jb: {meta['n_samples']} latent samples from {meta['run_dir']} ({meta['dates'][0]} .. "
+                    f"{meta['dates'][-1]}), localization {loc:.0f} km, control "
+                    f"{tuple(_JB_CACHE[key].control_shape)}; checkpoint sha256 {meta['checkpoint_sha256'][:12]} ok")
+    return _JB_CACHE[key]
+
+
 def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger):
     """Optimize a latent-space increment against the ps obs.
 
@@ -1495,6 +1550,12 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     `printz500err`) all use its `.date` rather than assuming it matches the
     background's. Also saves `*_latent_increment_*.pt` for offline
     inspection of the raw increment.
+
+    With `exp['jb_samples']` the control is not the latent increment itself
+    but v, with increment = B^1/2 v (`get_jb_operator`, static-ensemble B
+    with horizontal localization), and the loss gains Jb = jb_weight *
+    ||v||^2 (no 1/2, matching Jo = sum (d/sigma_o)^2). AdamW's weight decay
+    is then turned off (Jb is the regularizer) and latent_scale is unused.
     """
     logger.info('starting optimization (latent control space)...')
     lr = exp['learn_rate']
@@ -1511,7 +1572,15 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     logger.info('loss time-interp fields: ' + str([b for b, _ in interp_specs]))
 
     device = input_encoded.state.device
-    increment = torch.zeros(model.latent_shape, device=device, requires_grad=True)
+    jb_op = get_jb_operator(exp, model, logger) if exp.get('jb_samples') else None
+    jb_weight = float(exp.get('jb_weight', 1.0))
+    if jb_op is not None:
+        control = torch.zeros(jb_op.control_shape, device=device, requires_grad=True)
+        if wd:
+            logger.info(f'jb on: AdamW weight_decay {wd} -> 0 (Jb is the regularizer)')
+            wd = 0.0
+    else:
+        control = torch.zeros(model.latent_shape, device=device, requires_grad=True)
 
     # control_variables: restrict which packed-state columns the increment may
     # modify at the injection step (see _resolve_control_mask /
@@ -1570,7 +1639,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
                     f"{(model.n_points / jc_factor) ** 0.5:.4g} hPa on this grid)")
         jc_ref = (jc_field, p1, p2, jc_w, jc_factor)
 
-    optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd, betas=(beta1,beta2))
+    optimizer = torch.optim.AdamW([control], lr=lr, weight_decay=wd, betas=(beta1,beta2))
 
     # linear warmup/cosine decay
     # (parameters: warmup_steps, start_factor, end_factor)
@@ -1605,6 +1674,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     loss_min = 1e19
     epoch_min = 1
     increment_best = None
+    control_best = None
 
     # '_loss_latent_' kept (not '_loss_') for continuity with existing
     # loss-history file naming.
@@ -1629,7 +1699,13 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # loss surface for the fixed `increment`. No-op for AIFS.
         model._prime_noise()
         optimizer.zero_grad()
+        increment = control if jb_op is None else jb_op(control)
         loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref)
+        if jb_op is not None:
+            Jb = jb_weight * control.pow(2).sum()
+            if print_every > 0 and (epoch % print_every == 0 or epoch == 1):
+                print(f"epoch {epoch}, Jb = {Jb.item()}, Jo+Jc = {loss.item()}, Jtot = {loss.item() + Jb.item()}")
+            loss = loss + Jb
 
         if not torch.isfinite(loss):
             logger.warning(f'epoch={epoch}: non-finite loss ({loss.item()}), stopping optimization early')
@@ -1662,9 +1738,9 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # there is no known case where skip-and-continue actually helped.
         # Raising here makes that failure visible (nonzero exit, full
         # traceback) instead of silently masking a stalled optimization.
-        if not torch.isfinite(increment.grad).all():
+        if not torch.isfinite(control.grad).all():
             raise RuntimeError(
-                f'epoch={epoch}: non-finite gradient in increment -- stopping. '
+                f'epoch={epoch}: non-finite gradient in the control -- stopping. '
                 f'This indicates a real numerical instability (e.g. an overly '
                 f'aggressive learn_rate/window-length for this backend/checkpoint), '
                 f'not a transient blip -- see the "non-finite gradient" comment above.'
@@ -1685,10 +1761,11 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             loss_min = loss.item()
             epoch_min = epoch
             increment_best = increment.detach().clone()
+            control_best = control.detach().clone() if jb_op is not None else None
         else:
             lsave.append(lsave[-1])
 
-        torch.nn.utils.clip_grad_norm_([increment], max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_([control], max_norm=1.0)
 
         optimizer.step()
         scheduler.step()
@@ -1696,7 +1773,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
 
     if increment_best is not None:
         pt_file = exp['path_output'] + exp['date'] + '_latent_increment_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(max_epoch) + 'it.pt'
-        torch.save({'increment': increment_best, 'latent_scale': latent_scale}, pt_file)
+        torch.save({'increment': increment_best, 'latent_scale': latent_scale, 'control': control_best,
+                    'jb_samples': exp.get('jb_samples'), 'jb_loc_km': exp.get('jb_loc_km')}, pt_file)
         logger.info(f'saved best latent increment (for epoch={epoch_min}) to {pt_file}')
     else:
         logger.warning('no epoch improved on the background -- returning an UNCORRECTED forecast advance')
