@@ -171,7 +171,7 @@ class AIFSModel(forecast_model.LatentForecastModel):
 
     def __init__(self, checkpoint_path: str, config_path: str, device: str = "cuda",
                  autocast_dtype: Optional[Union[str, torch.dtype]] = None,
-                 compile_wrapper: bool = False):
+                 compile_wrapper: bool = False, attention: Optional[str] = None):
         """
         Parameters
         ----------
@@ -220,6 +220,17 @@ class AIFSModel(forecast_model.LatentForecastModel):
             correctness/speed not yet validated at real production scale
             when this param was added -- see integrate_multiple_backends.md for whatever the
             first real test found.
+        attention : str, optional
+            None (default) keeps the checkpoint's own attention
+            implementation (flash-attn for the AIFS checkpoints).
+            'block_sliding_window' replaces it after loading with
+            `aifs_attention.BlockSlidingWindowAttention`, an exact
+            flash-attn-free equivalent for platforms without flash-attn
+            (ROCm/MI300X); a stub `flash_attn` module is installed first if
+            the real one is missing, so the checkpoint still unpickles.
+            'flex_sliding_window' does the same with
+            `aifs_attention.FlexSlidingWindowAttention` (compiled
+            flex_attention).
         """
         # `device` isn't in aifs_inference.yaml (it has no fixed GPU/CPU
         # assumption baked in) -- pass it as an explicit override so callers
@@ -241,7 +252,16 @@ class AIFSModel(forecast_model.LatentForecastModel):
             torch.backends.cudnn.allow_tf32 = True
 
         config = RunConfiguration.load(config_path, [f"device={device}", f"checkpoint={checkpoint_path}"])
+        impls = {"block_sliding_window": "block", "flex_sliding_window": "flex"}
+        if attention is not None and attention not in impls:
+            raise ValueError(f"attention={attention!r}: expected None or one of {sorted(impls)}")
+        if attention is not None:
+            import aifs_attention
+            aifs_attention.install_flash_attn_stub()
         self.runner = create_runner(config)
+        if attention is not None:
+            n_swapped = aifs_attention.use_sliding_window_attention(self.runner.model, impls[attention])
+            print(f"attention: {attention} in {n_swapped} attention layers")
         self.runner.model.eval()
         # We only ever want gradients w.r.t. OUR control-vector increment,
         # never w.r.t. AIFS's pretrained weights -- torch.load doesn't set
