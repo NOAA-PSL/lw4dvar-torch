@@ -19,12 +19,21 @@ documented in `config.yml.template`.
 ## Rules that apply to every task
 
 - **One conda env per backend, never merged** -- run each backend in its
-  own env with its own launcher: `aifs2`/`aifs1` (`run_aifs.sh`), `fcstnet3`
+  own env with its own launcher: `aifs2`/`aifs1` (`run_aifs.sh`), `aifs3`
+  (`run_aifs3.sh`; AIFS checkpoints on the multi-dataset anemoi API, e.g.
+  the 1-degree `aifs2-1deg-ic1` -> `AIFS3Model`), `fcstnet3`
   (`run_fcn3.sh`; also runs `sfno` via `run_sfno.sh`), `aurora` (`run_aurora.sh`),
   `ace2` (`run_ace2.sh`), all
   under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2ic` is a
   login-node-only env for ACE2 IC/verification fetching. Backend modules are
   imported lazily so a process never needs another backend's dependencies.
+  Exception: `aifs2-1.0deg-v1.0` (a user-trained checkpoint, still
+  `model_backend: aifs`) needs its own env (`lwaifs2`, `run_aifs2-1.0deg-
+  v1.0.sh`) because of a dependency pin gap in the shared `aifs2` env that
+  this account can't fix in place (not group-writable) -- see
+  `integrate_aifs2-1deg-v1.0_backend.md`. The conda env is really keyed by
+  *checkpoint*, not strictly by *backend*, whenever two checkpoints of the
+  same backend need genuinely different pins.
 - **Compute (GPU) nodes have no internet.** Every IC, verification file,
   checkpoint and forcing file must be prefetched from a login node first
   (`backends/<name>/*_prefetch_*.py`, `backends/ace2/ace2_ic.py`).
@@ -47,7 +56,7 @@ documented in `config.yml.template`.
 | Document | Read it when working on |
 |---|---|
 | `running_at_alcf.md` | running on ALCF Polaris (PBS): building envs there, `run_ace2_polaris.sh`, A100 memory limits, Eagle data paths |
-| `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics |
+| `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics, the AIFS dry-air mass fixer (`dry_mass_fixer`)|
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.
