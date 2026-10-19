@@ -99,6 +99,12 @@ exp:
       # moisture at all.
       #q_error_fraction: 0.2
       #q_error_floor_kg_kg: 1.e-5
+      # Or a fixed per-level q error (g/kg; ln(p)-interpolated between entries,
+      # nearest beyond them), replacing the fraction-of-ob error, which weights
+      # dry obs most and pulls the analysis dry. And a background check on q:
+      # reject |O-B| > q_bg_check * error (off when unset).
+      #q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      #q_bg_check: 4.0
       # Radiosonde humidity sensors are unreliable above the lower/mid
       # troposphere -- mask 'q' at any matched level with pressure below this
       # (set null to disable the floor entirely).
