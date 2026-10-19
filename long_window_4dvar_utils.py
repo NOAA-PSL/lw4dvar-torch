@@ -293,6 +293,11 @@ _PSOBS_CONFIG_KEYS = {
     'use_source_error': 'psobs_use_source_error',
     'error_std_hpa': 'surface_pressure_error_std_hpa',
 }
+# Default per-level raob q error (hPa: g/kg): Desroziers estimates from a
+# ps + raobs run, cycles 2-10 (integrate_prepbufr_obs.md)
+RAOBS_Q_ERROR_G_KG = {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+RAOBS_Q_BG_CHECK = 4.0
+
 _RAOBS_CONFIG_KEYS = {
     'path': 'raobs_path',
     'variables': 'raobs_variables',
@@ -1131,15 +1136,15 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
             # q_error_g_kg {hPa: g/kg}: a fixed per-level error instead of the
             # fraction of the ob (which weights dry obs most and pulls the
             # analysis dry); levels between table entries interpolate in ln(p),
-            # beyond them take the nearest entry
-            table = exp.get('raobs_q_error_g_kg')
+            # beyond them take the nearest entry; null falls back to the fraction
+            table = exp.get('raobs_q_error_g_kg', RAOBS_Q_ERROR_G_KG)
             if table:
                 tp = np.array(sorted(float(k) for k in table))
                 tv = np.array([float(table[k]) for k in sorted(table, key=float)])
                 lev = np.asarray(levels_hpa['q'], dtype=float)
                 err = np.interp(np.log(lev), np.log(tp), tv) * 1.e-3
                 raobs_traj['error_q_level'] = torch.as_tensor(err, dtype=torch.float32, device=device)
-            bgc = exp.get('raobs_q_bg_check')
+            bgc = exp.get('raobs_q_bg_check', RAOBS_Q_BG_CHECK)
             raobs_traj['q_bg_check'] = float(bgc) if bgc else None
         else:
             raobs_traj['error_'+base] = float(error_std[base])

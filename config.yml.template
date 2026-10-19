@@ -91,19 +91,17 @@ exp:
       # Observation-error standard deviations for temperature (K) and wind
       # components (m/s) -- NOT specific humidity, see below.
       #error_std: {t: 1.0, u: 2.0, v: 2.0}
-      # Specific humidity has no fixed physical error scale (near zero in the
-      # upper troposphere, several g/kg at the surface) -- its error is a
-      # FRACTION of the observed value instead, floored so it never collapses
-      # to ~0 wherever the observation itself is tiny. No reference-repo
-      # precedent for any of this -- greg-long-window-4dvar never assimilated
-      # moisture at all.
+      # Specific humidity error: a fixed per-level table (g/kg; ln(p)-
+      # interpolated between entries, nearest beyond them). Default below:
+      # Desroziers estimates from a ps + raobs run. Set null to use instead a
+      # FRACTION of the observed value, floored (q_error_fraction /
+      # q_error_floor_kg_kg) -- the old default, which weights dry obs most and
+      # pulls the analysis dry.
+      #q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
       #q_error_fraction: 0.2
       #q_error_floor_kg_kg: 1.e-5
-      # Or a fixed per-level q error (g/kg; ln(p)-interpolated between entries,
-      # nearest beyond them), replacing the fraction-of-ob error, which weights
-      # dry obs most and pulls the analysis dry. And a background check on q:
-      # reject |O-B| > q_bg_check * error (off when unset).
-      #q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      # Background check on q: reject |O-B| > q_bg_check * error, at the
+      # current state (default 4.0; null turns it off).
       #q_bg_check: 4.0
       # Radiosonde humidity sensors are unreliable above the lower/mid
       # troposphere -- mask 'q' at any matched level with pressure below this
