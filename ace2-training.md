@@ -436,8 +436,9 @@ on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
       seeds and picks one by multi-year evaluation (time-mean climate and
       trends) -- a follow-on step if we need it.
 - [ ] Ursa run (see "Training on Ursa"): config, launcher, stats, smoke and
-      throughput tests done; full run to be submitted after the Ursa
-      maintenance starting 2026-10-14T12:00 (`sbatch run_ace2_train_ursa.sh`).
+      throughput tests done; full 120-epoch run on 4 nodes submitted
+      2026-10-14 (job 23736094, 7 days, seed 0, experiment dir
+      `/scratch4/BMC/gsienkf/whitaker/ace2_training/ace2-era5-vars-1979-2022-no2015`).
 - [ ] Yearly forcing files from our dataset for inference in lw4dvar.
 - [ ] Higher vertical resolution + extra layer fields for radiances. Memory
       probe done (see "Memory probe" above): up to 48 layers fit at embed

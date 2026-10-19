@@ -1646,6 +1646,14 @@ obs are NH and ~9% SH, so the SH carried little of the loss.
   branch saw q850 degrade); the up-weighting of isolated obs (effective sigma
   down to ~0.18x) is the main risk -- a cap w <= 1 (thinning only) is the
   untested fallback.
+- **Box geometry** (checked 2026-10-19): the cos(box-centre lat) factor makes
+  each box's total weight exactly proportional to its spherical area (a band's
+  area is 2 cos(lat_c) sin(dlat/2) dlon, and the constant cancels in the
+  rescaling). But the boxes' physical size still shrinks poleward (10 deg of
+  longitude is ~190 km at 85 deg), so obs are grouped over shorter distances
+  near the poles than at the equator. Probably minor, given few
+  high-latitude stations; if high-latitude fits look off, switch to equal-area
+  bins (HEALPix, or longitude width scaled by 1/cos(lat) per row).
 
 ## Known gaps / next steps
 
