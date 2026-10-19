@@ -121,6 +121,7 @@ purely through `model.advance`/`model.decode_state`).
 """
 
 import copy
+import importlib
 import json
 import logging
 import math
@@ -340,6 +341,8 @@ def load_config(config_path='config.yml'):
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
     if float(exp.get('obs_density_box_deg', 0.0)) < 0:
         raise ValueError(f"obs_density_box_deg must be >= 0 (degrees; 0 = off), got {exp['obs_density_box_deg']!r}")
+    if _dry_mass_fixer_hpa(exp) is not None and backend != 'aifs':
+        raise ValueError(f"dry_mass_fixer is only implemented for model_backend 'aifs', got {backend!r}")
     # More than one DA cycle requires cycle: True. With cycle: False the driver
     # never advances the previous analysis (valid at window_start + dt_verif)
     # to the next cycle time -- it falls through to the next-window-in-the-
@@ -424,6 +427,9 @@ def log_window(exp, logger):
                                         if exp.get('jc_ps_weight') else '(off)'))
     logger.info('   obs_density_box_deg: ' + (str(exp['obs_density_box_deg']) + ' (area-weighted Jo)'
                                                if exp.get('obs_density_box_deg') else '(off)'))
+    if exp['model_backend'] == 'aifs':
+        pdry = _dry_mass_fixer_hpa(exp)
+        logger.info('   dry_mass_fixer: ' + (f'{pdry} hPa (global-mean sp - g*tcw)' if pdry is not None else '(off)'))
     logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
     logger.info('   diurnal_clim: ' + str(exp.get('diurnal_clim', '(off -- linear time interpolation)')))
     if exp['model_backend'] == 'fcn3':
@@ -448,18 +454,49 @@ def log_window(exp, logger):
 # model / grid
 # ---------------------------------------------------------------------------
 
+DEFAULT_DRY_MASS_TARGET_HPA = 983.2  # ERA5 global-mean sp - g*tcw, Jan-Mar 2015, 1-deg and 0.25-deg grids
+
+
+def _dry_mass_fixer_hpa(exp):
+    """The dry-mass fixer's target in hPa, or None when off: `dry_mass_fixer`
+    (true/false, default false) switches it on, `dry_mass_target_hpa` sets the
+    global-mean dry surface pressure (default DEFAULT_DRY_MASS_TARGET_HPA)."""
+    on = exp.get('dry_mass_fixer', False)
+    if not isinstance(on, bool):
+        raise ValueError(f"dry_mass_fixer must be true or false (set the value with dry_mass_target_hpa), got {on!r}")
+    if not on:
+        return None
+    pdry = float(exp.get('dry_mass_target_hpa', DEFAULT_DRY_MASS_TARGET_HPA))
+    if not 900.0 <= pdry <= 1050.0:
+        raise ValueError(f"dry_mass_target_hpa must be a dry surface pressure in hPa (~983), got {pdry!r}")
+    return pdry
+
+
 def get_model(exp):
     backend = exp['model_backend']
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
-        import aifs_model
-        return aifs_model.AIFSModel(
+        # The aifs3 env (anemoi-inference >= 0.12, multi-dataset API; e.g. the
+        # 1-degree aifs2-1deg-ic1 checkpoint) needs AIFS3Model; the aifs1/aifs2
+        # envs keep AIFSModel. Chosen by the installed API, since each
+        # checkpoint only loads in its own env anyway.
+        import importlib.util
+        if importlib.util.find_spec('anemoi.inference.tensors') is not None:
+            import aifs3_model as aifs_model
+            model_class = aifs_model.AIFS3Model
+        else:
+            import aifs_model
+            model_class = aifs_model.AIFSModel
+        model = model_class(
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
             autocast_dtype=_autocast_torch_dtype(exp, 'aifs'),
             compile_wrapper=exp.get('compile_wrapper', False),
+            attention=exp.get('aifs_attention'),
         )
+        model.set_dry_mass_fixer(_dry_mass_fixer_hpa(exp))
+        return model
     elif backend == 'fcn3':
         _ensure_backend_on_path('fcn3')
         import fcn3_model
@@ -593,7 +630,7 @@ def get_input(exp, model, logger):
         back_dt = _to_utc_datetime(back_date, backend)
         if backend == 'aifs':
             _ensure_backend_on_path('aifs')
-            import aifs_ic
+            aifs_ic = importlib.import_module(getattr(model, 'ic_module', 'aifs_ic'))  # aifs3_ic for AIFS3Model
             input_state = aifs_ic.build_input_state(model.runner, back_dt, cache_dir, lagged=True)
         elif backend == 'fcn3':
             _ensure_backend_on_path('fcn3')
@@ -654,7 +691,7 @@ def get_verif(exp, model, logger, date_override=None):
     verif_ic = {}
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
-        import aifs_ic
+        aifs_ic = importlib.import_module(getattr(model, 'ic_module', 'aifs_ic'))  # aifs3_ic for AIFS3Model
         raw_fields = aifs_ic.read_single_date_fields(model.runner, date_dt, cache_dir)
         # Single-date snapshot: pack directly rather than through
         # model.prepare_initial_state() (which expects a full
