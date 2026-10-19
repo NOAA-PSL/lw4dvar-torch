@@ -262,6 +262,9 @@ reads parquet unconditionally, with no dead code path. Implementation:
   never collapses near-zero wherever q itself is tiny -- a flat absolute
   error makes no physical sense across q's full range, and has no
   reference-repo precedent.
+  Optional replacement (2026-10-17): a fixed per-level q error table
+  (`q_error_g_kg`) and a background check on q (`q_bg_check`) -- see
+  "Radiosonde humidity error and background check" below.
 - **Loss integration**: a `raobs_traj=None`-gated branch inside
   `compute_loss_4dvar`'s existing per-step loop (`_raobs_term`, parallel to
   `_obs_term`) -- NOT a second rollout. This works because `get_raobs`
@@ -429,3 +432,71 @@ What needed repo-specific work beyond a straight copy:
   repo's own convention -- see CLAUDE.md) and were not ported; the
   validation results they produced are summarized under "Verification"
   above instead.
+
+## Known issue: radiosonde temperature is virtual temperature (found 2026-10-17)
+
+- **The issue:** the archive's `temperature_c` is the current PREPBUFR TOB.
+  Wherever humidity was reported, that value is virtual temperature (the
+  event stack's program code 8, VIRTMP).
+- **Where it went wrong:** `raobs_parquet.py` read it as `t` and compared it
+  with the model's sensible temperature.
+- **Size:** against ERA5 (2015-01-10), sonde O - ERA5 is +1.0 K at
+  925-1000 hPa, +0.75 K at 850 hPa, +0.23 K at 500 hPa and about 0 above
+  300 hPa. Converting with Tv - T = Tv(1 - 1/(1 + 0.6078 q)), using the
+  sonde's own q, brings 850 hPa to +0.04 K. That conversion matches the
+  event stack's pre-VIRTMP value to within 0.07 K.
+- **Effect:** raob-assimilating runs are pulled warm in the moist lower
+  troposphere.
+- **Fix:** `raobs_parquet.py` now takes `t` from the first non-VIRTMP event
+  (`prepbufr_parquet_common.sensible_temperature`). On 2015-01-10, the
+  change in the values (old - new) is 1.30 / 0.90 / 0.73 / 0.42 / 0.15 K at
+  1000 / 925 / 850 / 700 / 500 hPa, and 0 above 250 hPa. The QC masks are
+  unchanged.
+- **Affected runs:** every raob run made before the fix assimilated Tv as T.
+
+## Radiosonde humidity error and background check (2026-10-17)
+
+- **Problem:** the default q error, 20% of the observed value, gives dry
+  obs the smallest errors, so they get the most weight and pull the
+  analysis dry. In 10 cycles from 2015-01-01 (AIFS-single 2.0, ps +
+  raobs), it also degraded every other variable.
+- **`q_error_g_kg`:** a fixed per-level error, {hPa: g/kg}, interpolated in
+  ln(p) between entries and taking the nearest entry beyond them. The
+  values in config.yml.template are Desroziers estimates from a ps + raobs
+  run (cycles 2-10).
+- **`q_bg_check`:** rejects q obs with |O - B| > q_bg_check * error. It is
+  re-evaluated at the current state on every loss evaluation. Off when
+  unset. Temperature and wind have no background check.
+- **Result** (10 cycles, global analysis RMSE vs ERA5, window mean; before
+  the Tv fix):
+
+  | run | z500 (m) | q850 (g/kg) | ws250 (m/s) |
+  |---|---|---|---|
+  | ps + raobs, 20% q error | 10.82 | 1.445 | 3.95 |
+  | ps + raobs, t/u/v only (no q) | 7.92 | 1.336 | 3.21 |
+  | ps + raobs, q table + 4-sigma bg check | 7.93 | 1.318 | 3.21 |
+
+  The q table removes the dry bias: B - ERA5 at 850 hPa goes from
+  -0.17 to +0.02 g/kg.
+
+
+## Forecast skill with both fixes (2026-10-19)
+
+30 daily 5-day forecasts, 2015-01-06T00 to 2015-02-04T00, from the
+window-end analyses (`diagnostics/forecast_skill.py`). Runs: Bo's ps +
+raobs (`ps_raob_bo`, before both fixes) and `lwatms_6mo_ps_raobs_qerr_tsens`
+(q table + 4-sigma q bg check + sensible T). Global RMSE:
+
+| | 0 h | 24 h | 72 h | 120 h |
+|---|---|---|---|---|
+| z500 vs ERA5 (m), before / after | 13.4 / 10.9 | 19.9 / 16.3 | 39.3 / 33.9 | 61.6 / 55.4 |
+| t850 vs ERA5 (K) | 1.20 / 1.05 | 1.40 / 1.21 | 2.16 / 1.88 | 3.03 / 2.74 |
+| q850 vs ERA5 (g/kg) | 1.58 / 1.41 | 1.65 / 1.49 | 1.87 / 1.75 | 2.12 / 2.02 |
+| 250 hPa wind speed vs ERA5 (m/s) | 4.36 / 3.68 | 5.43 / 4.67 | 7.95 / 7.18 | 10.39 / 9.59 |
+| surface pressure O - F (hPa) | 1.33 / 1.20 | 1.97 / 1.66 | 4.09 / 3.44 | 6.61 / 5.81 |
+| sonde t850 O - F (K) | 1.46 / 1.37 | 1.62 / 1.52 | 2.56 / 2.22 | 3.65 / 3.26 |
+
+Every variable and lead improves. Lead 0 is in-sample against obs.
+The two runs differ in hardware and attention kernel as well as in the fixes;
+in a 10-cycle test that difference alone was about 0.8 m on z500, in the
+other direction (our replica of Bo's config was worse).

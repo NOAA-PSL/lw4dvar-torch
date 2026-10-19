@@ -306,6 +306,8 @@ _RAOBS_CONFIG_KEYS = {
     'error_std': 'raobs_error_std',
     'q_error_fraction': 'raobs_q_error_fraction',
     'q_error_floor_kg_kg': 'raobs_q_error_floor_kg_kg',
+    'q_error_g_kg': 'raobs_q_error_g_kg',
+    'q_bg_check': 'raobs_q_bg_check',
     'humidity_min_pressure_hpa': 'raobs_humidity_min_pressure_hpa',
     'station_capacity': 'raobs_station_capacity',
 }
@@ -1126,6 +1128,19 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
         if base == 'q':
             raobs_traj['error_q_fraction'] = float(q_error_fraction)
             raobs_traj['error_q_floor'] = float(q_error_floor)
+            # q_error_g_kg {hPa: g/kg}: a fixed per-level error instead of the
+            # fraction of the ob (which weights dry obs most and pulls the
+            # analysis dry); levels between table entries interpolate in ln(p),
+            # beyond them take the nearest entry
+            table = exp.get('raobs_q_error_g_kg')
+            if table:
+                tp = np.array(sorted(float(k) for k in table))
+                tv = np.array([float(table[k]) for k in sorted(table, key=float)])
+                lev = np.asarray(levels_hpa['q'], dtype=float)
+                err = np.interp(np.log(lev), np.log(tp), tv) * 1.e-3
+                raobs_traj['error_q_level'] = torch.as_tensor(err, dtype=torch.float32, device=device)
+            bgc = exp.get('raobs_q_bg_check')
+            raobs_traj['q_bg_check'] = float(bgc) if bgc else None
         else:
             raobs_traj['error_'+base] = float(error_std[base])
 
@@ -1328,10 +1343,11 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
 
     Returns `{base: (innovation, model_equivalent, effective_error, used)}`,
     one entry per `raobs_traj['variables']`. Unlike the ps forward
-    operator, there is no orography/background-gross-error QC here (just
-    read-time QC, already folded into `mask_<base>`) and no elevation-based
-    reduction -- each variable is compared against the model's own native
-    level directly.
+    operator, there is no orography QC and no elevation-based reduction --
+    each variable is compared against the model's own native level directly.
+    QC is the read-time QC already folded into `mask_<base>`, plus, for q
+    only, an optional background check (`q_bg_check`: reject
+    |O-B| > q_bg_check * error, evaluated at the current state).
     """
     idx = raobs_traj['interp_idx'][oind]
     wts = raobs_traj['interp_wts'][oind]
@@ -1345,10 +1361,15 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
         safe_model_obspace = torch.where(interpolation_failed, torch.zeros_like(model_obspace), model_obspace)
         innovation = observation - safe_model_obspace
         if base == 'q':
-            effective_error = torch.clamp(
-                raobs_traj['error_q_fraction'] * observation.abs(),
-                min=raobs_traj['error_q_floor'],
-            )
+            if raobs_traj.get('error_q_level') is not None:
+                effective_error = raobs_traj['error_q_level'][:, None].expand_as(observation)
+            else:
+                effective_error = torch.clamp(
+                    raobs_traj['error_q_fraction'] * observation.abs(),
+                    min=raobs_traj['error_q_floor'],
+                )
+            if raobs_traj.get('q_bg_check'):
+                used = used & (innovation.abs() <= raobs_traj['q_bg_check'] * effective_error).detach()
         else:
             effective_error = torch.full_like(observation, raobs_traj['error_'+base])
         results[base] = (innovation, safe_model_obspace, effective_error, used)

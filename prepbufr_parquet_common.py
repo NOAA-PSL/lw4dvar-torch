@@ -109,3 +109,39 @@ def quality_passes(value, maximum):
     if maximum is None:
         return True
     return np.isfinite(value) and value <= float(maximum)
+
+
+VIRTMP_PROGRAM_CODE = 8
+_EVENT_COLUMNS = ['report_id', 'level_index', 'value_mnemonic', 'event_index', 'value', 'program_code']
+
+
+def sensible_temperature(cycle_directory, prepbufr_class, report_ids, level_indices, temperature_c):
+    """Sensible temperature (deg C) for the levels' current TOB values.
+
+    The archive's `temperature_c` is the current (top-of-stack) TOB. Wherever
+    moisture was reported, that is virtual temperature, written by PREPBUFR's
+    VIRTMP step (program code 8). This returns, for each (report_id,
+    level_index), the first event in the stack whose program is not VIRTMP,
+    falling back to the input value when there are no events. Values that are
+    NaN on input stay NaN.
+    """
+    events = read_partition(class_file(cycle_directory, 'events', prepbufr_class), _EVENT_COLUMNS)
+    mnemonic = np.asarray(events['value_mnemonic'].to_pylist())
+    keep = mnemonic == 'TOB'
+    rid = column(events, 'report_id', np.int64)[keep]
+    lev = column(events, 'level_index', np.int64)[keep]
+    idx = column(events, 'event_index', np.int64)[keep]
+    val = column(events, 'value')[keep]
+    prog = column(events, 'program_code')[keep]
+    ok = prog != VIRTMP_PROGRAM_CODE
+    rid, lev, idx, val = rid[ok], lev[ok], idx[ok], val[ok]
+    order = np.lexsort((idx, lev, rid))
+    rid, lev, val = rid[order], lev[order], val[order]
+    first = np.ones(len(rid), bool)
+    first[1:] = (rid[1:] != rid[:-1]) | (lev[1:] != lev[:-1])
+    sensible = dict(zip(zip(rid[first].tolist(), lev[first].tolist()), val[first].tolist()))
+    out = np.asarray(temperature_c, dtype=np.float64).copy()
+    for i, key in enumerate(zip(np.asarray(report_ids).tolist(), np.asarray(level_indices).tolist())):
+        if np.isfinite(out[i]):
+            out[i] = sensible.get(key, out[i])
+    return out
