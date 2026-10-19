@@ -262,7 +262,7 @@ reads parquet unconditionally, with no dead code path. Implementation:
   never collapses near-zero wherever q itself is tiny -- a flat absolute
   error makes no physical sense across q's full range, and has no
   reference-repo precedent.
-  Optional replacement (2026-10-17): a fixed per-level q error table
+  Superseded as the default (2026-10-19) by a fixed per-level q error table
   (`q_error_g_kg`) and a background check on q (`q_bg_check`) -- see
   "Radiosonde humidity error and background check" below.
 - **Loss integration**: a `raobs_traj=None`-gated branch inside
@@ -462,11 +462,11 @@ What needed repo-specific work beyond a straight copy:
   raobs), it also degraded every other variable.
 - **`q_error_g_kg`:** a fixed per-level error, {hPa: g/kg}, interpolated in
   ln(p) between entries and taking the nearest entry beyond them. The
-  values in config.yml.template are Desroziers estimates from a ps + raobs
-  run (cycles 2-10).
+  default (`RAOBS_Q_ERROR_G_KG`) is Desroziers estimates from a ps + raobs
+  run (cycles 2-10). Set null to go back to the fraction-of-ob error.
 - **`q_bg_check`:** rejects q obs with |O - B| > q_bg_check * error. It is
-  re-evaluated at the current state on every loss evaluation. Off when
-  unset. Temperature and wind have no background check.
+  re-evaluated at the current state on every loss evaluation. Default 4.0;
+  null turns it off. Temperature and wind have no background check.
 - **Result** (10 cycles, global analysis RMSE vs ERA5, window mean; before
   the Tv fix):
 
