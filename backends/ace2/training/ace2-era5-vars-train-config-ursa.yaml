@@ -1,0 +1,258 @@
+# Ursa copy of ace2-era5-vars-train-config.yaml (identical except paths; keep
+# the two in sync). ACE2 trained from scratch on our ARCO-ERA5 dataset
+# (ace2-training.md): ACE2-ERA5's stepper with ACE2.1-ERA5's training
+# settings; train 1979-2014 + 2016-2022, 2015 held out for validation and
+# inline inference (16 ICs: a multiple of 2, 4, 8 or 16 GPUs).
+# Ursa u1-h100 nodes have 2 x 80 GB H100: global batch 16 is 8 samples/GPU on
+# 1 node, 4 on 2, 2 on 4, 1 on 8. No gradient checkpointing needed from 2
+# nodes up (embed 384: ~17 GB at 1 sample, ~25 GB at 2, est. ~42 GB at 4
+# before DDP's +1.7 GB -- see "Memory probe" in ace2-training.md); on 1 node
+# add --override stepper.step.config.builder.config.checkpointing=3.
+# Launcher: run_ace2_train_ursa.sh.
+experiment_dir: /scratch4/BMC/gsienkf/whitaker/ace2_training/ace2-era5-vars-1979-2022-no2015
+save_checkpoint: true
+validate_using_ema: true
+max_epochs: 120
+seed: 0
+ema:
+  decay: 0.999
+inference:
+  n_forward_steps: 1440
+  forward_steps_in_memory: 40
+  loader:
+    start_indices:
+      times:
+      - '2015-01-01T00:00:00'
+      - '2015-01-01T06:00:00'
+      - '2015-01-01T12:00:00'
+      - '2015-01-01T18:00:00'
+      - '2015-01-02T00:00:00'
+      - '2015-01-02T06:00:00'
+      - '2015-01-02T12:00:00'
+      - '2015-01-02T18:00:00'
+      - '2015-01-03T00:00:00'
+      - '2015-01-03T06:00:00'
+      - '2015-01-03T12:00:00'
+      - '2015-01-03T18:00:00'
+      - '2015-01-04T00:00:00'
+      - '2015-01-04T06:00:00'
+      - '2015-01-04T12:00:00'
+      - '2015-01-04T18:00:00'
+    dataset:
+      data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer
+      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+    num_data_workers: 8
+  aggregator:
+    log_histograms: true
+    time_mean_reference_data: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer/stats-1990-01-2019-12/time-mean.nc
+logging:
+  log_to_screen: true
+  log_to_wandb: false
+  log_to_file: true
+  project: ace
+  entity: ai2cm
+train_loader:
+  batch_size: 16
+  num_data_workers: 8
+  prefetch_factor: 4
+  dataset:
+    concat:
+    - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer
+      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      subset:
+        start_time: '1979-01-01T00:00:00'
+        stop_time: '2014-12-31T06:00:00'
+    - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer
+      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      subset:
+        start_time: '2016-01-01T00:00:00'
+        stop_time: '2022-12-31T06:00:00'
+validation_loader:
+  batch_size: 128
+  num_data_workers: 8
+  prefetch_factor: 4
+  dataset:
+    data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer
+    file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+    subset:
+      start_time: '2015-01-01T00:00:00'
+      stop_time: '2015-12-31T06:00:00'
+      step: 3
+optimization:
+  use_gradient_accumulation: true
+  enable_automatic_mixed_precision: false
+  lr: 0.0001
+  optimizer_type: AdamW
+  kwargs:
+    fused: true
+    weight_decay: 0.01
+stepper_training:
+  n_forward_steps: 2
+  loss:
+    type: MSE
+    weights:
+      DLWRFsfc: 2
+      DSWRFsfc: 2
+      PRATEsfc: 0.5
+      Q2m: 0.5
+      TMP850: 5
+      ULWRFsfc: 5
+      USWRFsfc: 2
+      USWRFtoa: 2
+      air_temperature_0: 0.5
+      air_temperature_1: 0.5
+      eastward_wind_0: 0.5
+      h500: 10
+      northward_wind_0: 0.5
+      specific_total_water_0: 0.5
+      specific_total_water_1: 0.25
+      specific_total_water_2: 0.5
+      tendency_of_total_water_path_due_to_advection: 0.5
+stepper:
+  step:
+    type: single_module
+    config:
+      builder:
+        type: SphericalFourierNeuralOperatorNet
+        config:
+          embed_dim: 384
+          filter_type: linear
+          hard_thresholding_fraction: 1.0
+          normalization_layer: instance_norm
+          num_layers: 8
+          operator_type: dhconv
+          pos_embed: true
+          scale_factor: 1
+          separable: false
+          spectral_layers: 3
+          spectral_transform: sht
+          use_mlp: true
+          checkpointing: 0
+      normalization:
+        network:
+          global_means_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer/stats-1990-01-2019-12/centering.nc
+          global_stds_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer/stats-1990-01-2019-12/scaling-full-field.nc
+        residual:
+          global_means_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer/stats-1990-01-2019-12/centering.nc
+          global_stds_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer/stats-1990-01-2019-12/scaling-residual.nc
+      ocean:
+        surface_temperature_name: surface_temperature
+        ocean_fraction_name: ocean_fraction
+      corrector:
+        conserve_dry_air: true
+        moisture_budget_correction: advection_and_precipitation
+        force_positive_names:
+        - specific_total_water_0
+        - specific_total_water_1
+        - specific_total_water_2
+        - specific_total_water_3
+        - specific_total_water_4
+        - specific_total_water_5
+        - specific_total_water_6
+        - specific_total_water_7
+        - Q2m
+        - PRATEsfc
+        - ULWRFsfc
+        - ULWRFtoa
+        - DLWRFsfc
+        - DSWRFsfc
+        - USWRFsfc
+        - USWRFtoa
+      next_step_forcing_names:
+      - DSWRFtoa
+      in_names:
+      - land_fraction
+      - ocean_fraction
+      - sea_ice_fraction
+      - DSWRFtoa
+      - HGTsfc
+      - global_mean_co2
+      - PRESsfc
+      - surface_temperature
+      - TMP2m
+      - Q2m
+      - UGRD10m
+      - VGRD10m
+      - air_temperature_0
+      - air_temperature_1
+      - air_temperature_2
+      - air_temperature_3
+      - air_temperature_4
+      - air_temperature_5
+      - air_temperature_6
+      - air_temperature_7
+      - specific_total_water_0
+      - specific_total_water_1
+      - specific_total_water_2
+      - specific_total_water_3
+      - specific_total_water_4
+      - specific_total_water_5
+      - specific_total_water_6
+      - specific_total_water_7
+      - eastward_wind_0
+      - eastward_wind_1
+      - eastward_wind_2
+      - eastward_wind_3
+      - eastward_wind_4
+      - eastward_wind_5
+      - eastward_wind_6
+      - eastward_wind_7
+      - northward_wind_0
+      - northward_wind_1
+      - northward_wind_2
+      - northward_wind_3
+      - northward_wind_4
+      - northward_wind_5
+      - northward_wind_6
+      - northward_wind_7
+      out_names:
+      - PRESsfc
+      - surface_temperature
+      - air_temperature_0
+      - air_temperature_1
+      - air_temperature_2
+      - air_temperature_3
+      - air_temperature_4
+      - air_temperature_5
+      - air_temperature_6
+      - air_temperature_7
+      - specific_total_water_0
+      - specific_total_water_1
+      - specific_total_water_2
+      - specific_total_water_3
+      - specific_total_water_4
+      - specific_total_water_5
+      - specific_total_water_6
+      - specific_total_water_7
+      - eastward_wind_0
+      - eastward_wind_1
+      - eastward_wind_2
+      - eastward_wind_3
+      - eastward_wind_4
+      - eastward_wind_5
+      - eastward_wind_6
+      - eastward_wind_7
+      - northward_wind_0
+      - northward_wind_1
+      - northward_wind_2
+      - northward_wind_3
+      - northward_wind_4
+      - northward_wind_5
+      - northward_wind_6
+      - northward_wind_7
+      - LHTFLsfc
+      - SHTFLsfc
+      - PRATEsfc
+      - ULWRFsfc
+      - ULWRFtoa
+      - DLWRFsfc
+      - DSWRFsfc
+      - USWRFsfc
+      - USWRFtoa
+      - tendency_of_total_water_path_due_to_advection
+      - TMP850
+      - h500
+      - TMP2m
+      - Q2m
+      - UGRD10m
+      - VGRD10m

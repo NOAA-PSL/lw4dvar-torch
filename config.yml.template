@@ -65,6 +65,11 @@ exp:
   # h500/TMP850 verification from backends/ace2/ace2_ic.py (ace2ic env,
   # login node: `ace2_ic.py DATE` and `ace2_ic.py --verif DATE ...`).
   # ps_operator defaults to 'ps_native'; reset_skt_ocean is rejected.
+  # Our own trained checkpoint (ace2-training.md): path_model = its
+  # training_checkpoints/ dir, model_name 'best_ckpt.tar' (current fme layout,
+  # read as well as the released one), and forcing_dir/ic_cache built from
+  # OUR dataset by backends/ace2/ace2_inference_files.py -- never the HF
+  # forcing files (different HGTsfc and model top).
   #   path_model: './backends/ace2/ACE2-ERA5/'
   #   ic_cache: './ic_cache_ace2/'
   # SFNO (NVIDIA SFNO-73ch-small from NGC, run with makani in the fcstnet3
