@@ -185,6 +185,16 @@ exp:
   #     control_variables: [u, v, t, z, q, sp, msl, 2t, 2d, 10u, 10v, tcwv, skt]
   # control_variables: [u, v, t, z, q]
 
+  # diurnal_clim: (ACE2 only, default off) netCDF from
+  # backends/ace2/ace2_diurnal_clim.py -- the climatological part of the
+  # state that linear interpolation between 6-hourly states misses (tides,
+  # diurnal cycle), by calendar month and UTC hour, per packed-state
+  # channel. With dt_obs < 6, an off-step obs slot then sees the decoded
+  # (1-a) x_lo + a x_hi + C instead of linearly interpolated decoded
+  # fields, in the loss and the obs diagnostics alike. No effect at
+  # dt_obs == 6.
+  # diurnal_clim: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer/diurnal_clim.nc
+
   # loss_variables: which decode_state fields are (time-interpolated, for
   # dt_obs < dt_verif, and) fed to the ps forward operator. Defaults to
   # exactly what the active ps_operator reads:
@@ -316,7 +326,8 @@ windows:
     #   than 6h obs are matched to a linearly time-interpolated model state
     #   between the bracketing 6h steps -- validated for AIFS (a known
     #   unmitigated tidal (S2) representativeness error at off-step slots
-    #   is documented there); untested for FCN3.
+    #   is documented there); untested for FCN3. See diurnal_clim (exp
+    #   section) for a climatological correction of that error.
     # learn_rate is NOT shared across backends -- each was tuned
     # independently and a shared default would silently mistune one of
     # them:

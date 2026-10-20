@@ -323,6 +323,11 @@ def load_config(config_path='config.yml'):
             )
         if exp['ps_operator'] == 'ps':
             raise ValueError("ps_operator='ps' is not supported for ACE2 -- use 'ps_native' (the default)")
+    # diurnal_clim: a sub-6-hourly climatology in the backend's packed-state
+    # channels (see get_diurnal_correction); only ACE2 has a builder so far.
+    if exp.get('diurnal_clim') and backend != 'ace2':
+        raise ValueError("diurnal_clim is only implemented for the ACE2 backend so far "
+                         "(see backends/ace2/ace2_diurnal_clim.py)")
     # jc_ps_sigma (the original, un-normalized penalty) was removed -- fail
     # loudly rather than silently run without the penalty.
     if 'jc_ps_sigma' in exp:
@@ -426,6 +431,7 @@ def log_window(exp, logger):
         pdry = _dry_mass_fixer_hpa(exp)
         logger.info('   dry_mass_fixer: ' + (f'{pdry} hPa (global-mean sp - g*tcw)' if pdry is not None else '(off)'))
     logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
+    logger.info('   diurnal_clim: ' + str(exp.get('diurnal_clim', '(off -- linear time interpolation)')))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
     if 'bg_check' in exp: logger.info('   bg_check: ' + str(exp['bg_check']))
@@ -942,7 +948,83 @@ def get_psobs(exp, model, logger, grid_interp):
     psobs_traj['interp_idx'] = torch.stack(idx_list, dim=0)  # (n_obs, nobs_max, k)
     psobs_traj['interp_wts'] = torch.stack(wts_list, dim=0)
 
+    psobs_traj['diurnal'] = get_diurnal_correction(exp, model, psobs_traj, logger)
     return psobs_traj
+
+
+def _month_weights(t):
+    """Linear weights between the two calendar-month climatologies nearest
+    `t` (each valid at mid-month): ((month1, w1), (month2, w2))."""
+    import calendar
+    ndays = calendar.monthrange(t.year, t.month)[1]
+    pos = (t.month - 1) + (t.day - 1 + t.hour / 24.0) / ndays - 0.5
+    lo = math.floor(pos)
+    w2 = pos - lo
+    return (lo % 12 + 1, 1.0 - w2), ((lo + 1) % 12 + 1, w2)
+
+
+def get_diurnal_correction(exp, model, psobs_traj, logger):
+    """Sub-6-hourly climatological correction for obs slots between model
+    steps, `{slot j: tensor shaped like the packed state}` (None when
+    `exp['diurnal_clim']` is unset).
+
+    Linear interpolation between 6-hourly states cannot represent the
+    diurnal/semidiurnal tides or the diurnal cycle of surface and boundary-
+    layer fields (6 h is the Nyquist interval of the 12-h tide). The
+    climatology file (backends/ace2/ace2_diurnal_clim.py) holds C = x(t) -
+    linear interpolation between the bracketing 00/06/12/18Z ERA5 states,
+    averaged by calendar month and UTC hour, per packed-state channel; for
+    slot j the loss decodes `(1 - alpha) x_lo + alpha x_hi + C_j`
+    (`_slot_decoded`) instead of linearly interpolating decoded fields. C_j
+    is interpolated linearly between the two nearest mid-month
+    climatologies. Channels without a climatology (ACE2's diagnostic
+    outputs) get zero. It is a constant w.r.t. the control: it changes the
+    innovations, not the gradient path."""
+    path = exp.get('diurnal_clim')
+    if not path:
+        return None
+    from datetime import timedelta
+    alpha = psobs_traj['alpha'].tolist()
+    t0 = _to_utc_datetime(exp['date'], exp['model_backend']).replace(tzinfo=None)
+    names = model.channel_names
+    out = {}
+    with xarray.open_dataset(path) as ds:
+        have = [n for n in names if n in ds.data_vars]
+        nlat, nlon = ds.sizes['latitude'], ds.sizes['longitude']
+        if nlat * nlon != model.n_points:
+            raise ValueError(f"{path}: {nlat}x{nlon} grid does not match the model's {model.n_points} points")
+        for j, a in enumerate(alpha):
+            if a in (0.0, 1.0):
+                continue
+            t = t0 + timedelta(hours=j * exp['dt_obs'])
+            (m1, w1), (m2, w2) = _month_weights(t)
+            arr = np.zeros((len(names), nlat, nlon), dtype=np.float32)
+            for n in have:
+                v = ds[n].sel(hour=t.hour)
+                arr[names.index(n)] = w1 * v.sel(month=m1).values + w2 * v.sel(month=m2).values
+            out[j] = torch.as_tensor(arr[None], device=model.device)
+    if out and 'PRESsfc' in have:
+        k = names.index('PRESsfc')
+        rms = {j: round(float(torch.sqrt((out[j][0, k] ** 2).mean())) / 100.0, 3) for j in out}
+        logger.info(f'diurnal_clim {path}: {len(have)}/{len(names)} channels, {len(out)} off-step slots; '
+                    f'PRESsfc correction rms (hPa) by slot: {rms}')
+    return out
+
+
+def _slot_decoded(model, j, a, state_prev, state_cur, decoded_prev, decoded_cur, interp_specs, diurnal, only=None):
+    """Decoded fields for obs slot j, a fraction `a` of the way from
+    `state_prev` to `state_cur`: the bracketing step itself at a == 0 / 1;
+    otherwise linear interpolation of the decoded `interp_specs` fields, or,
+    with a diurnal climatology (`get_diurnal_correction`), the decoded
+    interpolated packed state plus the climatological sub-6-h correction."""
+    if a == 0.0:
+        return decoded_prev
+    if a == 1.0:
+        return decoded_cur
+    if not diurnal or j not in diurnal:
+        return _interp_decoded(decoded_prev, decoded_cur, a, interp_specs)
+    x = (1.0 - a) * state_prev.state + a * state_cur.state + diurnal[j]
+    return model.decode_state(model.wrap_state(x, state_prev.date), only=only)
 
 
 # ---------------------------------------------------------------------------
@@ -1272,19 +1354,16 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
     for name, value in decoded_prev.items():
         model_outputs.setdefault(name, []).append(value.detach().cpu().numpy())
 
+    diurnal = psobs_traj.get('diurnal')
     for s in range(step_start + 1, n_steps + 1):
+        state_prev = f_state
         f_state = model.advance(f_state, steps=1, use_checkpoint=False)
         decoded_cur = model.decode_state(f_state)
         for name, value in decoded_cur.items():
             model_outputs.setdefault(name, []).append(value.detach().cpu().numpy())
         for j in slots_by_step.get(s - 1, []):
-            a = alpha[j]
-            if a == 0.0:
-                decoded_j = decoded_prev
-            elif a == 1.0:
-                decoded_j = decoded_cur
-            else:
-                decoded_j = _interp_decoded(decoded_prev, decoded_cur, a, interp_specs)
+            decoded_j = _slot_decoded(model, j, alpha[j], state_prev, f_state, decoded_prev, decoded_cur,
+                                      interp_specs, diurnal)
             _record_obs(j, decoded_j)
         decoded_prev = decoded_cur
 
@@ -1463,11 +1542,13 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         return Jt
 
     jc_sp = {}
+    diurnal = psobs_traj.get('diurnal')
     f_state = input_state
     decoded_prev = model.decode_state(f_state, only=loss_bases)   # step 0 = uncorrected background
     for s in range(1, n_steps + 1):
         inj = scaled_increment if s == 1 else None
         use_ckpt = (checkpoint_stride > 0) and (s % checkpoint_stride == 0)
+        state_prev = f_state
         f_state = model.advance(f_state, steps=1, latent_increment=inj, use_checkpoint=use_ckpt)
         if s == 1 and keep_mask is not None:
             # Confine the increment's direct effect to the controlled
@@ -1482,13 +1563,8 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         if jc_ref is not None and s in (1, 2):
             jc_sp[s] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
         for j in slots_by_step.get(s - 1, []):
-            a = alpha[j]
-            if a == 0.0:
-                decoded_j = decoded_prev
-            elif a == 1.0:
-                decoded_j = decoded_cur
-            else:
-                decoded_j = _interp_decoded(decoded_prev, decoded_cur, a, interp_specs)
+            decoded_j = _slot_decoded(model, j, alpha[j], state_prev, f_state, decoded_prev, decoded_cur,
+                                      interp_specs, diurnal, only=loss_bases)
             Jol[j] = _obs_term(j, decoded_j)
         decoded_prev = decoded_cur
 
