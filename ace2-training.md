@@ -481,6 +481,17 @@ weights.
 - **Cycled ps 4D-Var:** `config_ace2ours_6h_50it_5day_lr1e-3_jc25_obden_{a,b}.yml`
   (= the official-checkpoint run test_ace2_6h_50it_5day_lr1e-3_jc25_diurnal_obden
   minus `diurnal_clim`, a no-op at dt_obs 6), jobs 24136025 -> 24136026.
+  Result, 460 cycles 2015-01-06..04-30, z500 analysis rms at window start
+  + 6 h (official -> ours): NH 13.18 -> 12.81, tropics 7.62 -> 7.46, SH
+  17.89 -> 14.57, global 13.55 -> 12.01 m; the backgrounds improve the same
+  (it is the model, not the analysis; SH obs counts differ by 2%). Ours is
+  worse in the NH/tropics in Jan (+0.8/+0.3 m) and better from Mar
+  (-1.2/-0.2 m in Mar, -1.0/-0.9 m in Apr). The SH gain is largest over
+  Antarctica, where z500 is below ground (S of 60S 30.7 -> 23.0 m; the
+  official checkpoint's time-mean error there is +-30 m), but real elsewhere
+  (20-60S 12.9 -> 11.6 m). Time-mean (bias) error is smaller everywhere
+  (global rms of the bias map 5.4 -> 3.6 m); the random part is smaller
+  except slightly larger in the NH (12.2 -> 12.4) and tropics (6.4 -> 6.6).
 
 ## Status / next steps
 
