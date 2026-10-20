@@ -372,6 +372,47 @@ Not covered: data loading (bytes per sample grow ~linearly with layers;
 enough to carry 4-6x more channels -- that is a skill question for a
 training run, not a memory one.
 
+## 32-layer vertical grid (2026-10-14)
+
+Where the 8 layers come from: Ai2's ERA5 pipeline picks the L137 interfaces
+nearest ACE's (Watt-Meyer et al. 2023, arXiv:2310.02074, App. A, Table 2:
+FV3GFS 63-layer interfaces 0 18 26 31 36 41 47 53 63), which were chosen by
+hand to match the SPEEDY model's 8 sigma levels (half levels ~0, .05, .14,
+.26, .42, .60, .77, .90, 1); top moved up to ERA5's. Not a formula: not
+even in index, pressure or log p.
+
+Chosen 32 layers: **nested** -- each of the 8 layers split into 4, evenly in
+L137 index, so all 9 original interfaces are kept (each 8-layer field is the
+dp-weighted mean of its 4 sub-layers: the 8-layer dataset checks the
+32-layer one, and models at both resolutions compare on the same 8 layers)
+and the sub-layers inherit L137's own resolution distribution:
+
+```
+--layer_indices 0 12 24 36 48 53 58 62 67 70 73 76 79 82 84 87 90 \
+                92 95 98 100 102 104 107 109 112 114 116 119 124 128 132 137
+```
+
+Interfaces at ps = 1013.25 hPa: 0.01, 0.7, 5.6, 20.8, 51.2 | 69, 91, 112,
+144 | 167, 193, 222, 254 | 290, 316, 359, 407 | 442, 498, 558, 600 | 642,
+683, 742, 778 | 828, 857, 883, 916 | 958, 982, 999, 1013 hPa; dp 15-60 hPa
+in the troposphere, 14-24 hPa in the lowest 4 layers. Rejected: splitting
+evenly in pressure (nothing above 13 hPa -- bad for stratospheric channels,
+e.g. AMSU-A 12-14) and in log p (3 interfaces above 7 hPa, a 44 hPa layer
+below). Open question: the top two layers (0-0.7, 0.7-5.6 hPa) are where
+ERA5 is least reliable; `0 20 32 41 48` (~3, 13, 32 hPa) is a milder top
+split if they cause trouble.
+
+Test month (Hercules `service`, job 10114455, 2020-01, 16 workers, into
+`/work2/noaa/gsienkf/whitaker/ace2_era5_1deg_32layer_test`): 124 times in
+16.9 min (8.3 s/time vs ~5 at 8 layers), 52 GB peak RSS, 8.07 GB/month
+(vs 4.99; ~4.3 TB for 1979-2022), 328 vars (vs 184). Checked against the
+8-layer 2020-01 file (first 8 times): the 9 original interfaces are
+`ak_{4k}`/`bk_{4k}`; every non-layer variable bit-identical; the dp-weighted
+mean of each 4 sub-layers (dp from the file's PRESsfc) matches the 8-layer
+field to rms <= 5e-4 K / 6.5e-4 m/s / 1.8e-7 kg/kg -- not exact because
+coarsening uses 0.25 deg ERA5 surface pressure before regridding, and
+PRESsfc is reduced to HGTsfc.
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -471,12 +512,20 @@ weights.
       2026-10-12 (job 7741004, capacity queue, seed 0). Upstream trains 4
       seeds and picks one by multi-year evaluation (time-mean climate and
       trends) -- a follow-on step if we need it.
-- [ ] Ursa run (see "Training on Ursa"): config, launcher, stats, smoke and
-      throughput tests done; full 120-epoch run on 4 nodes submitted
-      2026-10-14 (job 23736094, 7 days, seed 0, experiment dir
-      `/scratch4/BMC/gsienkf/whitaker/ace2_training/ace2-era5-vars-1979-2022-no2015`).
+- [x] Ursa run (see "Training on Ursa"): config, launcher, stats, smoke and
+      throughput tests done; full 120-epoch run on 4 nodes, job 23736094
+      (seed 0), finished 2026-10-20 in 5 d 4 h, experiment dir
+      `/scratch4/BMC/gsienkf/whitaker/ace2_training/ace2-era5-vars-1979-2022-no2015`
+      (results: "Running our checkpoint in lw4dvar").
 - [x] Yearly forcing files from our dataset for inference in lw4dvar
       (`ace2_inference_files.py`; see "Running our checkpoint in lw4dvar").
+- [ ] 32-layer build, 1979-01..2022-12 (see "32-layer vertical grid"):
+      submitted 2026-10-14 on Hercules as 44 one-year jobs (10114650-93;
+      ~3.4 h each, 8-h QOS cap) in 4 `--dependency=singleton` chains
+      (`-J ace2ds32_chain<N>`, years round-robin), logs in
+      `logs_ace2ds32/YYYY.{out,err}`, into
+      `/work2/noaa/gsienkf/whitaker/ace2_era5_1deg_32layer` (2020-01 from
+      the test reused). Then: normalization stats, copy to Ursa/Eagle.
 - [ ] Higher vertical resolution + extra layer fields for radiances. Memory
       probe done (see "Memory probe" above): up to 48 layers fit at embed
       384 on the current setup; embed 512 fits on 4 nodes; 768 needs

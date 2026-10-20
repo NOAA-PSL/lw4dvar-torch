@@ -1381,6 +1381,76 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
   with the same exp_name and overwrote each other's saved trajectories;
   only files attributable by mtime to the sigma=0.1 job were used.
 
+## A second AIFS checkpoint, `aifs2-1.0deg-v1.0`: own conda env, no code changes (2026-10-02)
+
+User trained AIFS-single-2.0 at 1-degree resolution and asked for it to be
+wired in as a third checkpoint alongside the official 0.25deg AIFS-single-2.0
+and AIFS-single-1.1, reusing the existing `aifs` backend (`model_backend:
+aifs`) -- not a new backend. Full detail (checkpoint identity probing,
+conda-env root-cause, file list) is in `integrate_aifs2-1deg-v1.0_backend.md`;
+summary here since it's a CLAUDE.md-indexed backend-specific change:
+
+- **API-wise this checkpoint is aifs2-generation, not aifs1's** -- confirmed
+  by directly probing it (CPU, `SimpleRunner` then the real
+  `RunConfiguration.load()`/`create_runner()` path `aifs_model.py` itself
+  uses): `select_variables_and_masks` exists, `runner.device` is a real
+  `torch.device`, none of `aifs_model.py`'s 8 aifs1-compat fallback branches
+  are exercised. **No code changes were needed in
+  `aifs_model.py`/`aifs_ic.py`/`aifs_grid.py`** -- only a new anemoi-inference
+  yaml (`backends/aifs/aifs_inference_aifs2-1.0deg-v1.0.yaml`, patterned on
+  v1.1's -- no wave/snow vars, confirmed absent) and a new experiment
+  config/env/launcher, all data, not code.
+- 89 input variables / 76 prognostic, native grid 40320-point O96 (same point
+  count as the official 0.25deg checkpoint's HIDDEN mesh -- this checkpoint's
+  full data grid is roughly that checkpoint's internal encoder-bottleneck
+  resolution). Hidden mesh for this checkpoint: 10944 nodes x 1024 channels,
+  ~3.7x smaller than the official checkpoint's 40320 -- the
+  `latent_scale`/`learn_rate` a 4D-Var config needs is not assumed to
+  transfer and has not been separately tuned.
+- **Needs its own conda env, `lwaifs2`** (not the shared `aifs2` env) --
+  root-caused to a `hydra-core` 1.3.5 (repo's `aifs2` env) vs. 1.3.7 (the
+  user's existing `lwaifs2` env) pin gap: `torch.load`-time unpickling of the
+  checkpoint needs `hydra._internal.target_policy`, a real 1.3.6/1.3.7
+  security-hardening module (sandboxes what `hydra.utils.instantiate`'s
+  `_target_` configs can resolve to/call), absent from 1.3.5 -- not something
+  to stub/shim. Every other pinned package is byte-identical between the two
+  envs. The shared `aifs2` env isn't group-writable by this account, so
+  bumping `hydra-core` there wasn't an option; reused the user's own
+  already-working `lwaifs2` env instead rather than cloning+patching a new
+  one. **This makes CLAUDE.md's "one conda env per backend" rule
+  checkpoint-keyed, not strictly backend-keyed, as a documented partial
+  exception**: two checkpoints of the same `model_backend` can need genuinely
+  different pins.
+- New files follow the existing per-checkpoint/per-env conventions:
+  `run_aifs2-1.0deg-v1.0.sh` (SLURM launcher activating `lwaifs2`),
+  `aifs2-1.0deg-v1.0-requirements.txt`/`-spec.txt` (the `lwaifs2` env's
+  `pip freeze`/`conda list --explicit`), `config_test_aifs2-1.0deg-v1.0.yml`
+  (untuned smoke-test shape, own `ic_cache_aifs2-1.0deg-v1.0/` -- the ERA5
+  GRIB cache is keyed only by date, not checkpoint, so caches are never
+  shared across checkpoints with different grids), and a prefetch launcher on
+  `u1-service` for `aifs_prefetch_ic.py` (unmodified, already generic).
+  Checkpoint file itself is a gitignored symlink to the user's own training
+  output on scratch (not an HF repo, so not submodule-vendored like the other
+  checkpoints).
+- **Known gaps as of 2026-10-02**: no real GPU run yet at the time the
+  conda-env work was done (CPU-only checkpoint load/instantiation verified);
+  `learn_rate`/`latent_scale` carried over untuned from `config_test_aifs1.yml`;
+  whether `hydra-core` 1.3.7's runtime sandboxing (not just load-time) affects
+  anything anemoi-inference relies on was unchecked at the time. **Since then,
+  a real cycled `long_window_4dvar.py` run completed with no hydra-related
+  errors** -- the runtime-sandboxing gap is effectively closed by that
+  evidence, though not yet written back into the dedicated checkpoint doc.
+  Z500 error from that cycled run grows steadily (NH/SH/tropics/global all
+  show the same shape) where the official 0.25deg checkpoint's stays flat --
+  current leading hypotheses are an intrinsic forecast bias/drift in this
+  checkpoint (it runs at the official checkpoint's internal
+  encoder-bottleneck resolution, is missing snow/soil-moisture variables, and
+  is a custom retrain with likely far less training compute than the
+  operational checkpoint) combined with the untuned `learn_rate`/
+  `latent_scale` making the 4D-Var analysis correction too weak to counteract
+  it (background and analysis z500 error track each other almost exactly
+  throughout the cycled run). Not yet root-caused.
+
 ## Fifth backend: NVIDIA SFNO-73ch-small (`model_backend: sfno`, 2026-09-29/30)
 
 Branch `sfno`. Purpose: ACE2 is the only backend so far that cycles stably
@@ -1654,6 +1724,128 @@ obs are NH and ~9% SH, so the SH carried little of the loss.
   near the poles than at the equator. Probably minor, given few
   high-latitude stations; if high-latitude fits look off, switch to equal-area
   bins (HEALPix, or longitude width scaled by 1/cos(lat) per row).
+
+## AIFS on the multi-dataset anemoi API: `aifs3` env, `AIFS3Model` (2026-10-08)
+
+S. Frolov's 1-degree checkpoint `aifs2-1deg-ic1` (O96, 40320 points, ONE
+input time level, one output level per 6h step, 89 inputs / 76 prognostic /
+17 diagnostic, hidden mesh 10944 x 1024, `latent_skip` on) was trained with
+anemoi-models 0.19.0.post35 / anemoi-training 0.17.0.post35 / torch 2.10.
+It cannot run in the `aifs1`/`aifs2` envs: anemoi-utils 0.4 looks for
+`ai-models.json` (now `anemoi-metadata/anemoi.json`), and unpickling fails
+on `anemoi.models.layers.graph_provider` (new classes) -- checked in the
+`aifs2` env, not a shim-able gap. The first symptom (`get_shard_shapes`
+import error) was only the tip: the API is multi-dataset throughout.
+
+- **Env `aifs3`** (`/scratch4/BMC/gsienkf/whitaker/conda/envs/aifs3`): a
+  rebuild of Frolov's `anemoi-dev` env (package lists identical except his
+  local `eagle-tools`), with anemoi pinned to NOAA-PSL fork commits instead of
+  his editable trees: anemoi-core@7b53fcb5f, anemoi-inference@2169c56 (both
+  dated before training started). Recipe and pins in `aifs3-requirements.txt`
+  / `aifs3-spec.txt`. Pitfalls hit building it: the rdhpcs-conda module's
+  system `.condarc` pins `pkgs_dirs` to `~/.conda/pkgs` with `#!final`, so
+  `CONDA_PKGS_DIRS` is ignored and the ~14 GB download filled the 30 GB home
+  quota -- build with a conda that lacks that config; setuptools_scm can't
+  derive the monorepo's per-package versions from a clone (gave
+  `0.0.0.post1357`), so install with `SETUPTOOLS_SCM_PRETEND_VERSION_FOR_*`
+  set to the versions the checkpoint records (anemoi-inference's
+  `validate_environment` then returns True). Triton JIT-compiles a CUDA
+  helper with the system gcc on first use and needs `cuda.h`, which the env
+  lacks -- `run_aifs3.sh` loads `cuda/12.8.1` for its CPATH.
+- **Code** (`model_backend: aifs` unchanged; `get_model()` picks
+  `aifs3_model.AIFS3Model` when `anemoi.inference.tensors` exists, i.e. by
+  env): `AIFS3Model(AIFSModel)` overrides only `__init__`, state preparation,
+  and stepping. Per-variable metadata moved from `Checkpoint` to
+  `runner.tensor_handlers[ds].metadata` (same attribute names --
+  `AIFSModel._init_variable_index(md)` now serves both); stepping mirrors
+  anemoi-inference's own `Runner.forecast` via the handler's
+  `copy_prognostic_fields_to_input_tensor` / `add_dynamic_forcings_to_input_tensor`
+  (on a clone -- they write in place). `predict_step` still runs under
+  `torch.no_grad()`, so `_predict_step_with_grad` re-implements its
+  unsharded body and calls the model's own `forward()` unchanged. **The latent
+  increment is a forward hook on `model.latent_aggregator`** (output +
+  increment) instead of AIFSModel's manual encoder/processor/decoder unroll:
+  with one dataset `SumAggregator` returns the encoder latent as-is, so the
+  processor and the latent skip both see the increment, as before -- and no
+  model internals are copied. Single-dataset, one-output-step checkpoints
+  only (raises otherwise); `compile_wrapper` not implemented.
+  `aifs3_ic.py` (selected through `AIFS3Model.ic_module`) builds the State
+  straight from cached ERA5 GRIBs (`era5_<date>.grib` or `_lagged.grib`),
+  read-only. Bo Huang's O96 cache `ic_cache_aifs2-1.0deg-v1.0` matches this
+  checkpoint exactly (grid identical to 0.0; supplies all 80 non-computed
+  inputs). `aifs_inference_aifs2-1deg-ic1.yaml` uses `input: empty` (the new
+  runner instantiates its input at startup and has no `opendata`).
+- **Validation** (`backends/aifs/probe_aifs3_validate.py`, H100, untracked):
+  4-step rollout vs `runner.run()` (anemoi-inference's own forecast)
+  **bit-identical** (max diff 0.0, six fields, every step); zero increment vs
+  plain step 1.4e-5 relative (adding an fp32 increment promotes the fp16
+  latent -- AIFSModel's `x_latent + latent_increment` does the same; casting
+  the increment to the latent's dtype would round small increments away);
+  gradients finite, 2 steps forward+backward ~2 s, 3.7 GiB; fp16 finite
+  differences (loss x 1e6) match autograd to 0.4%. Driver smoke test (1
+  cycle, 5-day window, 5 iterations, bf16): Jtot 337172 -> 290696, ~5 s per
+  iteration, all outputs written, no errors.
+- **Gradient accuracy -- precision, not code** (`probe_aifs3_gradfactor.py`):
+  autograd vs central differences of a small test J (rms sp response 0.035
+  hPa after 2 steps) disagreed by 2-3x in fp16 with every attention-backend
+  combination. In fp32 they agree to <1% (0.994 with PyG + SDPA, 0.996 and
+  1.000 with the Triton kernel + SDPA; fp32 needs
+  `ANEMOI_INFERENCE_TRANSFORMER_ATTENTION_BACKEND=scaled_dot_product_attention`,
+  since the processor's FlashAttention is fp16/bf16-only). fp16 with the loss
+  scaled by 1e6 agrees too (0.996 / 0.978) -> the fp16 error was gradient
+  underflow at this test's tiny J; real 4D-Var losses (~3e5) are far from it.
+  bf16 (the driver's AIFS default): its forward rounding noise (~0.05 hPa rms
+  in sp) swamps this J, so finite differences are meaningless there, but bf16
+  autograd is within 4% / 1% of the fp32 gradients.
+- **Not yet done**: a full 50-iteration cycle and cycling; `learn_rate` /
+  `latent_scale` untuned for this checkpoint (smaller hidden mesh than the
+  0.25deg AIFS); fetching ICs for dates outside Bo's cache (aifs3_ic only
+  reads; `aifs_prefetch_ic.py` in his `lwaifs2` env + aifs2-1.0deg-v1.0
+  checkpoint writes the same O96 files).
+
+## AIFS dry-air mass fixer (`dry_mass_fixer`, 2026-10-12)
+
+**Why.** Cycled 1-degree AIFS runs drift: the 24-h z500 analysis error grows
+about +2.7 m/30d for Bo's single-rollout aifs2-1.0deg-v1.0 checkpoint and
++5.0 m/30d for Sergey's single-time-level aifs2-1deg-ic1 (Jan-Apr 2015),
+while ACE2 stays level. Diagnosing Bo's run (717 cycles, Jan-Jun 2015) gave:
+- The global-mean dry surface pressure `sp - g*tcw` of the analyses fell
+  almost linearly by 522 Pa (about -85 Pa/30d, -0.7 Pa per cycle). ACE2,
+  which has a dry-air fixer, held it to 0.07 Pa. The water load g*tcw
+  behaved like ACE2's (+38 vs +30 Pa, seasonal), and integrating q on
+  pressure levels instead of tcw gives the same loss (-531 Pa).
+- `sp` itself drifted low against ERA5 everywhere: -507 Pa global by late
+  June, -932 Pa over Antarctica, -1434 Pa above 1500 m. ERA5's own dry
+  pressure stayed at 983.17-983.20 hPa.
+- But the surface-pressure O-B stayed unbiased (within +-0.1 hPa all run, rms
+  1.1-1.3 hPa, about 93% used). The default `ps_operator: 'logpinterp'` uses
+  only the pressure-level geopotential, never `sp`, so in AIFS (where `sp` and
+  `z` are separate outputs) `sp` is unobserved and free to drift. ACE2's `z`
+  is derived hydrostatically from PRESsfc, so its ps is observed.
+- The z500 global-mean bias trended +1.6 m/30d (+8 m by June), not the -7.3
+  m/30d a real mass loss would imply hydrostatically, and is small next to the
+  rms growth (about 9 to 28 m). So the `sp` drift is not what moves z500. Whether
+  feeding the drifting `sp` back in as an input degrades the forecasts is
+  what this fixer tests.
+
+**What it does.** `dry_mass_fixer: true` switches it on; `dry_mass_target_hpa`
+sets the target (default 983.2 hPa, ERA5 Jan-Mar 2015, the same on the
+1-degree O96 and 0.25-degree N320 grids). After every
+forecast step, in `_advance_one_step` (both `AIFSModel` and `AIFS3Model`;
+covers background, analysis and the increment-carrying step),
+`AIFSModel._fix_dry_mass` shifts `sp` uniformly so the area-weighted global
+mean of `sp - g*tcw` equals the target, like ACE2's additive fixer; `tcw` is
+unchanged. The shift is affine, so gradients pass through, with the
+global-mean `sp` component projected out. `load_config` rejects it for other
+backends; `log_window` logs the target.
+
+**Smoke test** (branch `AIFS-drymassfixer`, 2 cycles x 5 iterations from
+2015-01-01, the production configs otherwise): every saved state of both
+checkpoints holds 983.2000 +- 0.0001 hPa. The loss decreases normally, and
+first-cycle Jtot is comparable to the unfixed runs (Bo 284829 vs 285674,
+Sergey 299671 vs 293925). Not yet run: a multi-week cycling comparison with
+the unfixed runs. Alternatives not tried: `ps_operator: 'ps'` (observes `sp`
+directly, region by region) and `jc_ps_weight`.
 
 ## Known gaps / next steps
 
