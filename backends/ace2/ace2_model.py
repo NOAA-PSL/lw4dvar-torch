@@ -192,11 +192,25 @@ class ACE2Model(forecast_model.LatentForecastModel):
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         stepper_state = ckpt["stepper"]
-        sigma = stepper_state["sigma_coordinates"]
+        if "dataset_info" in stepper_state:
+            # Current fme layout (our own trained checkpoints, fme 2026.5):
+            # grid/vertical/timestep in dataset_info, names under config.step.
+            info = stepper_state["dataset_info"]
+            sigma = info["vertical_coordinate"]
+            encoded_timestep = info["timestep"]
+            hc = info["horizontal_coordinates"]
+            img_shape = (len(hc["lat"]), len(hc["lon"]))
+            cfg = stepper_state["config"]["step"]["config"]
+        else:
+            # Legacy layout (the released ACE2-ERA5 checkpoint).
+            sigma = stepper_state["sigma_coordinates"]
+            encoded_timestep = stepper_state["encoded_timestep"]
+            img_shape = stepper_state["img_shape"]
+            cfg = stepper_state["config"]
         self._ak = torch.as_tensor(sigma["ak"], dtype=torch.float32, device=self._device)
         self._bk = torch.as_tensor(sigma["bk"], dtype=torch.float32, device=self._device)
-        self._timestep = datetime.timedelta(seconds=int(stepper_state["encoded_timestep"]) / 1e6)
-        self._nlat, self._nlon = (int(s) for s in stepper_state["img_shape"])
+        self._timestep = datetime.timedelta(seconds=int(encoded_timestep) / 1e6)
+        self._nlat, self._nlon = (int(s) for s in img_shape)
 
         self.stepper = Stepper.from_state(stepper_state)
         self.stepper.set_eval()
@@ -205,7 +219,6 @@ class ACE2Model(forecast_model.LatentForecastModel):
         for p in self.stepper.modules.parameters():
             p.requires_grad_(False)
 
-        cfg = stepper_state["config"]
         in_names, out_names = list(cfg["in_names"]), list(cfg["out_names"])
         self._prognostic = [n for n in in_names if n in out_names]
         self._input_only = [n for n in in_names if n not in out_names]

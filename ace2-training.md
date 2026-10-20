@@ -405,6 +405,42 @@ Default OUTDIR on Polaris `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace
 on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
 (co2.nc staged in both).
 
+## Running our checkpoint in lw4dvar (2026-10-20)
+
+Ursa run 23736094 finished all 120 epochs (5 d 4 h, 471,120 batches): train
+loss 0.0992, valid loss 0.1490 (lowest at epoch 120, so `best_ckpt.tar` =
+epoch 120), inline inference error 0.0629 (best 0.0584, epoch ~100,
+`best_inference_ckpt.tar`; flat at 0.062-0.068 from epoch ~20 on). With
+`validate_using_ema: true` fme saves both best checkpoints with the EMA
+weights.
+
+- **Checkpoint layout:** fme 2026.5 writes the stepper state as
+  `config.step.config` + `dataset_info` (grid, `vertical_coordinate`,
+  `timestep`); the released ACE2-ERA5 checkpoint has the legacy flat layout
+  (`sigma_coordinates`, `encoded_timestep`, `img_shape`). `ACE2Model` reads
+  both; `Stepper.from_state` takes either.
+- **Forcings and ICs must come from our dataset**
+  (`backends/ace2/ace2_inference_files.py OUT --years ... --ic ...
+  --ic_template ... --link_verif ic_cache_ace2`): our HGTsfc differs from
+  Ai2's by 41 m rms and our model top is ~1 Pa; the network takes HGTsfc as
+  input and the ps operator uses it. Our 2014-12-30T00 IC differs from the
+  ace2_ic.py (HF-HGTsfc) one by 413 Pa rms in PRESsfc, identical elsewhere.
+  ERA5 h500/TMP850 verification is linked, so z500 scores compare directly.
+  Files for 2014-2015: `/scratch4/BMC/gsienkf/whitaker/ace2_training/inference_ours/`.
+- **Free rollout 2015-01-01..07-13** (`free_rollout: True`, 390 x 12 h,
+  same setup as the official-checkpoint and AIFS rollouts of issue #12):
+  48-h z500 rms 7.6 m vs 8.9 m for the official checkpoint. Bias change from
+  Jan 1-10 to Jun 14-Jul 13 (ours / official / AIFS): NH t250 -0.8 / -0.2 /
+  +13.6 K, SH t250 +0.4 / +1.3 / +11.3 K, GL z500 -4 / -0.5 / +22 m, GL z250
+  -12 / -2 / +55 m, GL z50 **-40** / -9 / +138 m, GL t850 0.0 / +0.2 / -0.5 K,
+  GL sp 0 / 0 / -2.5 hPa. As stable as the official checkpoint in the
+  troposphere; a slow stratospheric cooling from ~May (z50 -40 m) is the one
+  new signal -- untested leads: our ~1 Pa model top, or the seed (upstream
+  picks 1 of 4 by multi-year evaluation).
+- **Cycled ps 4D-Var:** `config_ace2ours_6h_50it_5day_lr1e-3_jc25_obden_{a,b}.yml`
+  (= the official-checkpoint run test_ace2_6h_50it_5day_lr1e-3_jc25_diurnal_obden
+  minus `diurnal_clim`, a no-op at dt_obs 6), jobs 24136025 -> 24136026.
+
 ## Status / next steps
 
 - [x] One-month compute-node test (PBS job 7731559, debug queue, 2020-01,
@@ -439,7 +475,8 @@ on Ursa `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/ace2_era5_1deg_8layer`
       throughput tests done; full 120-epoch run on 4 nodes submitted
       2026-10-14 (job 23736094, 7 days, seed 0, experiment dir
       `/scratch4/BMC/gsienkf/whitaker/ace2_training/ace2-era5-vars-1979-2022-no2015`).
-- [ ] Yearly forcing files from our dataset for inference in lw4dvar.
+- [x] Yearly forcing files from our dataset for inference in lw4dvar
+      (`ace2_inference_files.py`; see "Running our checkpoint in lw4dvar").
 - [ ] Higher vertical resolution + extra layer fields for radiances. Memory
       probe done (see "Memory probe" above): up to 48 layers fit at embed
       384 on the current setup; embed 512 fits on 4 nodes; 768 needs
