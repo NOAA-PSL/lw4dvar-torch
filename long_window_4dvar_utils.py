@@ -222,6 +222,32 @@ RAOBS_VARIABLE_MODEL_BASE = {
 }
 RAOBS_SUPPORTED_BACKENDS = ('aifs', 'aurora')
 
+# ATMS radiances through the radianced two-head decoder (obs_atms_operator.py,
+# notes/integrate_atms_obs.md). The decoder was trained on the AIFS 1-degree
+# checkpoint's variables, so AIFS only. ATMS_MODEL_FIELDS: decode_state keys
+# the operator reads, interpolated to each ob; the keys of
+# _ATMS_OPERATOR_FIELDS are the operator's own field names.
+ATMS_SUPPORTED_BACKENDS = ('aifs',)
+_ATMS_OPERATOR_FIELDS = {
+    'sp': 'sp', 'msl': 'msl', 'skt': 'skt', '2t': '2t', '2d': '2d', '10u': '10u', '10v': '10v',
+    'tcw': 'tcw', 'lsm': 'lsm', 'z': 'geopotential_at_surface', 'sdor': 'sdor', 'slor': 'slor',
+}
+ATMS_MODEL_FIELDS = ('t', 'q') + tuple(_ATMS_OPERATOR_FIELDS.values())
+# obs-file columns the operator takes as inputs (Obs_Time is left at its
+# default 0: the state is interpolated to the slot time)
+_ATMS_OBS_INPUTS = ('land_frac', 'water_frac', 'ice_frac', 'snow_frac', 'Sat_Zenith_Angle',
+                    'Scan_Angle', 'Sat_Azimuth_Angle', 'sat_id')
+# Microwave sensors with a two-head decoder, each its own `observations.<sensor>`
+# block (same keys as atms, flattened to `<sensor>_<key>`) and its own
+# trajectory; default channel sets (1-based) from the radianced hand-offs.
+# AMSU-A 4-8 are the frequencies of ATMS 5-9; AMSU-A 1, 2 are ATMS 1, 2
+# (23.8 / 31.4 GHz), which the cloud retrieval `_atms_clw` uses.
+MW_SENSORS = ('atms', 'amsua')
+_MW_DEFAULT_CHANNELS = {
+    'atms': {'assimilate': [5, 6, 7], 'monitor': [8, 9, 10, 11], 'emis': [1, 2, 3, 4, 16, 17]},
+    'amsua': {'assimilate': [4, 5, 6, 7, 8], 'monitor': [9, 10], 'emis': [1, 2, 3, 15]},
+}
+
 
 # ---------------------------------------------------------------------------
 # logging / dates / config
@@ -292,6 +318,7 @@ _PSOBS_CONFIG_KEYS = {
     'time_tolerance_hours': 'psobs_time_tolerance_hours',
     'use_source_error': 'psobs_use_source_error',
     'error_std_hpa': 'surface_pressure_error_std_hpa',
+    'error_scale': 'psobs_error_scale',
 }
 _RAOBS_CONFIG_KEYS = {
     'path': 'raobs_path',
@@ -306,9 +333,18 @@ _RAOBS_CONFIG_KEYS = {
     'error_std': 'raobs_error_std',
     'q_error_fraction': 'raobs_q_error_fraction',
     'q_error_floor_kg_kg': 'raobs_q_error_floor_kg_kg',
+    'q_error_g_kg': 'raobs_q_error_g_kg',
+    'q_bg_check': 'raobs_q_bg_check',
     'humidity_min_pressure_hpa': 'raobs_humidity_min_pressure_hpa',
     'station_capacity': 'raobs_station_capacity',
 }
+# observations.<sensor> keys for every MW_SENSORS sensor, flattened to <sensor>_<key>
+_MW_CONFIG_KEYS = (
+    'path', 'bundle', 'assimilate_channels', 'monitor_channels', 'sigma_o_scale', 'sigma_o', 'bg_check',
+    'huber_c', 'water_frac_min', 'clw_max', 'lsm_max', 'detach_q_above_hpa', 'time_tolerance_hours',
+    'capacity', 'scenes', 'emis_control', 'emis_channels', 'z_learn_rate', 'oberr_model', 'oberr_table',
+    'cloud_max', 'window_state_scenes', 'corr_r', 'corr_cond_max',
+)
 
 
 def _resolve_observations_config(exp):
@@ -329,9 +365,10 @@ def _resolve_observations_config(exp):
     config was nested.
     """
     observations = exp.get('observations', {}) or {}
-    unknown = set(observations) - {'psobs', 'raobs'}
+    unknown = set(observations) - {'psobs', 'raobs'} - set(MW_SENSORS)
     if unknown:
-        raise ValueError(f"exp.observations has unknown keys {sorted(unknown)} (expected 'psobs' and/or 'raobs')")
+        raise ValueError(f"exp.observations has unknown keys {sorted(unknown)} "
+                         f"(expected 'psobs', 'raobs', {', '.join(repr(m) for m in MW_SENSORS)})")
 
     psobs = observations.get('psobs', {}) or {}
     unknown_psobs = set(psobs) - set(_PSOBS_CONFIG_KEYS)
@@ -354,6 +391,20 @@ def _resolve_observations_config(exp):
                 exp[dst_key] = raobs[src_key]
         exp.setdefault('raobs_variables', ['temperature', 'u_component_of_wind', 'v_component_of_wind', 'specific_humidity'])
         exp.setdefault('raobs_path', exp['obspath'])
+
+    for sensor in MW_SENSORS:
+        block = observations.get(sensor, {}) or {}
+        unknown_mw = set(block) - set(_MW_CONFIG_KEYS) - {'enabled'}
+        if unknown_mw:
+            raise ValueError(f"exp.observations.{sensor} has unknown keys {sorted(unknown_mw)}")
+        exp[f'{sensor}_enabled'] = bool(block.get('enabled', False))
+        if exp[f'{sensor}_enabled']:
+            for key in ('path', 'bundle'):
+                if key not in block:
+                    raise ValueError(f"exp.observations.{sensor}.{key} is required when {sensor} is enabled")
+            for key in _MW_CONFIG_KEYS:
+                if key in block:
+                    exp[f'{sensor}_{key}'] = block[key]
 
 
 def load_config(config_path='config.yml'):
@@ -473,6 +524,10 @@ def load_config(config_path='config.yml'):
     # `_resolve_observations_config` (above) already applied the
     # `raobs_variables` default and the `raobs_path` fallback to `obspath`;
     # this just enforces the backend/variable support guard.
+    for sensor in MW_SENSORS:
+        if exp.get(f'{sensor}_enabled', False) and backend not in ATMS_SUPPORTED_BACKENDS:
+            raise ValueError(f"observations.{sensor} is supported for model_backend in {ATMS_SUPPORTED_BACKENDS}, "
+                             f"got {backend!r} -- the decoder was trained on the AIFS 1-degree variables")
     if exp.get('raobs_enabled', False):
         if backend not in RAOBS_SUPPORTED_BACKENDS:
             raise ValueError(
@@ -538,6 +593,15 @@ def log_window(exp, logger):
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
     logger.info('   raobs_enabled: ' + (str(exp['raobs_variables']) if exp.get('raobs_enabled', False) else '(off, psobs only)'))
+    for sensor in MW_SENSORS:
+        if exp.get(f'{sensor}_enabled', False):
+            ch = _MW_DEFAULT_CHANNELS[sensor]
+            logger.info(f"   {sensor}: assimilate ch {exp.get(f'{sensor}_assimilate_channels', ch['assimilate'])}, "
+                        f"monitor ch {exp.get(f'{sensor}_monitor_channels', ch['monitor'])}, "
+                        f"sigma_o {exp.get(f'{sensor}_sigma_o') or 'bundle'} x {exp.get(f'{sensor}_sigma_o_scale', 1.0)}, "
+                        f"huber_c {exp.get(f'{sensor}_huber_c') or '(off)'}, bundle {exp[f'{sensor}_bundle']}")
+        else:
+            logger.info(f'   {sensor}: (off)')
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
         logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
@@ -931,6 +995,8 @@ def get_psobs(exp, model, logger, grid_interp):
     oberrdeltaperday = exp.get('oberrdeltaperday', 0.)
     if oberrdeltaperday > 0:
         logger.info('ob error increase per day:' + str(oberrdeltaperday))
+    if exp.get('psobs_error_scale', 1.0) != 1.0:
+        logger.info('ps ob error scale: ' + str(exp['psobs_error_scale']))
     date = exp['date']
     device = model.device
     psobs_traj = {}
@@ -989,6 +1055,7 @@ def get_psobs(exp, model, logger, grid_interp):
             base_err = torch.full((nobs,), float(oberrstart), dtype=torch.float32, device=device)
         else:
             base_err = torch.as_tensor(parquet_data['oberr'][j], dtype=torch.float32, device=device)
+        base_err = base_err * float(exp.get('psobs_error_scale', 1.0))  # before the orography term
         psobs_traj['oberr'][j, :nobs] = base_err + oberrdeltaperday * tday
         # start-of-window error, without the oberrdeltaperday growth -- used by
         # the gross check instead of 'oberr' when qc_fixed_oberr is set
@@ -1127,6 +1194,19 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
         if base == 'q':
             raobs_traj['error_q_fraction'] = float(q_error_fraction)
             raobs_traj['error_q_floor'] = float(q_error_floor)
+            # q_error_g_kg {hPa: g/kg}: a fixed per-level error instead of the
+            # fraction of the ob (which weights dry obs most and pulls the
+            # analysis dry); levels between table entries interpolate in ln(p),
+            # beyond them take the nearest entry
+            table = exp.get('raobs_q_error_g_kg')
+            if table:
+                tp = np.array(sorted(float(k) for k in table))
+                tv = np.array([float(table[k] if k in table else table[int(k)]) for k in sorted(table, key=float)])
+                lev = np.asarray(levels_hpa['q'], dtype=float)
+                err = np.interp(np.log(lev), np.log(tp), tv) * 1.e-3
+                raobs_traj['error_q_level'] = torch.as_tensor(err, dtype=torch.float32, device=device)
+            bgc = exp.get('raobs_q_bg_check')
+            raobs_traj['q_bg_check'] = float(bgc) if bgc else None
         else:
             raobs_traj['error_'+base] = float(error_std[base])
 
@@ -1146,6 +1226,224 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     raobs_traj['step_lo'] = psobs_traj['step_lo']
     raobs_traj['alpha'] = psobs_traj['alpha']
     return raobs_traj
+
+
+_ATMS_OPERATORS = {}
+
+
+def _load_atms_operator(bundle, device):
+    """One AtmsOperator per (bundle, device), kept across windows."""
+    key = (os.path.abspath(bundle), str(device))
+    if key not in _ATMS_OPERATORS:
+        from obs_atms_operator import AtmsOperator
+        _ATMS_OPERATORS[key] = AtmsOperator.load(bundle, device)
+    return _ATMS_OPERATORS[key]
+
+
+ATMS_SCENES = ('ocean_clear', 'land', 'snow', 'seaice', 'ocean_cloudy')
+
+
+def _atms_scene_codes(d, water_frac_min, clw_max):
+    """Scene class per ob (index into ATMS_SCENES, -1 = none), as radianced
+    `scripts/twohead.py` `scene_masks` defines them on the ERA5 pairs: clear
+    ocean (all water, no ice, clw <= clw_max), land (water_frac <= 0.01, no
+    snow, no ice), snow (water_frac <= 0.01, snow), sea ice (ice_frac >= 0.5).
+    Cloudy ocean (all water, no ice, clw > clw_max) is code 4 ("ocean_cloudy");
+    mixed coastal footprints are -1."""
+    wf, ice, snow, clw = (d[c].to_numpy() for c in ('water_frac', 'ice_frac', 'snow_frac', 'clw_obs'))
+    land = wf <= 0.01
+    code = np.full(len(d), -1, dtype=np.int8)
+    code[(wf >= water_frac_min) & (ice <= 0) & (clw <= clw_max)] = 0
+    code[(wf >= water_frac_min) & (ice <= 0) & (clw > clw_max)] = 4
+    code[land & (snow <= 0) & (ice <= 0)] = 1
+    code[land & (snow > 0)] = 2
+    code[ice >= 0.5] = 3
+    return code
+
+
+def get_mwobs(exp, model, logger, grid_interp, psobs_traj):
+    """`get_atmsobs` for every enabled MW_SENSORS sensor: a list of
+    trajectories (one per sensor, `traj['sensor']`), or None if none is on."""
+    trajs = [get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor) for sensor in MW_SENSORS]
+    trajs = [t for t in trajs if t is not None]
+    return trajs or None
+
+
+def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
+    """Read microwave radiances of `sensor` (ATMS, AMSU-A) for psobs's
+    obs-slot grid (`step_lo`/`alpha`, as `get_raobs` does). Returns `None`
+    unless `exp['<sensor>_enabled']`. Config keys are `observations.<sensor>`
+    (flattened to `<sensor>_<key>`); the docstrings below say `atms_*`.
+
+    Obs files (radianced `scripts/build_lw4dvar_obs.py` for ATMS,
+    `build_mw_obs.py` for the others): one parquet per 6-h cycle,
+    `<atms_path>/<YYYYMMDDHH>.parquet`, with `dt_hours` (obs time minus cycle
+    time), `yobc_01..NN` (y_o - BC, K; NaN where the channel is off for that
+    satellite), `sat_id`, scan geometry, FOV surface fractions, `clw_obs`
+    and `withheld`. Slot `j` (time `t_j`) takes
+    every ob with obs time in `[t_j - tol, t_j + tol)`, `tol =
+    atms_time_tolerance_hours` (default `dt_obs / 2`), from the cycles
+    `t_j - 6h`, `t_j`, `t_j + 6h`.
+
+    Read-time scene screen (E1, clear-sky ocean): `water_frac >=
+    atms_water_frac_min` (0.99), `ice_frac == 0`, `clw_obs <= atms_clw_max`
+    (0.05 kg/m2). The model-side screens (all 4 interpolation neighbours
+    with lsm <= `atms_lsm_max`, background check) are applied in
+    `_compute_atms_observation_diagnostics_at_time`. Withheld obs are kept,
+    scored in the diagnostics and never enter the loss.
+    """
+    if not exp.get(f'{sensor}_enabled', False):
+        return None
+    import pandas as pd
+
+    def cfg(key, default=None):
+        return exp.get(f'{sensor}_{key}', default)
+
+    device = model.device
+    op = _load_atms_operator(cfg('bundle'), device)
+    if op.sensor != sensor:
+        raise ValueError(f"observations.{sensor}.bundle {cfg('bundle')} is a {op.sensor!r} decoder")
+    dt_obs = exp['dt_obs']
+    tol = cfg('time_tolerance_hours', dt_obs / 2.)
+    water_frac_min = cfg('water_frac_min', 0.99)
+    clw_max = cfg('clw_max', 0.05)
+    scenes = list(cfg('scenes', ['ocean_clear']))
+    unknown = set(scenes) - set(ATMS_SCENES)
+    if unknown:
+        raise ValueError(f"observations.{sensor}.scenes: unknown {sorted(unknown)}; known {list(ATMS_SCENES)}")
+    scene_codes = [ATMS_SCENES.index(sc) for sc in scenes]
+    n_obs = len(psobs_traj['step_lo'])
+
+    cache = {}
+
+    def read_cycle(date_str):
+        if date_str not in cache:
+            f = os.path.join(cfg('path'), get_YYYYMMDDHH(date_str) + '.parquet')
+            cache[date_str] = pd.read_parquet(f) if os.path.exists(f) else None
+        return cache[date_str]
+
+    slots = []
+    vdate = copy.copy(exp['date'])
+    for j in range(n_obs):
+        parts = []
+        for h in (-6, 0, 6):
+            d = read_cycle(add_hours(vdate, h))
+            if d is None:
+                continue
+            offset = h + d['dt_hours'].to_numpy()
+            parts.append(d[(offset >= -tol) & (offset < tol)])
+        if not parts:
+            raise FileNotFoundError(f"no {sensor} obs file within 6h of {vdate} under {cfg('path')}")
+        d = pd.concat(parts, ignore_index=True)
+        d['scene'] = _atms_scene_codes(d, water_frac_min, clw_max)
+        slots.append(d[d['scene'].isin(scene_codes)].reset_index(drop=True))
+        vdate = add_hours(vdate, dt_obs)
+
+    counts = [len(d) for d in slots]
+    capacity = cfg('capacity', max(max(counts), 1))
+    if max(counts) > capacity:
+        raise ValueError(f"{sensor} slot count {max(counts)} exceeds configured {sensor} capacity {capacity}")
+    logger.info(f'{sensor} obs per slot after scene screen: ' + str(counts)
+                + ', withheld: ' + str([int(d['withheld'].sum()) for d in slots]))
+    allobs = pd.concat(slots)
+    logger.info(f'{sensor} obs by scene: ' + str({sc: int((allobs['scene'] == ATMS_SCENES.index(sc)).sum()) for sc in scenes}))
+
+    nch = op.nch
+    f32 = dict(dtype=torch.float32, device=device)
+    atms_traj = {
+        'sensor': sensor,
+        'op': op,
+        'n_valid': torch.as_tensor(counts, dtype=torch.int32, device=device),
+        'lat': torch.zeros((n_obs, capacity), **f32),
+        'lon': torch.zeros((n_obs, capacity), **f32),
+        'y': torch.zeros((n_obs, capacity, nch), **f32),
+        'valid': torch.zeros((n_obs, capacity), dtype=torch.bool, device=device),
+        'withheld': torch.zeros((n_obs, capacity), dtype=torch.bool, device=device),
+        'scene': torch.full((n_obs, capacity), -1, dtype=torch.int8, device=device),
+    }
+    for name in _ATMS_OBS_INPUTS:
+        atms_traj['obs_'+name] = torch.zeros((n_obs, capacity), **f32)
+    ycols = [f'yobc_{c:02d}' for c in range(1, nch + 1)]
+    for j, d in enumerate(slots):
+        n = len(d)
+        atms_traj['lat'][j, :n] = torch.as_tensor(d['lat'].to_numpy(copy=True), **f32)
+        atms_traj['lon'][j, :n] = torch.as_tensor(d['lon'].to_numpy(copy=True), **f32)
+        atms_traj['y'][j, :n] = torch.as_tensor(d[ycols].to_numpy(copy=True), **f32)
+        atms_traj['valid'][j, :n] = True
+        atms_traj['withheld'][j, :n] = torch.as_tensor(d['withheld'].to_numpy(copy=True), device=device)
+        atms_traj['scene'][j, :n] = torch.as_tensor(d['scene'].to_numpy(copy=True), dtype=torch.int8, device=device)
+        for name in _ATMS_OBS_INPUTS:
+            atms_traj['obs_'+name][j, :n] = torch.as_tensor(d[name].to_numpy(copy=True), **f32)
+
+    # model levels -> the operator's level order (top -> bottom); q is
+    # detached (no Jo gradient) above atms_detach_q_above_hpa, where the
+    # decoder's q sensitivity is a learned proxy, not physics
+    t_levels = [float(p) for p in model.pressure_levels('t')]
+    q_levels = [float(p) for p in model.pressure_levels('q')]
+    op_q_levels = op.q_levels_hpa if op.q_levels_hpa[0] in q_levels else op.q_levels_hpa[1:]
+    atms_traj['t_order'] = [t_levels.index(p) for p in op.t_levels_hpa]
+    atms_traj['q_order'] = [q_levels.index(p) for p in op_q_levels]
+    detach_above = cfg('detach_q_above_hpa', 250.)
+    atms_traj['q_detach'] = torch.as_tensor([p < detach_above for p in op_q_levels], device=device)
+
+    defaults = _MW_DEFAULT_CHANNELS[sensor]
+    assimilate = list(cfg('assimilate_channels', defaults['assimilate']))
+    monitor = [c for c in cfg('monitor_channels', defaults['monitor']) if c not in assimilate]
+    atms_traj['assimilate_channels'] = assimilate
+    atms_traj['monitor_channels'] = monitor
+    atms_traj['assimilate_idx'] = [c - 1 for c in assimilate]
+    # emissivity control (plan E2): one z per land/snow/sea-ice ob, moved only
+    # by the window channels, which see the state detached
+    emis_control = cfg('emis_control', 'none')
+    if emis_control not in ('none', 'per_obs'):
+        raise ValueError(f"observations.{sensor}.emis_control must be 'none' or 'per_obs', got {emis_control!r}")
+    atms_traj['emis_control'] = emis_control
+    emis = list(cfg('emis_channels', defaults['emis'])) if emis_control == 'per_obs' else []
+    if set(emis) & set(assimilate):
+        raise ValueError(f"{sensor} emis_channels {emis} overlap assimilate_channels {assimilate}")
+    atms_traj['emis_channels'] = emis
+    atms_traj['emis_idx'] = [c - 1 for c in emis]
+    atms_traj['monitor_channels'] = [c for c in monitor if c not in emis]
+    atms_traj['z_active'] = atms_traj['valid'] & (atms_traj['scene'] > 0) & (atms_traj['scene'] < 4)  # z = 0 over open ocean
+    # scenes where the window channels also act on the state (plan E4), not only on z
+    window_state = list(cfg('window_state_scenes', []))
+    if [sc for sc in window_state if sc not in ATMS_SCENES]:
+        raise ValueError(f"observations.{sensor}.window_state_scenes must be among {ATMS_SCENES}, got {window_state}")
+    if window_state and emis_control != 'per_obs':
+        raise ValueError(f"observations.{sensor}.window_state_scenes needs emis_control: 'per_obs' (it uses emis_channels)")
+    ws_idx = torch.as_tensor([ATMS_SCENES.index(sc) for sc in window_state], dtype=torch.long, device=device)
+    atms_traj['window_state'] = atms_traj['valid'] & torch.isin(atms_traj['scene'].long(), ws_idx)
+    atms_traj['window_state_scenes'] = window_state
+    # per-channel overrides {channel: K} (e.g. Desroziers estimates), then the global scale
+    sigma_o = op.sigma_o.clone()
+    for c, v in (cfg('sigma_o') or {}).items():
+        sigma_o[int(c) - 1] = float(v)
+    atms_traj['sigma_o'] = sigma_o * float(cfg('sigma_o_scale', 1.0))
+    atms_traj['bg_check'] = float(cfg('bg_check', 4.0))
+    # Huber norm on Jo (assimilated and window channels): quadratic for
+    # |d| / sigma <= huber_c, linear beyond; None = plain quadratic
+    huber_c = cfg('huber_c')
+    atms_traj['huber_c'] = float(huber_c) if huber_c else None
+    # channels the decoder predicts (NaN y_mean = a channel without training
+    # targets, e.g. AMSU-A 14): only these enter the finite-H(x) screen
+    atms_traj['tb_ok_idx'] = torch.isfinite(op.y_mean).nonzero().flatten().tolist()
+    _setup_atms_oberr(exp, atms_traj, nch, device)
+    _setup_atms_corr_r(cfg('corr_r'), float(cfg('corr_cond_max', 50.)), atms_traj, logger, device)
+    atms_traj['lsm_max'] = float(cfg('lsm_max', 0.01))
+
+    idx_list, wts_list = [], []
+    lon_np = atms_traj['lon'].detach().cpu().numpy()
+    lat_np = atms_traj['lat'].detach().cpu().numpy()
+    for j in range(n_obs):
+        idx, wts = grid_interp.weights(lon_np[j], lat_np[j], k=4, device=device)
+        idx_list.append(idx)
+        wts_list.append(wts)
+    atms_traj['interp_idx'] = torch.stack(idx_list, dim=0)
+    atms_traj['interp_wts'] = torch.stack(wts_list, dim=0)
+    atms_traj['n_steps'] = psobs_traj['n_steps']
+    atms_traj['step_lo'] = psobs_traj['step_lo']
+    atms_traj['alpha'] = psobs_traj['alpha']
+    return atms_traj
 
 
 # ---------------------------------------------------------------------------
@@ -1346,14 +1644,192 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
         safe_model_obspace = torch.where(interpolation_failed, torch.zeros_like(model_obspace), model_obspace)
         innovation = observation - safe_model_obspace
         if base == 'q':
-            effective_error = torch.clamp(
-                raobs_traj['error_q_fraction'] * observation.abs(),
-                min=raobs_traj['error_q_floor'],
-            )
+            if raobs_traj.get('error_q_level') is not None:
+                effective_error = raobs_traj['error_q_level'][:, None].expand_as(observation)
+            else:
+                effective_error = torch.clamp(
+                    raobs_traj['error_q_fraction'] * observation.abs(),
+                    min=raobs_traj['error_q_floor'],
+                )
+            if raobs_traj.get('q_bg_check'):
+                used = used & (innovation.abs() <= raobs_traj['q_bg_check'] * effective_error).detach()
         else:
             effective_error = torch.full_like(observation, raobs_traj['error_'+base])
         results[base] = (innovation, safe_model_obspace, effective_error, used)
     return results
+
+
+def _compute_atms_observation_diagnostics_at_time(model, decoded, atms_traj, grid_interp, oind, z=None,
+                                                  return_inputs=False):
+    """ATMS H(x) and QC at obs slot `oind`.
+
+    Returns `(innovation, model_equivalent, screened, used)`:
+    innovation/model_equivalent `(capacity, 22)` K (y_o - BC minus H(x));
+    `screened` `(capacity,)`: a real ob whose 4 interpolation neighbours are
+    all ocean (lsm <= atms_lsm_max) and whose H(x) is finite; `used`
+    `(capacity, 22)`: screened, passing the background check
+    `|innovation| <= atms_bg_check * sigma_o` for that channel, and not
+    withheld. The loss uses `used` on the assimilated channels; the
+    diagnostics also score withheld obs. The all-ocean-neighbour screen
+    applies to clear-ocean obs only (land/snow/ice obs come with `z`).
+
+    `z` `(capacity, K)`: emissivity control in PC units (`e = e_hat + U z`);
+    None = 0. If None and `atms_traj['zeta_eval']` is set (the analysis
+    diagnostics), z = zeta_eval * sigma_k from the surface head.
+    `return_inputs`: also return `(x, log_sig)` (decoder inputs, surface-head
+    log sigma_k) for the loss's emissivity term.
+    """
+    op = atms_traj['op']
+    idx = atms_traj['interp_idx'][oind]
+    wts = atms_traj['interp_wts'][oind]
+    t = grid_interp.interp(idx, wts, decoded['t'][atms_traj['t_order']])
+    q = grid_interp.interp(idx, wts, decoded['q'][atms_traj['q_order']])
+    q = torch.where(atms_traj['q_detach'][:, None], q.detach(), q)
+    fields = {'t': t.float(), 'q': q.float()}
+    for name, key in _ATMS_OPERATOR_FIELDS.items():
+        fields[name] = grid_interp.interp(idx, wts, decoded[key]).float()
+    obs = {name: atms_traj['obs_'+name][oind] for name in _ATMS_OBS_INPUTS}
+    x = op.assemble(fields, obs)
+    model_equivalent, _, log_sig = op(x, z)
+    if z is None and atms_traj.get('zeta_eval') is not None:
+        z = _atms_z(atms_traj, atms_traj['zeta_eval'], oind, log_sig)
+        model_equivalent, _, _ = op(x, z)
+    innovation = atms_traj['y'][oind] - model_equivalent
+
+    ocean = (atms_traj['scene'][oind] == 0) | (atms_traj['scene'][oind] == 4)
+    all_ocean = decoded['lsm'][idx].max(dim=-1).values <= atms_traj['lsm_max']
+    finite = torch.isfinite(model_equivalent[:, atms_traj['tb_ok_idx']]).all(dim=-1)
+    screened = atms_traj['valid'][oind] & (all_ocean | ~ocean) & finite
+    sigma = _atms_sigma(atms_traj, oind, model_equivalent)
+    if atms_traj['oberr_model'] != 'none':
+        screened = screened & atms_traj['cloud_ok'][oind]
+    passed = (innovation.abs() <= atms_traj['bg_check'] * sigma).detach()
+    used = screened[:, None] & passed & ~atms_traj['withheld'][oind][:, None]
+    if return_inputs:
+        return innovation, model_equivalent, screened, used, (x, log_sig)
+    return innovation, model_equivalent, screened, used
+
+
+def _atms_clw(tb1, tb2, zenith_deg):
+    """GSI `ret_amsua` cloud liquid water (kg/m2) over ocean from the 23.8 and
+    31.4 GHz brightness temperatures (K), clipped to [0, 3]."""
+    mu = torch.cos(torch.deg2rad(zenith_deg))
+    c = mu * (8.240 - (2.622 - 1.846 * mu) * mu + 0.754 * torch.log((285.0 - tb1).clamp(min=1e-3))
+              - 2.265 * torch.log((285.0 - tb2).clamp(min=1e-3)))
+    return torch.nan_to_num(c, nan=3.0).clamp(0.0, 3.0)
+
+
+def _setup_atms_oberr(exp, atms_traj, nch, device):
+    """Observation-error model (`observations.atms.oberr_model`).
+
+    'none': sigma_o per channel. 'scene_cloud': sigma = sigma_o * r per ob,
+    with r from `oberr_table` (atms_cloud_error.py; r = 1 for channels it
+    does not list): over ocean the Geer & Bauer (2011) ramp in the symmetric
+    cloud amount C = (clw(y_o) + clw(H(x_b))) / 2, r = 1 for C <= c0,
+    ramp_ratio for C >= c1, linear between; over land, snow and sea ice the
+    per-scene ratio; r >= 1 (never tighter than sigma_o). r is set from the
+    background, the first time each slot is evaluated in a cycle, then held
+    fixed. Ocean obs with C > `cloud_max` (kg/m2, default 0.5) are not used.
+    """
+    sensor = atms_traj['sensor']
+    model_name = exp.get(f'{sensor}_oberr_model', 'none')
+    if model_name not in ('none', 'scene_cloud'):
+        raise ValueError(f"observations.{sensor}.oberr_model must be 'none' or 'scene_cloud', got {model_name!r}")
+    atms_traj['oberr_model'] = model_name
+    if model_name == 'none':
+        return
+    import json
+    with open(exp[f'{sensor}_oberr_table']) as fh:
+        table = json.load(fh)['channels']
+    f32 = dict(dtype=torch.float32, device=device)
+    scene_ratio = torch.ones((len(ATMS_SCENES), nch), **f32)
+    c0, c1, ramp = torch.zeros(nch, **f32), torch.ones(nch, **f32), torch.ones(nch, **f32)
+    for c, v in table.items():
+        k = int(c) - 1
+        for sc in ('land', 'snow', 'seaice'):
+            scene_ratio[ATMS_SCENES.index(sc), k] = v[sc]
+        c0[k], c1[k], ramp[k] = v['c0'], v['c1'], v['ramp_ratio']
+    atms_traj.update(oberr_scene_ratio=scene_ratio.clamp(min=1.0), oberr_c0=c0, oberr_c1=c1, oberr_ramp=ramp.clamp(min=1.0),
+                     cloud_max=float(exp.get(f'{sensor}_cloud_max', 0.5)))
+    y = atms_traj['y']
+    atms_traj['clw_obs_tb'] = _atms_clw(y[..., 0], y[..., 1], atms_traj['obs_Sat_Zenith_Angle'])
+    shape = atms_traj['valid'].shape
+    atms_traj['sigma_obs'] = torch.zeros(shape + (nch,), **f32)
+    atms_traj['cloud_sym'] = torch.zeros(shape, **f32)
+    atms_traj['cloud_ok'] = torch.ones(shape, dtype=torch.bool, device=device)
+    atms_traj['sigma_set'] = [False] * shape[0]
+
+
+def _setup_atms_corr_r(path, cond_max, atms_traj, logger, device):
+    """Inter-channel correlated R for the assimilated channels
+    (`observations.<sensor>.corr_r`): per scene, the correlation matrix C
+    from `path` (atms_decoder_error.py's json: `channels`, `scenes.<scene>.corr`),
+    reconditioned by C' = (C + d I) / (1 + d) with d set so cond(C') <=
+    `corr_cond_max` (unit diagonal kept, so sigma is unchanged). Stores
+    `corr_whiten` (n_scenes, na, na) = L^-1, C' = L L^T; identity for scenes
+    the file does not list. None = diagonal R."""
+    atms_traj['corr_whiten'] = None
+    if not path:
+        return
+    import json
+    with open(path) as fh:
+        d = json.load(fh)
+    chans = list(d['channels'])
+    assim = atms_traj['assimilate_channels']
+    if [c for c in assim if c not in chans]:
+        raise ValueError(f"corr_r {path} lacks assimilated channels {[c for c in assim if c not in chans]}")
+    ii = [chans.index(c) for c in assim]
+    na = len(assim)
+    W = torch.eye(na, dtype=torch.float64).repeat(len(ATMS_SCENES), 1, 1)
+    for sc, v in d['scenes'].items():
+        C = torch.tensor(v['corr'], dtype=torch.float64)[ii][:, ii]
+        lam = torch.linalg.eigvalsh(C)
+        dl = max(0.0, float((lam[-1] - cond_max * lam[0]) / (cond_max - 1)))
+        Cr = (C + dl * torch.eye(na, dtype=torch.float64)) / (1 + dl)
+        W[ATMS_SCENES.index(sc)] = torch.linalg.inv(torch.linalg.cholesky(Cr))
+        logger.info(f"{atms_traj['sensor']} corr_r {sc}: cond {float(lam[-1] / lam[0]):.0f} -> "
+                    f"{float(torch.linalg.cond(Cr)):.0f} (d {dl:.3f}), channels {assim}")
+    atms_traj['corr_whiten'] = W.to(device=device, dtype=torch.float32)
+
+
+def _atms_sigma(atms_traj, oind, model_equivalent=None):
+    """Observation error at slot `oind`: `(22,)` sigma_o, or `(capacity, 22)`
+    per ob for 'scene_cloud' (set from `model_equivalent` on the slot's first
+    evaluation, see `_setup_atms_oberr`)."""
+    if atms_traj['oberr_model'] == 'none':
+        return atms_traj['sigma_o']
+    if not atms_traj['sigma_set'][oind]:
+        if model_equivalent is None:
+            raise RuntimeError(f'ATMS sigma for slot {oind} used before the slot was evaluated')
+        hb = model_equivalent.detach()
+        clw_b = _atms_clw(hb[:, 0], hb[:, 1], atms_traj['obs_Sat_Zenith_Angle'][oind])
+        scene = atms_traj['scene'][oind].long()
+        ocean = (scene == 0) | (scene == 4)
+        C = torch.where(ocean, 0.5 * (atms_traj['clw_obs_tb'][oind] + clw_b), torch.zeros_like(clw_b))
+        f = ((C[:, None] - atms_traj['oberr_c0']) / (atms_traj['oberr_c1'] - atms_traj['oberr_c0'])).clamp(0.0, 1.0)
+        r_cloud = 1.0 + (atms_traj['oberr_ramp'] - 1.0) * f
+        r = torch.where(ocean[:, None], r_cloud, atms_traj['oberr_scene_ratio'][scene.clamp(min=0)])
+        atms_traj['sigma_obs'][oind] = atms_traj['sigma_o'] * r
+        atms_traj['cloud_sym'][oind] = C
+        atms_traj['cloud_ok'][oind] = ~ocean | (C <= atms_traj['cloud_max'])
+        atms_traj['sigma_set'][oind] = True
+    return atms_traj['sigma_obs'][oind]
+
+
+def _rho(r, huber_c=None):
+    """Jo per normalized departure r: r^2, or the Huber norm (r^2 for
+    |r| <= c, 2c|r| - c^2 beyond: the same value and slope at c, linear in
+    the tails, so outliers pull with a bounded gradient)."""
+    if huber_c is None:
+        return r ** 2
+    a = r.abs()
+    return torch.where(a <= huber_c, r ** 2, 2. * huber_c * a - huber_c ** 2)
+
+
+def _atms_z(atms_traj, zeta, oind, log_sig):
+    """Emissivity control at slot `oind` in PC units: z = zeta * sigma_k
+    (sigma_k from the surface head, detached), 0 where `z_active` is off."""
+    return zeta[oind] * torch.exp(log_sig.detach()) * atms_traj['z_active'][oind][:, None]
 
 
 def _resolve_loss_interp_specs(model, exp):
@@ -1390,6 +1866,9 @@ def _resolve_loss_interp_specs(model, exp):
     # raobs observations share psobs's obs-slot grid (see get_raobs).
     if exp.get('raobs_enabled', False):
         names |= {RAOBS_VARIABLE_MODEL_BASE[v] for v in exp['raobs_variables']}
+    # microwave sensors read profiles, surface and static fields at the same slots
+    if any(exp.get(f'{sensor}_enabled', False) for sensor in MW_SENSORS):
+        names |= set(ATMS_MODEL_FIELDS)
     specs = []
     for base in sorted(names):
         if not model.is_known_variable(base):
@@ -1465,7 +1944,7 @@ def _resolve_control_mask(model, exp, n_vars, device):
 
 @torch.no_grad()
 def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, grid_interp,
-                              interp_specs, step_start=0, raobs_traj=None):
+                              interp_specs, step_start=0, raobs_traj=None, mw_trajs=None, wc_state=None):
     """Evaluate a trajectory at every surface-pressure observation slot.
     Post-optimization diagnostics only -- no gradients anywhere here.
 
@@ -1478,10 +1957,16 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
         `step_start` are omitted -- the caller pads them.
       - `raobs_trajectory` (only when `raobs_traj` is not None): the same
         shape of thing, per raobs variable -- see `_record_raobs`.
+      - `mw_trajectories` (only when `mw_trajs` is not None): per microwave
+        sensor, in `mw_trajs` order, `model_equivalent` `(slot, capacity,
+        nch)`, `screened`, `used`.
 
     `step_start`: the 6h-step index `model_state` sits at. 0 for the
     background; `dt_verif // 6` for a latent analysis (valid at
     `window_start + dt_verif` -- see `compute_optimal`'s docstring).
+
+    `wc_state` (an analysis under weak constraint, `exp['wc_state']`): the
+    model-error jumps added along the way (see `_wc_step`).
 
     Entirely backend-agnostic (only uses `model.advance`/`model.decode_state`).
     Does NOT re-prime FCN3's stochastic noise state before running (see
@@ -1503,6 +1988,7 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
     diagnostics = {}
     model_outputs = {}
     raobs_diagnostics = {base: {} for base in raobs_traj['variables']} if raobs_traj is not None else None
+    mw_diagnostics = [{} for _ in mw_trajs] if mw_trajs is not None else None
 
     def _record_obs(j, decoded_j):
         innovation, model_equivalent, effective_error, available, used, qc_flag = \
@@ -1526,6 +2012,12 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
                     'used': used_r,
                 }.items():
                     raobs_diagnostics[base].setdefault(name, []).append(value.detach().cpu().numpy())
+        for mw_traj, mw_diag in zip(mw_trajs or [], mw_diagnostics or []):
+            _, model_equivalent_a, screened_a, used_a = _compute_atms_observation_diagnostics_at_time(
+                model, decoded_j, mw_traj, grid_interp, j
+            )
+            for name, value in {'model_equivalent': model_equivalent_a, 'screened': screened_a, 'used': used_a}.items():
+                mw_diag.setdefault(name, []).append(value.detach().cpu().numpy())
 
     f_state = model_state
     decoded_prev = model.decode_state(f_state)
@@ -1533,7 +2025,7 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
         model_outputs.setdefault(name, []).append(value.detach().cpu().numpy())
 
     for s in range(step_start + 1, n_steps + 1):
-        f_state = model.advance(f_state, steps=1, use_checkpoint=False)
+        f_state = _wc_step(model, f_state, s, wc_state)
         decoded_cur = model.decode_state(f_state)
         for name, value in decoded_cur.items():
             model_outputs.setdefault(name, []).append(value.detach().cpu().numpy())
@@ -1565,7 +2057,10 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
             base: {name: np.stack(v, axis=0) for name, v in fields.items()}
             for base, fields in raobs_diagnostics.items()
         }
-    return obs_trajectory, model_trajectory, raobs_trajectory
+    mw_trajectories = None
+    if mw_trajs is not None:
+        mw_trajectories = [{name: np.stack(v, axis=0) for name, v in d.items()} for d in mw_diagnostics]
+    return obs_trajectory, model_trajectory, raobs_trajectory, mw_trajectories
 
 
 # ---------------------------------------------------------------------------
@@ -1574,6 +2069,97 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
 
 def forecast(model, model_state, steps):
     return model.advance(model_state, steps=steps)
+
+
+def _resolve_weak_constraint(exp, n_steps, timestep_h):
+    """Window hours of the weak-constraint model-error jumps
+    (`exp.weak_constraint.every_hours`: one every N h, first at N h, last
+    before the window end), or [] for strong constraint. A jump at hour h is
+    a latent increment injected on the h -> h + 6 h step, exactly like the
+    window-start increment on the 0 -> 6 h step."""
+    every = int((exp.get('weak_constraint') or {}).get('every_hours', 0) or 0)
+    if every <= 0:
+        return []
+    if every % timestep_h:
+        raise ValueError(f'weak_constraint.every_hours ({every}) must be a multiple of the {timestep_h} h model step')
+    # the next cycle's background is this analysis advanced to +dt_init; a
+    # restart from the saved +dt_verif state advances it without jumps, so
+    # no jump may fall before dt_init
+    if every < int(exp.get('dt_init', 0)):
+        raise ValueError(f"weak_constraint.every_hours ({every}) must be >= dt_init ({exp.get('dt_init')})")
+    return list(range(every, n_steps * timestep_h, every))
+
+
+def _wc_step(model, state, s, wc_state, use_checkpoint=False):
+    """One 6h step to window step `s`, adding the weak-constraint jump
+    injected on that step if there is one. `wc_state`: None (plain step) or
+    {'step_index': {s: k}, 'forcing': (n_jumps, *latent_shape) already
+    divided by latent_scale, 'keep_mask': control_variables mask or None}.
+    With a mask, the uncontrolled columns take the no-jump step (not
+    detached: they still depend on the earlier controls)."""
+    k = wc_state['step_index'].get(s) if wc_state else None
+    if k is None:
+        return model.advance(state, steps=1, use_checkpoint=use_checkpoint)
+    new = model.advance(state, steps=1, latent_increment=wc_state['forcing'][k], use_checkpoint=use_checkpoint)
+    if wc_state['keep_mask'] is not None:
+        ref = model.advance(state, steps=1, use_checkpoint=use_checkpoint)
+        new = model.wrap_state(_apply_control_mask(new.state, wc_state['keep_mask'], ref.state, model.state_layout),
+                               new.date)
+    return new
+
+
+def advance_with_jumps(model, state, step_start, steps, wc_state):
+    """`model.advance` (no grad, no checkpointing) of `state`, sitting at
+    window step `step_start`, by `steps` steps, adding the weak-constraint
+    jumps of `wc_state` (see `_wc_step`) that fall in that range."""
+    with torch.no_grad():
+        if not wc_state:
+            return model.advance(state, steps=steps, use_checkpoint=False)
+        for s in range(step_start + 1, step_start + steps + 1):
+            state = _wc_step(model, state, s, wc_state)
+    return state
+
+
+def _wc_file(exp, date, max_epoch):
+    return (exp['path_output'] + date + '_wc_forcing_' + exp['window_name'] + 'h' + exp['suffix']
+            + '_' + str(max_epoch) + 'it.pt')
+
+
+def _previous_wc_controls(exp, prev_state, max_epoch, logger):
+    """The previous cycle's unit jump controls v and their window hours, for
+    `weak_constraint.warm_start`: from the in-process `exp['wc_state']` of the
+    cycle dt_init earlier, else from its saved `*_wc_forcing_*.pt` (a restart
+    or resubmit). None if neither exists (the first cycle)."""
+    prev_date = add_hours(exp['date'], -int(exp['dt_init']))
+    if prev_state and prev_state.get('date') == prev_date and prev_state.get('controls') is not None:
+        return prev_state['controls'], prev_state['hours']
+    f = _wc_file(exp, prev_date, max_epoch)
+    if os.path.exists(f):
+        st = torch.load(f, map_location='cpu', weights_only=False)
+        if st.get('controls') is not None:
+            return st['controls'], st['hours']
+        logger.warning(f'weak_constraint.warm_start: {f} has no unit controls (written before warm_start)')
+    logger.info(f'weak_constraint.warm_start: no jumps from {prev_date} -- prior mean 0 this cycle')
+    return None
+
+
+def _shift_wc_controls(prev, prev_hours, hours, dt):
+    """Move the previous window's jump controls `prev` (n_prev, ...) at window
+    hours `prev_hours` to this window's `hours`, a window starting `dt` h later:
+    jump k sits at the previous window's hour hours[k] + dt (the same valid
+    time), linearly interpolated between the previous jumps, with 0 at hour 0
+    (the window-start increment is not a jump) and one jump spacing past the
+    last jump (no information beyond the previous window)."""
+    every = prev_hours[1] - prev_hours[0] if len(prev_hours) > 1 else prev_hours[0]
+    knots = [0] + list(prev_hours) + [prev_hours[-1] + every]
+    vals = torch.cat([torch.zeros_like(prev[:1]), prev, torch.zeros_like(prev[:1])])
+    out = []
+    for h in hours:
+        t = min(max(h + dt, knots[0]), knots[-1])
+        i = max(j for j in range(len(knots) - 1) if knots[j] <= t)
+        w = (t - knots[i]) / (knots[i + 1] - knots[i])
+        out.append((1 - w) * vals[i] + w * vals[i + 1])
+    return torch.stack(out)
 
 
 def _apply_control_mask(state, keep_mask, ref_state, state_layout):
@@ -1592,7 +2178,7 @@ def _apply_control_mask(state, keep_mask, ref_state, state_layout):
 
 def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif_ic,
                        psobs_traj, epoch, exp, grid_interp, print_every, interp_specs,
-                       keep_mask=None, ref_state1=None, jc_ref=None, raobs_traj=None):
+                       keep_mask=None, ref_state1=None, jc_ref=None, raobs_traj=None, mw_trajs=None, wc=None):
     """Latent-space 4D-Var cost function, with sub-6h observations.
 
     `latent_increment` lives in the model's latent space -- AIFS's hidden-
@@ -1641,6 +2227,18 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     needed) -- `None` (the default) assimilates surface pressure only,
     unchanged from before raobs existed.
 
+    `mw_trajs` (from `get_mwobs`: one per enabled microwave sensor): the
+    radiance terms, sum over used obs and the assimilated channels of
+    rho((y_o - BC - H(x)) / sigma_o), on the same slots and `decoded_j`;
+    rho(r) = r^2, or the Huber norm with the sensor's `huber_c`.
+
+    `wc` (weak constraint, from `compute_optimal`, present iff
+    `exp.weak_constraint` is on): `{'step_index', 'forcing', 'keep_mask'}`
+    as in `_wc_step` -- model-error jumps, latent increments injected on
+    later steps the same way as the window-start one. Their penalty is
+    AdamW weight decay on their own optimizer group, like the window-start
+    increment's, so they add no term to `J` here.
+
     `jc_ref` (from `compute_optimal`, present iff `exp['jc_ps_weight']` is
     set): `(field, bg_p_6h, bg_p_12h, weights, factor)` -- the pressure
     field used ('sp' where the backend has it, else 'msl' -- FCN3), the
@@ -1685,6 +2283,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     do_print = print_every > 0 and (epoch % print_every == 0 or epoch == 1)
     Jol = [None] * n_obs
     Jraobs = [None] * n_obs if raobs_traj is not None else None
+    Jmw = [[None] * n_obs for _ in mw_trajs] if mw_trajs is not None else None
 
     def _obs_term(j, decoded_j):
         innovation, model_equivalent, effective_error, available, used, qc_flag = \
@@ -1712,13 +2311,74 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                   f"obs used {counts}")
         return Jt
 
+    def _atms_term(atms_traj, j, decoded_j):
+        zeta = atms_traj.get('zeta')
+        if zeta is None:
+            innovation, _, screened, used = _compute_atms_observation_diagnostics_at_time(
+                model, decoded_j, atms_traj, grid_interp, j)
+        else:
+            # z from the previous evaluation's sigma_k is not needed: sigma_k
+            # depends on x only, so one surface-head pass gives it, then the
+            # sounding channels see z detached and the window channels see x
+            # detached (plan E2)
+            _, _, _, _, (x, log_sig) = _compute_atms_observation_diagnostics_at_time(
+                model, decoded_j, atms_traj, grid_interp, j, return_inputs=True)
+            z = _atms_z(atms_traj, zeta, j, log_sig)
+            innovation, _, screened, used = _compute_atms_observation_diagnostics_at_time(
+                model, decoded_j, atms_traj, grid_interp, j, z=z.detach())
+        a = atms_traj['assimilate_idx']
+        u = used[:, a]
+        innov = torch.where(u, innovation[:, a], torch.zeros_like(innovation[:, a]))
+        sigma = _atms_sigma(atms_traj, j)
+        huber_c = atms_traj['huber_c']
+        rn = innov / sigma[..., a]
+        W = atms_traj.get('corr_whiten')
+        if W is not None:
+            # correlated R: whiten the normalized departures of obs used in
+            # all assimilated channels (r^T C^-1 r = |L^-1 r|^2); obs with
+            # some channels rejected keep the diagonal R; Huber acts on the
+            # whitened components
+            full = u.all(-1)
+            w = torch.einsum('nij,nj->ni', W[atms_traj['scene'][j].long().clamp(min=0)], rn)
+            rn = torch.where(full[:, None], w, rn)
+        Jt = _rho(rn, huber_c).sum()
+        if zeta is not None:
+            e = atms_traj['emis_idx']
+            tb_e, _, _ = atms_traj['op'](x.detach(), z)
+            act = atms_traj['z_active'][j]
+            ws = atms_traj['window_state'][j]
+            if ws.any():
+                # window_state_scenes: these obs see x and z both attached
+                tb_s, _, _ = atms_traj['op'](x, z)
+                tb_e = torch.where(ws[:, None], tb_s, tb_e)
+                if 'cloud_ok' in atms_traj:
+                    ws = ws & atms_traj['cloud_ok'][j]
+                act = act | ws
+            innov_e = atms_traj['y'][j][:, e] - tb_e[:, e]
+            sig_e = sigma[..., e]
+            ok = screened[:, None] & act[:, None] & (innov_e.abs() <= atms_traj['bg_check'] * sig_e).detach()
+            Je = _rho(torch.where(ok, innov_e, torch.zeros_like(innov_e)) / sig_e, huber_c).sum()
+            Jt = Jt + Je
+        if do_print:
+            msg = (f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): {atms_traj['sensor']} J {Jt.item()}, "
+                   f"obs used {dict(zip(atms_traj['assimilate_channels'], u.sum(0).tolist()))} "
+                   f"of {int(screened.sum().item())} screened")
+            if W is not None:
+                msg += f"; corr_r on {int(full.sum())} obs"
+            if zeta is not None:
+                msg += f"; window-channel Jo {Je.item():.1f} over {int(ok.any(-1).sum())} obs"
+            print(msg)
+        return Jt
+
     jc_sp = {}
     f_state = input_state
     decoded_prev = model.decode_state(f_state, only=loss_bases)   # step 0 = uncorrected background
     for s in range(1, n_steps + 1):
-        inj = scaled_increment if s == 1 else None
         use_ckpt = (checkpoint_stride > 0) and (s % checkpoint_stride == 0)
-        f_state = model.advance(f_state, steps=1, latent_increment=inj, use_checkpoint=use_ckpt)
+        if s > 1:
+            f_state = _wc_step(model, f_state, s, wc, use_checkpoint=use_ckpt)
+        else:
+            f_state = model.advance(f_state, steps=1, latent_increment=scaled_increment, use_checkpoint=use_ckpt)
         if s == 1 and keep_mask is not None:
             # Confine the increment's direct effect to the controlled
             # columns; the rest revert to the uncorrected forecast
@@ -1742,11 +2402,20 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             Jol[j] = _obs_term(j, decoded_j)
             if raobs_traj is not None:
                 Jraobs[j] = _raobs_term(j, decoded_j)
+            for k, mw_traj in enumerate(mw_trajs or []):
+                Jmw[k][j] = _atms_term(mw_traj, j, decoded_j)
         decoded_prev = decoded_cur
 
     J = sum(Jol)
     if raobs_traj is not None:
         J = J + sum(Jraobs)
+    for k, mw_traj in enumerate(mw_trajs or []):
+        J = J + sum(Jmw[k])
+        if mw_traj.get('zeta') is not None:
+            Jz = ((mw_traj['zeta'] ** 2) * mw_traj['z_active'][..., None]).sum()
+            J = J + Jz
+            if do_print:
+                print(f"epoch {epoch}, {mw_traj['sensor']} Jz = {Jz.item()}")
     if jc_ref is not None:
         jc_field, bg1, bg2, jc_w, jc_factor = jc_ref
         delta = ((jc_sp[2] - bg2) - (jc_sp[1] - bg1)) / 100.0   # hPa
@@ -1762,7 +2431,26 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     return J, Jol_np
 
 
-def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj=None):
+def load_optstate_background(exp, model, input_encoded, logger):
+    """The background state saved in an `opt_resume` file, in place of the
+    freshly built `input_encoded`: the 48-h spin-up forecast that builds the
+    first background is not bit-reproducible on GPU (Jo of the uncorrected
+    background varies ~0.4% between processes), so a resumed optimization
+    must reuse the saved one to continue the same problem."""
+    st = torch.load(exp['opt_resume'], map_location='cpu', weights_only=False)
+    if 'background' not in st:
+        logger.warning(f"{exp['opt_resume']} has no saved background; resuming on a rebuilt one")
+        return input_encoded
+    if st['background_date'] != input_encoded.date:
+        raise ValueError(f"opt_resume background is dated {st['background_date']}, this run's is {input_encoded.date}")
+    state = st['background'].to(input_encoded.state.device, input_encoded.state.dtype)
+    d = float((state - input_encoded.state).abs().max())
+    logger.info(f"opt_resume: using the saved background (max |diff| vs the rebuilt one {d:.4g})")
+    return model.prime_from_state(model.wrap_state(state, input_encoded.date))
+
+
+def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj=None,
+                    mw_trajs=None):
     """Optimize a latent-space increment against the ps obs.
 
     No backend's encoder/decoder is used to produce a corrected t=0
@@ -1804,6 +2492,61 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     device = input_encoded.state.device
     increment = torch.zeros(model.latent_shape, device=device, requires_grad=True)
 
+    # weak constraint (exp.weak_constraint): model-error jumps, one latent
+    # increment per jump hour, each injected like the window-start one
+    timestep_h = int(round(model.timestep.total_seconds() / 3600))
+    wc_hours = _resolve_weak_constraint(exp, exp['n_verif'] * exp['dt_verif'] // timestep_h, timestep_h)
+    wc_steps = [h // timestep_h + 1 for h in wc_hours]
+    prev_wc_state = exp.get('wc_state')
+    exp['wc_state'] = None
+    exp['wc_prior_state'] = None
+    eta = None
+    if wc_hours:
+        eta = torch.zeros((len(wc_hours),) + tuple(model.latent_shape), device=device, requires_grad=True)
+
+    # control_prior: explicit Gaussian prior -- `increment` and `eta` are unit-variance controls
+    # u, v with injected delta = sigma_b * u, eta_k = sigma_q * v_k (injected latent units, as
+    # fit_latent_to_era5.py sizes them), J += sum u^2 + sum v^2 (the factor-2 convention of Jo),
+    # and no weight decay. With b_cov / q_cov (latent_eof.py output: channel eigvecs, eigvals),
+    # each node's increment is correlated across latent channels: delta_n = sigma_b * L u_n,
+    # L = E diag(sqrt(lam / mean(lam))) -- unit mean variance, so sigma_b stays the rms per
+    # element. to_b / to_q map the optimized tensors to the latent_scale'd increments the rest
+    # of this function works with.
+    prior = exp.get('control_prior') or {}
+    to_b = to_q = lambda t: t  # noqa: E731
+    if prior:
+        def _prior_map(sigma, cov_file):
+            if not cov_file:
+                return lambda t: t * (sigma * latent_scale)
+            ev = np.load(cov_file)
+            lam = torch.as_tensor(ev['eigvals'], dtype=torch.float64).clamp(min=0)
+            L = torch.as_tensor(ev['eigvecs'], dtype=torch.float64) * (lam / lam.mean()).sqrt()
+            Lt = (L.T * (sigma * latent_scale)).to(device=device, dtype=torch.float32).contiguous()
+            return lambda t: t @ Lt
+        to_b = _prior_map(float(prior['sigma_b']), prior.get('b_cov'))
+        if eta is not None:
+            to_q = _prior_map(float(prior['sigma_q']), prior.get('q_cov'))
+        logger.info(f"control_prior: sigma_b {prior['sigma_b']} ({prior.get('b_cov') or 'diagonal'})"
+                    + (f", sigma_q {prior['sigma_q']} ({prior.get('q_cov') or 'diagonal'})" if eta is not None else '')
+                    + ' (no weight decay)')
+
+    # weak_constraint.warm_start (needs control_prior): the jumps' prior mean, and first guess,
+    # is the previous cycle's jumps moved to the same valid times, Jq = sum (v - v_prior)^2
+    v_prior = None
+    if eta is not None and (exp['weak_constraint'] or {}).get('warm_start'):
+        if not prior:
+            raise ValueError('weak_constraint.warm_start needs control_prior (a prior mean for the jumps)')
+        prev = _previous_wc_controls(exp, prev_wc_state, exp['max_epoch'], logger)
+        if prev is not None:
+            v_prior = _shift_wc_controls(prev[0].to(device), prev[1], wc_hours, int(exp['dt_init']))
+            with torch.no_grad():
+                eta.copy_(v_prior)
+            logger.info('weak_constraint.warm_start: prior-mean jump rms '
+                        + ', '.join(f'{h} h {to_q(v_prior[k]).pow(2).mean().sqrt().item():.4g}'
+                                    for k, h in enumerate(wc_hours)))
+            exp['wc_prior_state'] = {'step_index': {s: k for k, s in enumerate(wc_steps)},
+                                     'forcing': (to_q(v_prior) / latent_scale).detach(), 'keep_mask': None}
+
     # control_variables: restrict which packed-state columns the increment may
     # modify at the injection step (see _resolve_control_mask /
     # compute_loss_4dvar). `ref_state1` -- the detached uncorrected first-step
@@ -1814,6 +2557,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     n_vars = (input_encoded.state.shape[1] if model.state_layout == 'channels_first'
               else input_encoded.state.shape[-1])
     keep_mask = _resolve_control_mask(model, exp, n_vars, device)
+    if exp['wc_prior_state'] is not None:
+        exp['wc_prior_state']['keep_mask'] = keep_mask
     ref_state1 = None
     if keep_mask is not None:
         n_ctl = int(keep_mask.sum())
@@ -1861,7 +2606,35 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
                     f"{(model.n_points / jc_factor) ** 0.5:.4g} hPa on this grid)")
         jc_ref = (jc_field, p1, p2, jc_w, jc_factor)
 
-    optimizer = torch.optim.AdamW([increment], lr=lr, weight_decay=wd, betas=(beta1,beta2))
+    groups = [{'params': [increment]} if not prior else {'params': [increment], 'weight_decay': 0.0}]
+    if eta is not None:
+        # the jumps' penalty (Q) is their own AdamW weight decay, as the
+        # window-start increment's (B) is the window's weight_decay -- or, under
+        # control_prior, the explicit sum v^2
+        wc_cfg = exp['weak_constraint']
+        groups.append({'params': [eta], 'lr': lr * float(wc_cfg.get('learn_rate_factor', 1.0)),
+                       'weight_decay': 0.0 if prior else float(wc_cfg.get('weight_decay', wd))})
+        logger.info(f"weak constraint: {len(wc_hours)} model-error jumps at window hours {wc_hours}, "
+                    f"lr {groups[-1]['lr']}, weight_decay {groups[-1]['weight_decay']} "
+                    f"(window-start increment: lr {lr}, weight_decay {wd})")
+    zeta_groups = []  # optimizer group indices of the zeta controls
+    zeta = {}  # sensor -> per-ob emissivity control, one optimizer group each
+    for mw_traj in mw_trajs or []:
+        if mw_traj.get('emis_control') != 'per_obs':
+            continue
+        # emissivity control in prior-std units (z = zeta * sigma_k, Jz = sum zeta^2);
+        # window-local: a fresh zero zeta every cycle
+        sensor = mw_traj['sensor']
+        K = mw_traj['op'].K
+        zeta[sensor] = torch.zeros(mw_traj['y'].shape[:2] + (K,), device=device, requires_grad=True)
+        mw_traj['zeta'] = zeta[sensor]
+        mw_traj['zeta_eval'] = None
+        groups.append({'params': [zeta[sensor]], 'lr': float(exp.get(f'{sensor}_z_learn_rate', 0.1)),
+                       'weight_decay': 0.0})
+        zeta_groups.append(len(groups) - 1)
+        logger.info(f"{sensor} emissivity control: per-ob zeta ({K} PCs) on {int(mw_traj['z_active'].sum())} "
+                    f"land/snow/ice obs, lr {groups[-1]['lr']}, window channels {mw_traj['emis_channels']}")
+    optimizer = torch.optim.AdamW(groups, lr=lr, weight_decay=wd, betas=(beta1,beta2))
 
     # linear warmup/cosine decay
     # (parameters: warmup_steps, start_factor, end_factor)
@@ -1896,6 +2669,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     loss_min = 1e19
     epoch_min = 1
     increment_best = None
+    eta_best = None
+    zeta_best = {sensor: None for sensor in zeta}
 
     # '_loss_latent_' kept (not '_loss_') for continuity with existing
     # loss-history file naming.
@@ -1910,6 +2685,69 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         history = []
 
     epoch = 0
+    # Optimizer checkpoints (exp.opt_checkpoint_every > 0): the full state --
+    # current and best increment, AdamW moments, scheduler, epoch, history --
+    # saved every N epochs and after the last one, as
+    # <date>_optstate_<window>h<suffix>_e<epoch>.pt. exp.opt_resume: path to
+    # such a file continues that optimization (same date) up to this run's
+    # max_epoch. With the same max_epoch it picks up the saved schedule
+    # exactly; with a larger one the extra epochs run at a constant learning
+    # rate: exp.opt_resume_learn_rate if set, else the rate the saved run
+    # ended at (the cosine schedule is not re-stretched, which would jump
+    # the rate back up).
+    ckpt_every = int(exp.get('opt_checkpoint_every', 0) or 0)
+    ckpt_base = exp['path_output'] + exp['date'] + '_optstate_' + exp['window_name'] + 'h' + exp['suffix']
+    if exp.get('opt_resume'):
+        st = torch.load(exp['opt_resume'], map_location=device, weights_only=False)
+        if st['date'] != exp['date'] or st['window_name'] != exp['window_name']:
+            raise ValueError(f"opt_resume {exp['opt_resume']} is for {st['date']} / {st['window_name']}h, "
+                             f"this run is {exp['date']} / {exp['window_name']}h")
+        with torch.no_grad():
+            increment.copy_(st['increment'])
+        optimizer.load_state_dict(st['optimizer'])
+        epoch = st['epoch']
+        loss_min, epoch_min, lsave, history = st['loss_min'], st['epoch_min'], st['lsave'], st['history']
+        increment_best = st['increment_best'].to(device) if st['increment_best'] is not None else None
+        if eta is not None:
+            if st.get('eta') is None or st['eta'].shape != eta.shape:
+                raise ValueError(f"opt_resume {exp['opt_resume']} has no weak-constraint jumps matching "
+                                 f"this run's {len(wc_hours)}")
+            with torch.no_grad():
+                eta.copy_(st['eta'])
+            eta_best = st['eta_best'].to(device) if st['eta_best'] is not None else None
+        saved_zeta, saved_best = st.get('zeta'), st.get('zeta_best')
+        if torch.is_tensor(saved_zeta):  # written before AMSU-A: ATMS only
+            saved_zeta, saved_best = {'atms': saved_zeta}, {'atms': saved_best}
+        for sensor in zeta:
+            if (saved_zeta or {}).get(sensor) is not None:
+                with torch.no_grad():
+                    zeta[sensor].copy_(saved_zeta[sensor])
+                best = (saved_best or {}).get(sensor)
+                zeta_best[sensor] = best.to(device) if best is not None else None
+        if max_epoch == st['max_epoch']:
+            scheduler.load_state_dict(st['scheduler'])
+        else:
+            lr_cont = float(exp.get('opt_resume_learn_rate') or st['last_lr'])
+            for g in optimizer.param_groups:
+                g['lr'] = lr_cont
+            scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
+        logger.info(f"resumed optimization from {exp['opt_resume']} at epoch {epoch} "
+                    f"(saved max_epoch {st['max_epoch']}, best loss {loss_min} at epoch {epoch_min}), "
+                    f"continuing to {max_epoch} at lr {optimizer.param_groups[0]['lr']}")
+
+    def save_optstate():
+        f = f'{ckpt_base}_e{epoch}.pt'
+        torch.save({'date': exp['date'], 'window_name': exp['window_name'], 'epoch': epoch,
+                    'max_epoch': max_epoch, 'increment': increment.detach().clone(),
+                    'increment_best': increment_best, 'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(), 'last_lr': optimizer.param_groups[0]['lr'],
+                    'loss_min': loss_min, 'epoch_min': epoch_min, 'lsave': lsave, 'history': history,
+                    'latent_scale': latent_scale, 'background': input_encoded.state.detach().cpu(),
+                    'zeta': {k: v.detach().clone() for k, v in zeta.items()}, 'zeta_best': dict(zeta_best),
+                    'eta': eta.detach().clone() if eta is not None else None, 'eta_best': eta_best,
+                    'background_date': input_encoded.date}, f)
+        logger.info(f'saved optimizer state at epoch {epoch} to {f}')
+
     while epoch < max_epoch:
         epoch += 1
         # Re-prime FCN3's stochastic noise state at the START of every
@@ -1920,7 +2758,19 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # loss surface for the fixed `increment`. No-op for AIFS.
         model._prime_noise()
         optimizer.zero_grad()
-        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, raobs_traj)
+        wc = None
+        if eta is not None:
+            wc = {'step_index': {s: k for k, s in enumerate(wc_steps)}, 'forcing': to_q(eta) / latent_scale,
+                  'keep_mask': keep_mask}
+        loss, all_loss = compute_loss_4dvar(model, to_b(increment), latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, raobs_traj,
+                                            mw_trajs=mw_trajs, wc=wc)
+        Jb = Jq = None
+        if prior:
+            Jb = (increment ** 2).sum()
+            loss = loss + Jb
+            if eta is not None:
+                Jq = ((eta if v_prior is None else eta - v_prior) ** 2).sum()
+                loss = loss + Jq
 
         if not torch.isfinite(loss):
             logger.warning(f'epoch={epoch}: non-finite loss ({loss.item()}), stopping optimization early')
@@ -1953,7 +2803,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # there is no known case where skip-and-continue actually helped.
         # Raising here makes that failure visible (nonzero exit, full
         # traceback) instead of silently masking a stalled optimization.
-        if not torch.isfinite(increment.grad).all():
+        if not torch.isfinite(increment.grad).all() or (eta is not None and not torch.isfinite(eta.grad).all()):
             raise RuntimeError(
                 f'epoch={epoch}: non-finite gradient in increment -- stopping. '
                 f'This indicates a real numerical instability (e.g. an overly '
@@ -1966,6 +2816,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             'epoch': epoch,
             'loss': float(loss.item()),
             'all_loss': all_loss.tolist(),
+            **({'Jb': float(Jb.item())} if Jb is not None else {}),
+            **({'Jq': float(Jq.item())} if Jq is not None else {}),
         })
         with open(json_file, 'w') as f:
             json.dump(history, f, indent=4)
@@ -1976,15 +2828,34 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             loss_min = loss.item()
             epoch_min = epoch
             increment_best = increment.detach().clone()
+            if eta is not None:
+                eta_best = eta.detach().clone()
+            for sensor, z in zeta.items():
+                zeta_best[sensor] = z.detach().clone()
         else:
             lsave.append(lsave[-1])
 
         torch.nn.utils.clip_grad_norm_([increment], max_norm=1.0)
+        if eta is not None:
+            torch.nn.utils.clip_grad_norm_([eta], max_norm=1.0)
 
         optimizer.step()
         scheduler.step()
-        logger.info(f'epoch={epoch}, lr={scheduler.get_last_lr()[0]}, loss={loss.item()}')
+        # zeta keeps a constant rate: its per-ob problem is small and is re-fit from zero each cycle
+        for k in zeta_groups:
+            optimizer.param_groups[k]['lr'] = groups[k]['initial_lr']
+        logger.info(f'epoch={epoch}, lr={scheduler.get_last_lr()[0]}, loss={loss.item()}'
+                    + (f', Jb={Jb.item():.6g}' if Jb is not None else '')
+                    + (f', Jq={Jq.item():.6g}' if Jq is not None else ''))
+        if ckpt_every > 0 and (epoch % ckpt_every == 0 or epoch == max_epoch):
+            save_optstate()
 
+    if eta is not None:  # the unit controls, for the next cycle's warm_start
+        eta_controls = (eta_best if eta_best is not None
+                        else v_prior if v_prior is not None else torch.zeros_like(eta)).detach().cpu()
+    if prior:  # unit controls -> the latent_scale'd increments everything downstream expects
+        increment_best = to_b(increment_best) if increment_best is not None else None
+        eta_best = to_q(eta_best) if eta_best is not None else None
     if increment_best is not None:
         pt_file = exp['path_output'] + exp['date'] + '_latent_increment_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(max_epoch) + 'it.pt'
         torch.save({'increment': increment_best, 'latent_scale': latent_scale}, pt_file)
@@ -1992,6 +2863,35 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     else:
         logger.warning('no epoch improved on the background -- returning an UNCORRECTED forecast advance')
         lsave = lsave or [float('nan')]
+    if eta is not None:
+        # the analysis trajectory past +dt_verif is the analysis state advanced
+        # WITH these jumps (save_trajectory_diagnostics, the driver's cycling
+        # and window-end state all read exp['wc_state'])
+        if eta_best is not None:
+            forcing = eta_best
+        else:
+            forcing = to_q(v_prior).detach() if v_prior is not None else torch.zeros_like(eta)
+        exp['wc_state'] = {'hours': wc_hours, 'steps': wc_steps,
+                           'step_index': {s: k for k, s in enumerate(wc_steps)},
+                           'forcing': forcing / latent_scale, 'keep_mask': keep_mask,
+                           'date': exp['date'], 'controls': eta_controls}
+        wc_file = _wc_file(exp, exp['date'], max_epoch)
+        torch.save({'hours': wc_hours, 'steps': wc_steps, 'forcing': forcing, 'latent_scale': latent_scale,
+                    'controls': eta_controls}, wc_file)
+        rms0 = increment_best.pow(2).mean().sqrt().item() if increment_best is not None else 0.
+        logger.info(f'saved weak-constraint jumps to {wc_file}; latent rms: window-start increment {rms0:.4g}, '
+                    + ', '.join(f'{h} h {forcing[k].pow(2).mean().sqrt().item():.4g}' for k, h in enumerate(wc_hours)))
+    for mw_traj in mw_trajs or []:
+        sensor = mw_traj['sensor']
+        if sensor not in zeta:
+            continue
+        # the analysis diagnostics evaluate H with the best zeta; the loss's live zeta is retired
+        mw_traj['zeta_best'] = zeta_best[sensor]
+        mw_traj['zeta'] = None
+        if zeta_best[sensor] is not None:
+            za = zeta_best[sensor][mw_traj['z_active']]
+            logger.info(f'{sensor} zeta at the analysis: rms {za.pow(2).mean().sqrt().item():.3f}, '
+                        f'|zeta| > 2 for {(za.abs() > 2).float().mean().item() * 100:.1f}% of components')
 
     # Materialize the actual corrected physical state once, under no_grad
     # (training is done -- increment_best is already detached). This is the
@@ -2048,17 +2948,24 @@ def _pad_leading(arr, n_lead, fill):
     return np.concatenate([pad, arr], axis=0)
 
 
-def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif_ic, psobs_traj, save_levs, grid_interp, logger, raobs_traj=None):
+def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif_ic, psobs_traj, save_levs, grid_interp, logger, raobs_traj=None,
+                                mw_trajs=None):
     interp_specs = _resolve_loss_interp_specs(model, exp)
     timestep_h = int(round(model.timestep.total_seconds() / 3600))
     dt_obs = exp['dt_obs']
     n_obs = int(psobs_traj['n_valid'].shape[0])
     step_lo = psobs_traj['step_lo'].tolist()
 
-    background, initial_traj, raobs_background = compute_ps_observation_hx(
+    for mw_traj in mw_trajs or []:
+        mw_traj['zeta_eval'] = None  # background: z = 0
+    # background: the free run, or under weak_constraint.warm_start the first guess with the
+    # prior-mean jumps (the previous cycle's)
+    background, initial_traj, raobs_background, mw_background = compute_ps_observation_hx(
         model, input_encoded, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=0,
-        raobs_traj=raobs_traj,
+        raobs_traj=raobs_traj, mw_trajs=mw_trajs, wc_state=exp.get('wc_prior_state'),
     )
+    for mw_traj in mw_trajs or []:
+        mw_traj['zeta_eval'] = mw_traj.get('zeta_best')  # analysis: the fitted z (None without control)
 
     # The latent analysis_state is valid at input_encoded.date + dt_verif
     # (see compute_optimal). compute_ps_observation_hx starts its trajectory
@@ -2068,9 +2975,9 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
     shift_hours = (analysis_state.date - input_encoded.date).total_seconds() / 3600.0
     step_start = int(round(shift_hours / timestep_h))
     j_start = sum(1 for s in step_lo if s < step_start)
-    analysis, final_traj, raobs_analysis = compute_ps_observation_hx(
+    analysis, final_traj, raobs_analysis, mw_analysis = compute_ps_observation_hx(
         model, analysis_state, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=step_start,
-        raobs_traj=raobs_traj,
+        raobs_traj=raobs_traj, mw_trajs=mw_trajs, wc_state=exp.get('wc_state'),
     )
     analysis['model_equivalent'] = _pad_leading(analysis['model_equivalent'], j_start, np.nan)
     analysis['used'] = _pad_leading(analysis['used'], j_start, False)
@@ -2079,6 +2986,10 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
         for base in raobs_traj['variables']:
             raobs_analysis[base]['model_equivalent'] = _pad_leading(raobs_analysis[base]['model_equivalent'], j_start, np.nan)
             raobs_analysis[base]['used'] = _pad_leading(raobs_analysis[base]['used'], j_start, False)
+    for atms_analysis in mw_analysis or []:
+        atms_analysis['model_equivalent'] = _pad_leading(atms_analysis['model_equivalent'], j_start, np.nan)
+        atms_analysis['screened'] = _pad_leading(atms_analysis['screened'], j_start, False)
+        atms_analysis['used'] = _pad_leading(atms_analysis['used'], j_start, False)
 
     available = background['available'].astype(bool)
     used = background['used'].astype(bool)
@@ -2166,6 +3077,13 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
             exp, raobs_traj, raobs_background, raobs_analysis, valid_times, lead_hours, ofile_raobs, logger,
         )
 
+    for mw_traj, mw_b, mw_a in zip(mw_trajs or [], mw_background or [], mw_analysis or []):
+        ofile_mw = (
+            exp['path_output'] + exp['date'] + f"_{mw_traj['sensor']}_diagnostics_" + exp['window_name'] + 'h'
+            + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
+        )
+        save_atms_diagnostics(exp, mw_traj, mw_b, mw_a, valid_times, lead_hours, ofile_mw, logger)
+
     ofile2 = exp['path_output'] + exp['date'] + '_control_forecast_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
     ofile3 = exp['path_output'] + exp['date'] + '_optimal_forecast_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
     _ = save_xr_trajectory(model, initial_traj, save_levs, ofile2, start_date=str(input_encoded.date))
@@ -2249,6 +3167,95 @@ def save_raobs_diagnostics(exp, raobs_traj, background, analysis, valid_times, l
     return ofile
 
 
+def save_atms_diagnostics(exp, atms_traj, background, analysis, valid_times, lead_hours, ofile, logger):
+    """Save a microwave sensor's O-B/O-A for the assimilated, monitored and
+    window channels: one `(time, obs_slot, channel)` array per quantity,
+    `obs_slot` a plain index within each time (same convention as psobs's
+    `observation_slot`). Channels are 1-based channel numbers of the sensor.
+    """
+    sensor = atms_traj['sensor']
+    channels = atms_traj['assimilate_channels'] + atms_traj['monitor_channels'] + atms_traj.get('emis_channels', [])
+    ci = [c - 1 for c in channels]
+    capacity = atms_traj['y'].shape[1]
+    ds = xarray.Dataset(
+        coords={
+            'time': ('time', valid_times),
+            'obs_slot': ('obs_slot', np.arange(capacity, dtype=np.int32)),
+            'channel': ('channel', np.asarray(channels, dtype=np.int32)),
+            'lead_time_hours': ('time', lead_hours),
+        },
+        attrs={
+            'title': f'4D-Var {sensor.upper()} observation diagnostics (radianced two-head decoder)',
+            'sensor': sensor,
+            'window_start': str(exp['date']),
+            'window_length_hours': int(exp['n_verif'] * exp['dt_verif']),
+            'dt_obs_hours': int(exp['dt_obs']),
+            'assimilated_channels': np.asarray(atms_traj['assimilate_channels'], dtype=np.int32),
+            'monitored_channels': np.asarray(atms_traj['monitor_channels'], dtype=np.int32),
+            'emissivity_channels': np.asarray(atms_traj.get('emis_channels', []), dtype=np.int32),
+            'emis_control': str(atms_traj.get('emis_control', 'none')),
+            'window_state_scenes': ' '.join(atms_traj.get('window_state_scenes', [])) or 'none',
+            'scenes': ' '.join(f'{i}={n}' for i, n in enumerate(ATMS_SCENES)),
+            'bundle': str(exp[f'{sensor}_bundle']),
+            'huber_c': float(atms_traj['huber_c'] or 0.),
+            'observation': 'y_o - BC (GSI replay bias correction, fixed)',
+            'innovation_convention': 'observation_minus_model',
+            'history': 'Created by long_window_4dvar.py',
+        },
+    )
+    valid = atms_traj['valid'].detach().cpu().numpy()
+    ds['latitude'] = (('time', 'obs_slot'), np.where(valid, atms_traj['lat'].detach().cpu().numpy(), np.nan))
+    ds['longitude'] = (('time', 'obs_slot'), np.where(valid, atms_traj['lon'].detach().cpu().numpy(), np.nan))
+    ds['withheld'] = (('time', 'obs_slot'), atms_traj['withheld'].detach().cpu().numpy().astype(np.int8))
+    ds['scene'] = (('time', 'obs_slot'), atms_traj['scene'].detach().cpu().numpy().astype(np.int8))
+    ds['scene'].attrs['long_name'] = 'scene class, index into the scenes attribute (-1 = padding)'
+    if atms_traj.get('zeta_best') is not None:
+        zb = atms_traj['zeta_best'].detach().cpu().numpy().astype(np.float32)
+        ds['zeta'] = (('time', 'obs_slot', 'emis_pc'), np.where(valid[..., None], zb, np.nan))
+        ds['zeta'].attrs['long_name'] = 'analysis emissivity control in prior-std units (z = zeta * sigma_k)'
+    ds['screened'] = (('time', 'obs_slot'), background['screened'].astype(np.int8))
+    ds['screened'].attrs['long_name'] = 'real ob, finite H(x_b); clear-ocean obs also need all-ocean interpolation neighbours'
+    ds['sigma_o'] = (('channel',), atms_traj['sigma_o'].detach().cpu().numpy()[ci])
+    ds['sigma_o'].attrs.update({'long_name': 'observation error standard deviation', 'units': 'K'})
+    ds.attrs['oberr_model'] = str(atms_traj['oberr_model'])
+    if atms_traj['oberr_model'] != 'none':
+        so = atms_traj['sigma_obs'].detach().cpu().numpy()[..., ci]
+        ds['sigma_obs'] = (('time', 'obs_slot', 'channel'), np.where(valid[..., None], so, np.nan).astype(np.float32))
+        ds['sigma_obs'].attrs.update({'long_name': 'per-ob observation error (oberr_model scene_cloud), set at x_b',
+                                      'units': 'K'})
+        cs = atms_traj['cloud_sym'].detach().cpu().numpy()
+        ds['cloud_sym'] = (('time', 'obs_slot'), np.where(valid, cs, np.nan).astype(np.float32))
+        ds['cloud_sym'].attrs.update({'long_name': 'symmetric cloud liquid water (clw(y_o) + clw(H(x_b))) / 2, ocean',
+                                      'units': 'kg m-2'})
+    dims = ('time', 'obs_slot', 'channel')
+    mask = valid[..., None]
+    y = atms_traj['y'].detach().cpu().numpy()[..., ci]
+    hb = background['model_equivalent'][..., ci].astype(np.float32)
+    ha = analysis['model_equivalent'][..., ci].astype(np.float32)
+    for name, values, long_name in (
+        ('observation', y, 'observed brightness temperature minus bias correction'),
+        ('background', hb, 'background model equivalent H(x_b)'),
+        ('analysis', ha, 'analysis model equivalent H(x_a)'),
+        ('omb', y - hb, 'observation minus background'),
+        ('oma', y - ha, 'observation minus analysis'),
+    ):
+        ds[name] = (dims, np.where(mask, values, np.nan).astype(np.float32))
+        ds[name].attrs.update({'long_name': long_name, 'units': 'K'})
+    for name, values, long_name in (
+        ('used', background['used'][..., ci], 'screened, passing the background check at x_b, not withheld'),
+        ('analysis_used', analysis['used'][..., ci], 'the same, reevaluated at the analysis'),
+    ):
+        ds[name] = (dims, values.astype(np.int8))
+        ds[name].attrs.update({'long_name': long_name, 'flag_values': np.array([0, 1], dtype=np.int8),
+                               'flag_meanings': 'not_used used'})
+    encoding = {name: {'zlib': True, 'complevel': 2} for name in ds.data_vars}
+    ds.to_netcdf(ofile, encoding=encoding)
+    if 'sat_id' in _ATMS_OBS_INPUTS:
+        ds['sat_id'] = (('time', 'obs_slot'), np.where(valid, atms_traj['obs_sat_id'].detach().cpu().numpy(), -1).astype(np.int8))
+    logger.info(f'saved {sensor} diagnostics: ' + ofile)
+    return ofile
+
+
 def save_xr_trajectory(model, model_trajectory, olevels, ofile, save=True, start_date=None):
     """Save a (time, ...) dict-of-arrays trajectory (from compute_ps_observation_hx)
     to netCDF on the model's flat unstructured "values" grid -- lat/lon are
@@ -2299,6 +3306,23 @@ def save_inputs_pkl(exp, input_encoded, analysis_state, lsave):
         for L in lsave:
             f.write(f"{L}\n")
     return
+
+
+def save_window_end_state(exp, model, input_encoded, analysis_state, logger):
+    """Weak constraint: the analysis at the window end -- the analysis state
+    advanced through the window WITH the model-error jumps -- as
+    `<date>_wcend_inputs_<window>h..it.pkl`. Forecasts from the window end
+    must start from it (diagnostics/forecast_skill.py does): advancing the
+    `optimal_inputs` state (valid at +dt_verif) would drop the jumps."""
+    timestep = model.timestep.total_seconds()
+    step_start = int(round((analysis_state.date - input_encoded.date).total_seconds() / timestep))
+    n_steps = exp['n_verif'] * exp['dt_verif'] * 3600 // int(timestep)
+    end_state = advance_with_jumps(model, analysis_state, step_start, n_steps - step_start, exp['wc_state'])
+    ofile = (exp['path_output'] + exp['date'] + '_wcend_inputs_' + exp['window_name'] + 'h' + exp['suffix']
+             + '_' + str(exp['max_epoch']) + 'it.pkl')
+    with open(ofile, 'wb') as f:
+        pickle.dump(end_state, f)
+    logger.info(f'saved window-end analysis (valid {end_state.date}): {ofile}')
 
 
 def save_inputs_nc(exp, model, input_encoded, analysis_state, logger):

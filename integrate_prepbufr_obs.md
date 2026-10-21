@@ -429,3 +429,27 @@ What needed repo-specific work beyond a straight copy:
   repo's own convention -- see CLAUDE.md) and were not ported; the
   validation results they produced are summarized under "Verification"
   above instead.
+
+## Known issue: radiosonde temperature is virtual temperature (found 2026-10-17)
+
+- **The issue:** the archive's `temperature_c` is the current PREPBUFR TOB.
+  Wherever humidity was reported, that value is virtual temperature (the
+  event stack's program code 8, VIRTMP).
+- **Where it goes wrong:** `raobs_parquet.py` reads it as `t` and compares it
+  with the model's sensible temperature.
+- **Size:** against ERA5 (2015-01-10), sonde O − ERA5 is +1.0 K at
+  925–1000 hPa, +0.75 K at 850 hPa, +0.23 K at 500 hPa and about 0 above
+  300 hPa. Converting with Tv − T = Tv(1 − 1/(1 + 0.6078 q)), using the
+  sonde's own q, brings 850 hPa to +0.04 K. That conversion matches the
+  event stack's pre-VIRTMP value to within 0.07 K.
+- **Effect:** raob-assimilating runs are pulled warm in the moist lower
+  troposphere.
+- **Status:** fixed 2026-10-17. `raobs_parquet.py` now takes `t` from the
+  first non-VIRTMP event (`prepbufr_parquet_common.sensible_temperature`).
+  On 2015-01-10, the change in the values (old − new) is 1.30 / 0.90 /
+  0.73 / 0.42 / 0.15 K at 1000 / 925 / 850 / 700 / 500 hPa, and 0 above
+  250 hPa. The QC masks are unchanged.
+- **Affected runs:** every raob run before this date assimilated Tv as T.
+  That includes Bo's ps + raobs baseline and our 10-cycle, 1-month and
+  6-month raob runs. The 6-month runs were restarted with the fix as
+  `lwatms_6mo_ps_raobs_qerr_tsens` and `lwatms_6mo_all_tsens`.

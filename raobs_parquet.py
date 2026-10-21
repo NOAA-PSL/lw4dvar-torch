@@ -10,6 +10,12 @@ Ported from the `long-window-4dvar` (JAX/NeuralGCM) reference repo's
 `prepbufr_parquet.py` (`_profile_records`/`load_prepbufr_raob_observations`),
 restricted to the ADPUPA class, with specific humidity added -- the
 reference never implemented moisture for radiosondes at all.
+
+Temperature is sensible temperature: the archive's current TOB is virtual
+temperature wherever moisture was reported (VIRTMP), so `t` is taken from the
+first non-VIRTMP event (`common.sensible_temperature`). Before 2026-10-17
+this reader returned the virtual temperature (+1 K at 925-1000 hPa, +0.75 K
+at 850 hPa vs ERA5; integrate_prepbufr_obs.md).
 """
 
 import numpy as np
@@ -93,7 +99,7 @@ def _profile_records(
         'report_id', 'observation_time', 'station_id', 'latitude',
         'longitude', 'elevation_m', 'report_type',
     ]
-    level_columns = ['report_id', 'category', 'pressure_mb'] + list(_HEIGHT_COLUMNS)
+    level_columns = ['report_id', 'level_index', 'category', 'pressure_mb'] + list(_HEIGHT_COLUMNS)
     for variable in variables:
         level_columns.extend(_VARIABLE_COLUMNS[variable])
     level_columns = list(dict.fromkeys(level_columns))
@@ -128,6 +134,13 @@ def _profile_records(
             level_quality = {
                 v: common.column(levels, _VARIABLE_COLUMNS[v][1]) for v in variables
             }
+            if 't' in level_values:
+                # current TOB is virtual temperature where moisture was
+                # reported (VIRTMP); the model's t is sensible temperature
+                level_values['t'] = common.sensible_temperature(
+                    cycle, prepbufr_class, level_report_ids,
+                    common.column(levels, 'level_index', np.int64), level_values['t'],
+                )
 
             for level_row, report_id in enumerate(level_report_ids):
                 report_row = report_rows.get(int(report_id))

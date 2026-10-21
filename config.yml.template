@@ -54,6 +54,7 @@ exp:
       #quality_mark_max: 3  # max accepted PREPBUFR quality mark (source QC)
       #use_source_error: False  # True: use each report's own pressure_error_mb instead of error_std_hpa
       #error_std_hpa: 1.0  # assigned ob error when use_source_error is False (or oberrstart <= 0)
+      #error_scale: 1.0  # multiplies the assigned ps error (before the orography term and its QC use)
 
     # --- raobs (radiosonde profile) settings -- omit this whole block (the
     # default) or leave `enabled: False` to assimilate surface pressure
@@ -99,6 +100,12 @@ exp:
       # moisture at all.
       #q_error_fraction: 0.2
       #q_error_floor_kg_kg: 1.e-5
+      # Or a fixed per-level q error (g/kg; ln(p)-interpolated between entries,
+      # nearest beyond them), replacing the fraction-of-ob error, which weights
+      # dry obs most and pulls the analysis dry. And a background check on q:
+      # reject |O-B| > q_bg_check * error (off when unset).
+      #q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      #q_bg_check: 4.0
       # Radiosonde humidity sensors are unreliable above the lower/mid
       # troposphere -- mask 'q' at any matched level with pressure below this
       # (set null to disable the floor entirely).
@@ -107,6 +114,47 @@ exp:
       # omitted) sized to the largest slot actually read; set an explicit
       # integer only if you need a stable shape across configs/runs.
       #station_capacity: 1000
+    # --- atms (ATMS radiances through the radianced two-head decoder) ---
+    # AIFS only (the decoder was trained on the 1-degree checkpoint's
+    # variables). Operator: obs_atms_operator.py (copied from radianced
+    # atmsdec/operator.py) + a bundle exported by radianced
+    # scripts/export_operator.py. Obs files: one parquet per 6-h cycle from
+    # radianced scripts/build_lw4dvar_obs.py. Uses psobs's obs-slot grid, like
+    # raobs. See notes/integrate_atms_obs.md.
+    #atms:
+    #  enabled: False
+    #  path: '/scratch4/BMC/gsienkf/Sergey.Frolov/obs/atms_2015'   # required
+    #  bundle: '.../outputs/bo_twohead_s1/atms_twohead_bo_s1.pt'     # required
+    #  assimilate_channels: [5, 6, 7]       # 1-based ATMS channels in Jo
+    #  monitor_channels: [8, 9, 10, 11]     # O-B/O-A diagnostics only
+    #  sigma_o_scale: 1.0                   # multiplies the bundle's sigma_o
+    #  sigma_o: {5: 0.37, 6: 0.21}         # optional per-channel sigma_o (K), replaces the bundle's before the scale
+    #  bg_check: 4.0                        # reject |O-B| > bg_check * sigma_o, per channel
+    #  water_frac_min: 0.99                 # read-time scene screen: FOV water fraction,
+    #  clw_max: 0.05                        #   cloud liquid water (kg/m2), and ice_frac == 0
+    #  lsm_max: 0.01                        # all 4 interpolation neighbours must have lsm <= this
+    #  scenes: ['ocean_clear']              # scene classes read: ocean_clear, land, snow, seaice, ocean_cloudy
+    #                                       #   (radianced scene_masks; ocean_cloudy = all water, no ice, clw > clw_max;
+    #                                       #   lsm_max applies to the ocean scenes only)
+    #  oberr_model: 'none'                  # 'scene_cloud': per-ob sigma = sigma_o * r, r >= 1 from oberr_table, set at x_b:
+    #                                       #   ocean: Geer & Bauer ramp in symmetric clw (clw(y_o) + clw(H(x_b))) / 2,
+    #                                       #   from ch 1-2 by the GSI retrieval; land/snow/seaice: per-scene ratio
+    #  oberr_table: 'figures/atms_oberr/oberr_table.json'   #   from atms_cloud_error.py
+    #  cloud_max: 0.5                       #   ocean obs with symmetric clw above this (kg/m2) are not used
+    #  emis_control: 'none'                 # 'per_obs': one emissivity control z per land/snow/ice ob
+    #  emis_channels: [1, 2, 3, 4, 16, 17]  #   window channels that fit z (state detached); sounding
+    #                                       #   channels see z detached. Jz = sum zeta^2, z = zeta*sigma_k
+    #  z_learn_rate: 0.1                    #   AdamW learning rate of zeta (own group, constant, not scheduled)
+    #  window_state_scenes: []              #   scenes whose window-channel obs also act on the state (x and z attached;
+    #                                       #   needs emis_control 'per_obs'; ocean obs need clw <= cloud_max), e.g. ['ocean_clear']
+    #  corr_r: null                         # inter-channel correlated R for the assimilated channels: json from
+    #                                       #   atms_decoder_error.py (per-scene corr); obs used in all assimilated
+    #                                       #   channels are whitened, the rest keep a diagonal R; null = diagonal
+    #  corr_cond_max: 50.                   #   recondition each scene's corr to this condition number (ridge, unit diag)
+    #  detach_q_above_hpa: 250.             # no Jo gradient to q at p < this (decoder's
+    #                                       #   stratospheric-q sensitivity is a learned proxy)
+    #  time_tolerance_hours: (dt_obs / 2)   # slot j takes obs in [t_j - tol, t_j + tol)
+    #  capacity: (max per slot)             # padded obs per slot
 
   ic_suffix: '96h_100it' # pkl file info for restart
   sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
@@ -174,6 +222,18 @@ exp:
   # fcn3_prefetch_ic.py / aifs_prefetch_ic.py in the source repos).
   ic_cache: './ic_cache/'
   print_every: 10
+  # Optimizer checkpoints. opt_checkpoint_every > 0 saves the optimizer state
+  # (current and best increment, AdamW moments, scheduler, epoch, loss
+  # history) every N epochs and after the last one, to
+  # <date>_optstate_<window>h<suffix>_e<epoch>.pt (~4x the latent increment).
+  # opt_resume: one of those files -- continues that optimization (same date
+  # and window) up to this run's max_epoch: with the same max_epoch, exactly
+  # where it stopped; with a larger one, at a constant learning rate
+  # (opt_resume_learn_rate, default the rate the saved run ended at).
+  # Outputs are named by the new max_epoch, so nothing is overwritten.
+  #opt_checkpoint_every: 100
+  #opt_resume: './output/<exp>/2015-01-01T00_optstate_120h_e300.pt'
+  #opt_resume_learn_rate: 2.0e-4
   # optionally increase ob error linearly through window to give more weight to
   # loss at beginning of window (crude treatment of model error).
   oberrstart: 1.0 # ob error at start of window (-1 to use surface_pressure_error_std_hpa / per-report source error instead)
@@ -225,6 +285,34 @@ exp:
   #latent_scale: 1.0 # optional global preconditioner divided into the
   #   latent increment inside the differentiable forward pass (rarely
   #   needed -- tune learn_rate first)
+
+  # weak_constraint: model-error jumps (weak-constraint 4D-Var) -- one latent
+  # increment per jump time, injected on the step h -> h+6 at h = every_hours,
+  # 2*every_hours, ... inside the window, like the window-start increment. The
+  # analysis trajectory, cycling and the window-end state (*_wcend_inputs_*.pkl,
+  # read by diagnostics/forecast_skill.py) include them. See
+  # notes/weak_constraint_4dvar.md.
+  #weak_constraint:
+  #  every_hours: 24          # 0/omit = strong constraint; a multiple of the model step, >= dt_init
+  #  learn_rate_factor: 0.75  # jumps' lr / learn_rate
+  #  weight_decay: 1.0e-3     # jumps' AdamW decay (ignored under control_prior)
+  #  warm_start: False        # needs control_prior: the jumps' prior mean and first guess are
+  #                           # the previous cycle's (same valid time, linearly interpolated;
+  #                           # read from its *_wc_forcing_*.pt on a restart), Jq = sum (v - v_prev)^2;
+  #                           # the saved background trajectory then includes those prior jumps
+
+  # control_prior: explicit Gaussian prior in place of AdamW weight decay: the
+  # optimizer works on unit-variance controls u, v with window-start increment
+  # sigma_b * u and jumps sigma_q * v_k (latent units as injected, i.e. after
+  # latent_scale; fit_latent_to_era5.py estimates them), J += sum u^2 + sum v^2,
+  # weight decay 0. learn_rate then acts on u (lr ~ old lr / sigma_b keeps the
+  # same increment step size). Omit for the weight-decay prior (the default).
+  #control_prior:
+  #  sigma_b: 0.24
+  #  sigma_q: 0.185           # needed with weak_constraint
+  #  b_cov: output/latent_eof_B_accept_a.npz    # optional: channel covariance (latent_eof.py),
+  #  q_cov: output/latent_eof_Q24_accept_a.npz  #   normalized to unit mean variance -- each node's
+  #                           # increment is sigma * E diag(sqrt(lam/mean lam)) u_n; omit = diagonal
 
   # control_variables: decode-time mask (list of model variable/family base
   # names) -- at the injection step, packed-state columns NOT named here

@@ -141,6 +141,10 @@ for k in range(exp_config['n_init']):
         if k == 0 and window == list(windows.keys())[0]:
             # first time, first window, read from a file based on config
             input_encoded, exp_config = utils.get_input(exp_config, model, logger)
+            # opt_resume: continue on the background the saved optimization
+            # used -- rebuilding it from ERA5 is not bit-reproducible on GPU
+            if exp_config.get('opt_resume'):
+                input_encoded = utils.load_optstate_background(exp_config, model, input_encoded, logger)
             # if we just read an optimal IC file (restart), advance the state
             if exp_config['restart']:
                 logger.info('making prior from a forecast initialized with the RESTART optimal...')
@@ -190,7 +194,12 @@ for k in range(exp_config['n_init']):
                     f"dt_init ({exp_config['dt_init']}h) must be >= the analysis's shift past window start "
                     f"({shift_hours}h, the latent +dt_verif shift) to cycle"
                 )
-            input_encoded = model.advance(analysis_state, steps=steps_for_hours(max(remaining_hours, 0.0)))
+            # weak constraint: the previous window's jumps up to the new start (none, as
+            # every_hours >= dt_init -- see utils._resolve_weak_constraint)
+            input_encoded = utils.advance_with_jumps(
+                model, analysis_state, steps_for_hours(shift_hours), steps_for_hours(max(remaining_hours, 0.0)),
+                exp_config.get('wc_state'),
+            )
             is_new_analysis_time = True
         else:
             # window-to-window within one cycle -- analysis_state is already
@@ -219,15 +228,20 @@ for k in range(exp_config['n_init']):
         # exp.raobs_enabled is True, in which case every call below just
         # assimilates surface pressure, unchanged (see get_raobs).
         raobs_traj = utils.get_raobs(exp_config, model, logger, grid_interp, psobs_traj)
+        # microwave radiances (ATMS, AMSU-A; notes/integrate_atms_obs.md) --
+        # None unless an observations.<sensor> block is enabled; same slot
+        # grid as psobs.
+        mw_trajs = utils.get_mwobs(exp_config, model, logger, grid_interp, psobs_traj)
 
         # call the optimization routine
         analysis_state, lsave = utils.compute_optimal(
             exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj,
+            mw_trajs=mw_trajs,
         )
         # save initial and final trajectory in model and observation space.
         utils.save_trajectory_diagnostics(
             exp_config, model, input_encoded, analysis_state, verif_ic, psobs_traj,
-            exp_config['save_levs'], grid_interp, logger, raobs_traj,
+            exp_config['save_levs'], grid_interp, logger, raobs_traj, mw_trajs=mw_trajs,
         )
         # print z500 error before and after optimization. The latent
         # analysis_state is always valid at window_start + dt_verif, not
@@ -247,6 +261,8 @@ for k in range(exp_config['n_init']):
         printz500err('z500err after', model.decode_state(analysis_state), verif_shifted, vdate)
         # save the inputs and loss info
         utils.save_inputs_pkl(exp_config, input_encoded, analysis_state, lsave)
+        if exp_config.get('wc_state'):
+            utils.save_window_end_state(exp_config, model, input_encoded, analysis_state, logger)
         utils.save_inputs_nc(exp_config, model, input_encoded, analysis_state, logger)
         # longer forecast, if desired.
         if 'dt_forecast' in exp_config and 'n_forecast' in exp_config:
