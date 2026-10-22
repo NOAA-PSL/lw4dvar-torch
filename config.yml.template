@@ -38,6 +38,9 @@ exp:
   # load_config raises for n_init > 1 with cycle: False (it used to silently
   # skip advancing the analysis to the next cycle time, see
   # integrate_multiple_backends.md "cycle: False with n_init > 1")
+  # free_rollout: True # skip the assimilation and cycle on the plain
+  # background: a pure model run with the same cycling, output files and
+  # O-B diagnostics as a DA experiment (O-A == O-B). Default False.
   exp_name: 'test_v1' # data is saved in this subdirectory
 
   # --- path_model / model_backend-specific checkpoint keys ---

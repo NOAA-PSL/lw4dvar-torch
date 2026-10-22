@@ -216,8 +216,21 @@ for k in range(exp_config['n_init']):
         logger.info('reading observations...')
         psobs_traj = utils.get_psobs(exp_config, model, logger, grid_interp)
 
-        # call the optimization routine
-        analysis_state, lsave = utils.compute_optimal(exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger)
+        # call the optimization routine -- or, with free_rollout, skip the
+        # assimilation and advance the background by dt_verif: the same
+        # uncorrected advance compute_optimal falls back to, dated window start
+        # + dt_verif like an analysis, so cycling continues on the background
+        # and every consumer below works unchanged (O-A == O-B).
+        if exp_config.get('free_rollout', False):
+            logger.info('free_rollout: skipping assimilation, advancing the background only...')
+            model._prime_noise()
+            with torch.no_grad():
+                analysis_state = model.advance(
+                    input_encoded, steps=steps_for_hours(exp_config['dt_verif']), use_checkpoint=False,
+                )
+            lsave = [float('nan')]
+        else:
+            analysis_state, lsave = utils.compute_optimal(exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger)
         # save initial and final trajectory in model and observation space.
         utils.save_trajectory_diagnostics(
             exp_config, model, input_encoded, analysis_state, verif_ic, psobs_traj,
