@@ -87,7 +87,7 @@ def main():
               f"{(torch.cuda.max_memory_allocated() - base) / 1e9:.2f} GB", flush=True)
 
     # ---- 1. single ob
-    with open(glob.glob(os.path.join(meta['run_dir'], f'{args.single_ob_date}_control_inputs_120h_50it.pkl'))[0], 'rb') as fh:
+    with open(glob.glob(os.path.join(meta['run_dir'], f'{args.single_ob_date}_control_inputs_*.pkl'))[0], 'rb') as fh:
         s_b = pickle.load(fh)
     s_b.state = s_b.state.to(dev)
     with torch.no_grad():
@@ -124,7 +124,7 @@ def main():
                   f"10m {st['10m'][0]:.2f}/{st['10m'][1]:.2f}/{st['10m'][2]:+.0f}deg", flush=True)
 
     # ---- 2. decoded draws
-    run_files = sorted(glob.glob(os.path.join(meta['run_dir'], '*_control_inputs_120h_50it.pkl')))[meta['skip']:]
+    run_files = sorted(glob.glob(os.path.join(meta['run_dir'], '*_control_inputs_*.pkl')))[meta['skip']:]
     files = [run_files[i] for i in np.linspace(0, len(run_files) - 1, args.n_test).astype(int)]
     cases = ['real'] + [f'ens{loc:.0f}' for loc in locs]
     rms = {k: {f: [] for f in FIELDS} for k in cases}
