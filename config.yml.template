@@ -124,6 +124,28 @@ exp:
   # unless set. (Replaces the removed jc_ps_sigma: sigma = s corresponds to
   # kappa = n_points / (s^2 * N_obs).)
   #jc_ps_weight: 30.
+  # jb_samples: optional background term Jb with a static-ensemble latent B
+  # (ACE2 only so far; latent_b.EnsembleB). The file holds N latent
+  # background-error samples (z(ERA5) - z(cycled background) at the
+  # increment's injection point, mean removed), built offline from a cycled
+  # run by diagnostics/build_latent_ens_b.py (~8 GB for 161 samples); the run
+  # refuses a file built for a different checkpoint. B = (1/(N-1)) sum_k
+  # e_k e_k^T o L, with L a Gaussian horizontal localization (the same for
+  # all latent channels, so the samples' cross-channel structure -- e.g.
+  # geostrophic ps-wind balance -- is kept; no vertical localization). The
+  # control becomes v with increment = B^1/2 v, and Jb = jb_weight * ||v||^2
+  # (no 1/2, like Jo). With Jb on, AdamW weight_decay is set to 0 and
+  # latent_scale must be unset/1. The control is O(1) per element under the
+  # prior, so learn_rate is in different units than without Jb (retune).
+  # Leave jc_ps_weight off with Jb: the sampled B already carries the
+  # (geostrophic) mass-wind balance the tendency penalty was standing in for.
+  #jb_samples: './output/latent_b/ace2_jc25_ens_samples.pt'
+  # jb_loc_km: Gaussian localization scale (km; correlation exp(-d^2/(2 loc^2)),
+  # 0.25 at d ~ 1.7 loc). Default 1500. A runtime parameter -- no need to
+  # rebuild the samples to change it.
+  #jb_loc_km: 1500.
+  # jb_weight: multiplies Jb (default 1; > 1 tightens the prior).
+  #jb_weight: 1.
   # obs_density_box_deg (degrees): optional observation-density weighting of
   # Jo, giving more weight to obs in sparsely observed regions (SH, oceans).
   # At each obs time the used obs are binned into box x box degree lat-lon
