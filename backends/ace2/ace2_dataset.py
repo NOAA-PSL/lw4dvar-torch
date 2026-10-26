@@ -1083,8 +1083,8 @@ def _month_stats(path: str) -> dict:
                 diff=_moments(np.diff(x, axis=0)),
                 tsum=np.where(ok, x, 0.0).sum(axis=0),
                 tcount=ok.sum(axis=0).astype(np.int64),
-                first=x[0],
-                last=x[-1],
+                first=x[0].copy(),  # copies: a view would keep all of x alive
+                last=x[-1].copy(),
                 vmin=float(np.nanmin(x)) if ok.any() else np.nan,
                 vmax=float(np.nanmax(x)) if ok.any() else np.nan,
                 nonfinite=int(x.size - ok.sum()),

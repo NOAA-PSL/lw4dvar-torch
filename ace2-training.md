@@ -661,3 +661,12 @@ weights.
       all eight 16-layer jobs; logs `logs_ace2ds32_crtm/YYYY-YYYY.{out,err}`.
       +96 fields = +3 GB/month (~1.7 TB). If a 16-layer job fails these stay
       pending (DependencyNeverSatisfied): fix, rerun it, resubmit them.
+- [ ] 16-layer normalization stats incl. the crtm families (2026-10-26):
+      job 10280347 (`MODE=stats` in `run_ace2_dataset_hercules.sh`, 8
+      workers, 100 GB -- fits beside a 32-layer job on a DTN node),
+      `afterok` on the 16-layer jobs covering 1985-2020, into
+      `ace2_era5_1deg_16layer/stats-1990-01-2019-12/`; log
+      `logs_ace2ds16_crtm/stats.{out,err}`. Fixed first: `_month_stats` kept
+      each variable's whole month array alive through the `first`/`last`
+      views (23 GB per worker at 16 layers, 236 vars; now 8.4 GB, results
+      identical) -- likely also the cause of the ~14 GB/worker OOMs on Ursa.
