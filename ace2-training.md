@@ -653,3 +653,11 @@ weights.
       21-25) in 4 `--dependency=singleton` chains (`-J ace2crtm16_chain<N>`),
       logs `logs_ace2ds16_crtm/YYYY-YYYY.{out,err}`. Then: stats with the new
       fields, copy to Ursa/Polaris.
+      First months: 4.3-4.4 min/month (16 workers), total water check
+      ~2.4e-9 kg/kg; ~5.3 h per 6-year job.
+- [ ] CRTM families added to the 32-layer dataset (2026-10-26, same mode):
+      16 jobs of 3 years (10278432-47: 1979-81, ..., 2021-23, 2024-25) in 4
+      singleton chains (`-J ace2crtm32_chain<N>`), each also `afterok` on
+      all eight 16-layer jobs; logs `logs_ace2ds32_crtm/YYYY-YYYY.{out,err}`.
+      +96 fields = +3 GB/month (~1.7 TB). If a 16-layer job fails these stay
+      pending (DependencyNeverSatisfied): fix, rerun it, resubmit them.
