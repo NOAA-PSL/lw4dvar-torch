@@ -49,18 +49,30 @@ vendored helpers.
   `hours since 1940-01-01T12:00:00` (as Ai2's), static fields and
   `ak_N`/`bk_N` in every file. Written to `.tmp` and renamed; existing months
   are skipped, so jobs over disjoint month ranges can share one OUTDIR.
-- `--layer_indices` (any increasing L137 interface list from 0 to 137) and
-  `--extra_layer_vars` (`specific_humidity`, the four condensates,
-  `ozone_mass_mixing_ratio`, `fraction_of_cloud_cover`, `vertical_velocity`)
-  for the radiance work.
+- `--layer_indices` (any increasing L137 interface list from 0 to 137),
+  `--layer_families` (`ace2`, the default, or `crtm`; see "CRTM layer
+  variables" below) and `--extra_layer_vars` (`specific_humidity`, the four
+  condensates, `ozone_mass_mixing_ratio`, `fraction_of_cloud_cover`,
+  `vertical_velocity`) for the radiance work.
 - Shared per-OUTDIR files: `regrid_weights_0p25deg_to_F90.nc` (xESMF weights,
   ~3 min to compute once), `invariant.nc`, `co2.nc`.
 - **CO2**: `ace2_dataset.py co2 OUT.nc 1940 2022` pulls ACE2-ERA5's own
   6-hourly `global_mean_co2` out of the public HF `forcing_YYYY.nc` files via
   HTTP range reads (~3 s/year, no full download). Verified bit-identical to
-  the local `forcing_2020.nc`. HF has 1940-2022 only; later years need
-  another source (not done). Runs in the `ace2` env (`ace2ic` lacks
+  the local `forcing_2020.nc`. HF has 1940-2022 only. Runs in the `ace2` env (`ace2ic` lacks
   `h5netcdf`).
+- **CO2 after 2022** (2026-10-18): ACE2-ERA5's series is, from ~2017 on,
+  NOAA GML global annual means (`co2_annmean_gl.txt`) linearly interpolated
+  between knots at July 1 00Z (Jul-1 values within 0.01 ppm of NOAA's; slope
+  breaks exactly at Jul 1 00Z; 1979-2016 annual means differ by up to
+  0.45 ppm, an older NOAA vintage). `ace2_dataset.py co2_noaa IN.nc OUT.nc
+  2025` appends the same construction (input kept bit-identical; the 2022
+  knot taken from the input; past the last NOAA year the last slope is
+  extrapolated). With NOAA's 2023-2025 (419.35, 422.79, 425.62) there is a
+  0.02 ppm step at 2023-01-01 (vs ~0.0016 per 6 h), from NOAA's revision of
+  2023 since Ai2's series was made. H2 2025 is extrapolated until NOAA
+  publishes 2026. Installed as `co2.nc` (1940-2025) in both the 8- and
+  32-layer dirs; the original is kept as `co2_1940-2022.nc`.
 - Memory: a family summing several ERA5 fields (total water) is built as the
   sum of each field's coarsened layers (the layer mean is linear, so this
   equals coarsening the sum), and dp is built one coarse layer at a time:
@@ -413,6 +425,69 @@ field to rms <= 5e-4 K / 6.5e-4 m/s / 1.8e-7 kg/kg -- not exact because
 coarsening uses 0.25 deg ERA5 surface pressure before regridding, and
 PRESsfc is reduced to HGTsfc.
 
+## Total water and its components (2026-10-14)
+
+`specific_total_water_<i>` is vapor plus all four ERA5 condensates:
+`specific_humidity` + `specific_cloud_liquid_water_content` +
+`specific_cloud_ice_water_content` + `specific_rain_water_content` +
+`specific_snow_water_content` (`WATER_VARS` in `ace2_ic.py`, imported by
+`ace2_dataset.py` through `LAYER_VARS`), each coarsened to layers and then
+summed (as Ai2's). Both the 8- and 32-layer builds store **only the total**
+(checked 32-layer `1979010100.nc`: no `specific_humidity_<i>` or condensate
+fields).
+
+For radiances this matters: vapor, cloud liquid and cloud ice have different
+radiative properties. Vapor dominates clear-sky absorption, liquid emits in
+microwave window channels, and ice (and snow/rain) scatter at high microwave
+frequencies and in the IR. Clear-sky operators (CRTM/RTTOV) need q; all-sky
+operators also need the hydrometeor profiles. Options:
+
+- **Prognostic split**: rebuild with `--extra_layer_vars specific_humidity
+  specific_cloud_liquid_water_content specific_cloud_ice_water_content`
+  (+ rain/snow if all-sky MW) and train on the components instead of, or
+  besides, the total. Costs more channels; the condensates are intermittent
+  and skewed, so they probably need a transformed normalization.
+- **Diagnostic secondary decoder** (like ACE2.1-ERA5's pressure-level
+  decoder): reconstruct q / liquid / ice from total water and temperature
+  (plus layer pressure, and possibly the rest of the column), keeping total
+  water as the conserved prognostic. The training data still needs the
+  components, as output-only fields. A physical baseline to beat:
+  saturation adjustment (q = min(qt, qsat(T, p)), the excess split into
+  liquid and ice by a temperature ramp). This will underestimate cloud at
+  1-deg layer means, where clouds exist below grid-mean saturation.
+
+Either way the dataset has to be rebuilt (or extended) with the component
+fields.
+
+## CRTM layer variables (2026-10-26)
+
+Decided: for CRTM radiances the model carries vapor and ozone as
+prognostics, and total water is replaced by the total condensate.
+`build --layer_families crtm` writes six layer families:
+`air_temperature`, `specific_humidity`, `specific_total_condensate` (cloud
+liquid + cloud ice + rain + snow, each coarsened and then summed, like total
+water), `ozone_mass_mixing_ratio`, `eastward_wind`, `northward_wind` -- no
+`specific_total_water_<i>` (it is `specific_humidity_<i>` +
+`specific_total_condensate_<i>`). The default `--layer_families ace2` is
+unchanged, so the existing 8/16/32-layer datasets rebuild identically. Files
+carry the `layer_families` attribute. One more ERA5 model-level field read
+per time (ozone: 9 vs 8). Can be combined with `--extra_layer_vars` (e.g.
+the individual condensates for all-sky work); repeating a family there is an
+error.
+
+- Validated (Hercules login node, 2023-01-01T00, 8 layers, one
+  `process_time`, ~80 s): vs the 8-layer `2023010100.nc`, vapor + condensate
+  = total water to float32 rounding (relative max error <= 1e-7, layer 0
+  exactly); the other 147 fields bit-identical; condensate >= 0 (max 3 g/kg,
+  layer 4; 0 in layer 0); ozone layer-mean 7.8e-6 kg/kg in layer 0 down to
+  6e-8 in layer 7.
+- For training (not done): the ACE2-ERA5 stepper config's corrector
+  (`conserve_dry_air`, `moisture_budget_correction`) and `force_positive_names`
+  refer to `specific_total_water_<i>`, which these files lack: check how fme
+  2026.5's `ClimateData` finds total water before reusing it, and add the new
+  families to `force_positive_names`. The condensate is intermittent and
+  skewed (zero in most cells), so its normalization may need a transform.
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -530,4 +605,27 @@ weights.
       probe done (see "Memory probe" above): up to 48 layers fit at embed
       384 on the current setup; embed 512 fits on 4 nodes; 768 needs
       ZeRO/FSDP or AMP.
-- [ ] CO2 after 2022.
+- [ ] Split total water into vapor / liquid / ice for radiances: decided
+      2026-10-26 to make vapor, total condensate and ozone prognostic
+      (`--layer_families crtm`; see "CRTM layer variables"). Builder done
+      and validated on one time; dataset build, stats and training config
+      not yet.
+- [x] CO2 after 2022 (NOAA GML; see "CO2 after 2022" above).
+- [ ] 2023-01..2025-12 for both datasets (2026-10-18, Hercules `service`):
+      32-layer one job per year (10159808-10, chains `ace2ds_new_chain1-3`)
+      into `ace2_era5_1deg_32layer`; 8-layer 2023/2024/2025 chained
+      (10159811-13, `ace2ds_new_chain4`) into a recreated
+      `/work2/noaa/gsienkf/whitaker/ace2_era5_1deg_8layer` holding only
+      2023-2025 (its 1979-2022 files were deleted on Hercules after backup).
+      Logs `logs_ace2ds_2023-2025/{8L,32L}_YYYY.{out,err}`.
+- [ ] 16-layer build, 1979-01..2025-12 (2026-10-20, Hercules `service`):
+      nested, every other 32-layer interface (each 8-layer layer split in
+      two, so it contains all 9 original interfaces and is itself contained
+      in the 32-layer grid):
+      `--layer_indices 0 24 48 58 67 73 79 84 90 95 100 104 109 114 119 128 137`.
+      47 one-year jobs (10180627-73) in 4 `--dependency=singleton` chains
+      (`-J ace2ds16_chain<N>`, years round-robin), logs
+      `logs_ace2ds16/YYYY.{out,err}`, into
+      `/work2/noaa/gsienkf/whitaker/ace2_era5_1deg_16layer` (`co2.nc`
+      1940-2025, `co2_1940-2022.nc`, `invariant.nc` and regrid weights
+      copied from the 32-layer dir). Then: check vs 8/32-layer, stats.
