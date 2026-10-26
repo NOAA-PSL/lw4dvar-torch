@@ -481,6 +481,24 @@ error.
   exactly); the other 147 fields bit-identical; condensate >= 0 (max 3 g/kg,
   layer 4; 0 in layer 0); ozone layer-mean 7.8e-6 kg/kg in layer 0 down to
   6e-8 in layer 7.
+- **`add_layer_families` mode** adds a set's missing families to existing
+  months instead of rebuilding (`ace2_dataset.py add_layer_families OUTDIR
+  START END [--layer_families crtm]`; Hercules launcher `MODE=add_layer_families`).
+  Why not rebuild: per time step at 16 layers a full `build` takes ~80-110 s
+  per worker, while each ERA5 model-level field reads in 0.5-2 s and coarsens
+  in <1 s -- most of a build is the other streams and the regridding. The
+  patch reads only vapor, ozone, the four condensates and surface pressure
+  (the condensates are read, not taken as total water - vapor, so empty
+  cells stay exactly 0 and the result equals a fresh `crtm` build). It uses
+  the files' own layer indices and model top, keeps total water (so the
+  files serve both sets; fme ignores unused variables), refuses a month
+  unless vapor + condensate matches its total water within 1e-7 kg/kg, and
+  writes a .tmp copy renamed over the original; done months carry
+  `layer_families = "ace2 crtm"` and are skipped. Validated on a 3-time copy
+  of the 16-layer 2020-01: the 48 added fields bit-identical (values and
+  attributes) to `process_time` with `crtm`, existing fields and attributes
+  unchanged, same (1, 180, 360) chunking, total water check 2.2e-9 kg/kg.
+  +48 fields at 16 layers = +1.5 GB/month (~0.9 TB for 1979-2025).
 - For training (not done): the ACE2-ERA5 stepper config's corrector
   (`conserve_dry_air`, `moisture_budget_correction`) and `force_positive_names`
   refer to `specific_total_water_<i>`, which these files lack: check how fme
@@ -629,3 +647,9 @@ weights.
       `/work2/noaa/gsienkf/whitaker/ace2_era5_1deg_16layer` (`co2.nc`
       1940-2025, `co2_1940-2022.nc`, `invariant.nc` and regrid weights
       copied from the 32-layer dir). Then: check vs 8/32-layer, stats.
+- [ ] CRTM families added to the 16-layer dataset (2026-10-26, Hercules
+      `service`, `MODE=add_layer_families`): 8 jobs of ~6 years
+      (10278388-95: 1979-84, 85-90, 91-96, 97-02, 03-08, 09-14, 15-20,
+      21-25) in 4 `--dependency=singleton` chains (`-J ace2crtm16_chain<N>`),
+      logs `logs_ace2ds16_crtm/YYYY-YYYY.{out,err}`. Then: stats with the new
+      fields, copy to Ursa/Polaris.
