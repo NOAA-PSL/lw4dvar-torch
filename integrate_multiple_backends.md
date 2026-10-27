@@ -1847,6 +1847,77 @@ Sergey 299671 vs 293925). Not yet run: a multi-week cycling comparison with
 the unfixed runs. Alternatives not tried: `ps_operator: 'ps'` (observes `sp`
 directly, region by region) and `jc_ps_weight`.
 
+## Sub-6-hourly diurnal climatology (`diurnal_clim`, ACE2, 2026-10-15/19)
+
+With `dt_obs: 3`, every other obs slot falls between two 6-hourly model
+steps and was matched to the linear interpolation of the bracketing decoded
+states. 6 h is the Nyquist interval of the semidiurnal (S2) tide, so that
+interpolation misses the tide and the diurnal cycle entirely -- the
+representativeness error noted for AIFS in the Aurora section.
+
+- **Method.** `backends/ace2/ace2_diurnal_clim.py` (env `ace2ic`, launcher
+  `run_ace2_diurnal_ursa.sh` on u1-service) computes, from hourly ARCO-ERA5
+  processed by `ace2_dataset`'s own model-level pipeline (same layers, model
+  top and PRESsfc reduction, read from the dataset's attributes),
+  C(t) = x(t) - [(1 - a) x(t_lo) + a x(t_hi)] for every off-synoptic hour,
+  with x(t_lo), x(t_hi) read from the 6-hourly training dataset itself, and
+  composites its mean and std by calendar month and UTC hour (`accum` per
+  month into a sums directory, then `combine`). The 2012-2014 climatology
+  (independent of the 2015 experiments) is
+  `/scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_8layer/diurnal_clim.nc`
+  (6 GB; every ACE2 prognostic channel plus PRMSL, DPT2m).
+- **In the solver** (`get_diurnal_correction`, `_slot_decoded`): for an
+  off-step slot j the loss and the obs diagnostics decode
+  `(1 - a) x_lo + a x_hi + C_j` (packed state, then `decode_state`) instead
+  of linearly interpolating decoded fields. C_j is interpolated between the
+  two nearest mid-month climatologies; channels without a climatology get
+  zero. It is a constant with respect to the control (changes innovations,
+  not the gradient path). ACE2 only (the check in `load_config`); a no-op at
+  `dt_obs: 6`, where every slot is on a step.
+- **Size of the signal** (PRESsfc, Jan-Mar, at 3 h past a step, rms over
+  the band): climatological mean C 0.51 hPa NH, 0.97 tropics, 0.43 SH -- what
+  the correction removes; the std of C (day-to-day sub-6-h variability a
+  6-hourly model cannot represent) 0.44 / 0.29 / 0.45 hPa -- small next to
+  O-B ~2.2 hPa and sigma_o ~1.6.
+- **Cycled result** (`test_ace2_6h3h_50it_5day_lr1e-3_jc25` vs
+  `..._jc25_diurnal`, configs identical except `diurnal_clim`; 6 h cycling,
+  5-day window, `dt_obs: 3`, 50 epochs, lr 1e-3, `jc_ps_weight: 25`). z500
+  rms error, mean of 340 cycles 2015-01-06 - 03-31:
+
+  | Analysis, hours into window | NH | Tropics | SH | Global |
+  |---|---|---|---|---|
+  | 6 h, linear interpolation | 14.87 | 7.44 | 21.18 | 15.51 |
+  | 6 h, diurnal correction | 14.63 | 7.47 | 20.12 | 14.96 |
+  | difference | -0.23 | +0.03 | -1.06 | -0.55 |
+  | 120 h, difference | -0.36 | -0.10 | -0.94 | -0.55 |
+
+  The gain is nearly constant through the window. Fit to the ps obs used by
+  both runs (Feb-Mar, leads 6-117 h, rms O-B in hPa): on-step slots
+  unchanged (NH 2.107/2.107, tropics 2.279/2.275, SH 1.819/1.815);
+  off-step slots NH 2.142 -> 2.081, tropics 2.430 -> 2.224, SH
+  1.855 -> 1.772. The tropical off-step misfit removed, sqrt(2.430^2 -
+  2.224^2) ~ 1.0 hPa, matches the 0.97 hPa S2 amplitude. Tropical z500 does
+  not respond (the tide is mostly a surface-pressure signal).
+- **With obs-density weighting and dt_obs 3 vs 6**
+  (`..._jc25_diurnal_obden` vs `test_ace2_6h_50it_5day_lr1e-3_jc25_diurnal_obden`,
+  `obs_density_box_deg: 10`, identical except `dt_obs`; 335 cycles
+  2015-01-06 - 03-30; the 3-hourly run uses ~2x the obs). 6 h analysis z500:
+  dt_obs 6 13.21 / 7.21 / 17.74 / 13.41 m (NH/tropics/SH/global), dt_obs 3
+  +0.39 / +0.25 / -0.86 / -0.18. The SH gain and the NH loss both hold
+  from February on (January is reversed); globally 3-hourly obs are only
+  marginally better. In the 3-hourly run off-step obs fit the background as
+  well as on-step ones in the NH (O-B 2.188 vs 2.186 hPa), so the NH loss is
+  not an off-step representation problem; the untested hypothesis is
+  temporally correlated obs error (each station seen twice as often with
+  the same sigma_o) -- the test is dt_obs 3 with sigma_o inflated by sqrt(2).
+  (Obs-density weighting itself takes the 3-hourly diurnal run from 14.96
+  to 13.26 m global.)
+- **Caveats.** One run per configuration, one season; no bootstrap of the
+  cycle-to-cycle noise (monthly SH differences swing by ~1 m). The
+  climatology is ERA5 at 1 deg; station-scale sub-6-h variability is not in
+  it (it is in sigma_o, equally for on- and off-step slots).
+  Diagnostic scripts and plots were session scratch (untracked).
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle
