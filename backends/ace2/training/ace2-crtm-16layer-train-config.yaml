@@ -15,9 +15,9 @@
 #   share. Vapor and condensate (same weights): layers 0-3 (top-144 hPa,
 #   layer 3 mean ~117 hPa) 0.1 (w^2 1/50 of the layers below 252 hPa); 4-5
 #   0.354 (ACE2-ERA5's 0.5 for that total-water layer);
-#   6-15 0.707. Ozone (stratosphere-dominated): layers 0-6 (top-313 hPa)
-#   0.707, layers 7-15 (below ~313 hPa, troposphere) 0.1 (w^2 1/50 of the
-#   layers above).
+#   6-15 0.707. Ozone (stratosphere-dominated): layers 0-5 (top-252 hPa)
+#   0.707, 6-7 (252-401 hPa, transition) 0.354, 8-15 (below ~401 hPa,
+#   troposphere) 0.1 (w^2 1/50 of the layers above).
 # - Normalization: ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-
 #   floor (condensate std floored at 1e-6 kg/kg in layers 0-2; see
 #   ace2-training.md).
@@ -177,8 +177,8 @@ stepper_training:
       ozone_mass_mixing_ratio_3: 0.707
       ozone_mass_mixing_ratio_4: 0.707
       ozone_mass_mixing_ratio_5: 0.707
-      ozone_mass_mixing_ratio_6: 0.707
-      ozone_mass_mixing_ratio_7: 0.1
+      ozone_mass_mixing_ratio_6: 0.354
+      ozone_mass_mixing_ratio_7: 0.354
       ozone_mass_mixing_ratio_8: 0.1
       ozone_mass_mixing_ratio_9: 0.1
       specific_humidity_0: 0.1

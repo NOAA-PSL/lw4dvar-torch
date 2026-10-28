@@ -575,8 +575,8 @@ Experiment dir `ace2_training/ace2-crtm-16layer-1979-2025-no2015`.
   run started) -- not ACE2-ERA5's non-monotonic 0.5/0.25 for its top two
   total-water layers; 4-5 (144-252 hPa) 0.354;
   6-15 0.707. Ozone (stratosphere-dominated; user's choice, 2026-10-28):
-  layers 0-6 (top-313 hPa; layer 6 mean ~283 hPa) 0.707, 7-15 (below ~313
-  hPa) 0.1 (untuned). Loss shares: 2-D fields ~83%, each 3-D family 2-4%
+  layers 0-5 (top-252 hPa) 0.707, 6-7 (252-401 hPa) 0.354, 8-15 (below
+  ~401 hPa) 0.1 (untuned). Loss shares: 2-D fields ~83%, each 3-D family 2-4%
   (8-layer: 87%, 3-4%).
 - Memory: like the 8-layer model (probe: 4L = 96 layer channels changes
   peak memory by <0.3 GB at 1 sample/GPU) -- 4 nodes, no checkpointing.
