@@ -642,6 +642,56 @@ Only the top soil layer (the user's choice: it's the one emissivity sees).
   ~3% of its std per 6 h); check snow cover and soil moisture drift in a
   30-60 day free run, not just the 6-h loss.
 
+## Training on Ursa MI300X (2026-10-28)
+
+Ursa's `u1-mi300x` partition: 5 nodes (e01g[01-02], e02g[01-03]), each 8 x
+192 GB AMD MI300X, 96 CPUs, 2 TB RAM, one mlx5 InfiniBand HCA, 1 TB tmpfs
+`/tmp`, ROCm 7.2.4 / amdgpu 6.16 driver, no internet. Account `gpu-ai4wp`,
+QOS `gpuwf` (<= 7 days).
+
+- **Env `ace2-rocm`** (`/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2-rocm`,
+  `ace2-rocm-requirements.txt`): the `ace2` env rebuilt on a login node with
+  only torch swapped for the same version's ROCm wheel --
+  `conda create --prefix $P --file ace2-spec.txt`, then
+  `pip install torch==2.7.1+rocm6.3 torchvision==0.22.1+rocm6.3 --index-url
+  https://download.pytorch.org/whl/rocm6.3`, then the `ace2` lock minus
+  torch/torchvision/triton/nvidia-*. The wheel bundles its own ROCm and RCCL
+  (no `module load rocm`); torch-harmonics is pure Python. fme needs no
+  changes: `torch.cuda` and `backend="nccl"` map to HIP and RCCL.
+  `~/.local` site-packages leak into conda envs (pip took `requests` from
+  there), so the launcher sets `PYTHONNOUSERSITE=1`.
+- **Launcher `run_ace2_train_mi300x.sh`**: one `torchrun --nproc_per_node 8`
+  per node; default 1 node = 2 samples/GPU at batch 16, no checkpointing
+  needed. `expandable_segments` is unsupported in this torch build (dropped).
+- **Per-rank MIOpen caches (`backends/ace2/training/rocm_rank_env.sh`,
+  started by torchrun with `--no-python`, then runs `fme_train.py`).** fme
+  sets `torch.backends.cudnn.benchmark = True`, which on ROCm is MIOpen's
+  exhaustive convolution search; with all 8 ranks sharing one MIOpen user DB
+  (sqlite) in `/tmp`, rank 3 segfaulted 4 min in, still tuning (job
+  24889236). With a DB per rank both the exhaustive and the
+  `MIOPEN_FIND_MODE=FAST` runs work, with identical losses (to ~1e-8) and
+  speed, so the default is kept.
+- **Smoke test** (`ace2-smoke-mi300x.yaml`, untracked = `ace2-smoke-ursa.yaml`
+  with its own experiment dir; jobs 24889407/8): valid loss 22.04 -> 12.61,
+  inference error 0.569 -> 0.452 (H100: 22.92 -> 12.96, 0.577 -> 0.456).
+- **Throughput** (`ace2-rate-mi300x.yaml`, untracked = the Ursa rate test;
+  2 epochs on 2016-2017, jobs 24890813/4), steady (epoch 2): 183 batches in
+  142 s = **0.78 s/batch on 1 node vs 0.97 on 4 u1-h100 nodes**; whole epoch
+  incl. validation and 80-step inference 259 s (4 H100 nodes 272 s). Inline
+  inference ~0.33 s/step. Every job first spends ~5-6 min warming up before
+  step 1 at the same rate in both MIOpen modes (so not conv tuning; cause not
+  found) -- negligible in a 7-day job. Estimate for a full run (~3930
+  batches/epoch): ~51 min training + ~3 min validation + ~8 min 1440-step
+  inference, ~1 h/epoch, **~5 days for 120 epochs** on one node, if 16 layers
+  run like 8 (the memory probe says they do).
+- **16-layer CRTM + land on Ursa:** `ace2-crtm-16layer-train-config-ursa.yaml`
+  = `ace2-crtm-16layer-train-config.yaml` with Eagle paths -> `/scratch4/BMC/gsienkf/whitaker`
+  and **seed 1** (Polaris: 0), a second realization (different init and
+  shuffling); regenerate it from the Polaris config, don't edit it. Data
+  `ace2_era5_1deg_16layer` (+ `snow-capped-1000/`,
+  `stats-1990-01-2019-12-condensate-floor-land/`) copied from Polaris,
+  staged via `/scratch3/data_untrusted`.
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -667,6 +717,8 @@ qsub run_ace2_train_polaris.sh     # 4 nodes, <= 168 h
 # Ursa: normalization stats (u1-service), then training (u1-h100, <= 7 days)
 sbatch -t 02:00:00 -c 64 --mem=240g -o ace2_stats.out -e ace2_stats.err --export=ALL,MODE=stats,WORKERS=12 run_ace2_dataset_ursa.sh
 sbatch run_ace2_train_ursa.sh      # 4 nodes; -N 2..8
+# Ursa: training on u1-mi300x (1 node = 8 MI300X, <= 7 days)
+sbatch --export=ALL,CONFIG=backends/ace2/training/ace2-crtm-16layer-train-config-ursa.yaml run_ace2_train_mi300x.sh
 # Ursa: patch PRESsfc in months built before 2026-10-10 (own log files)
 sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
     --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_ursa.sh
@@ -823,3 +875,7 @@ weights.
       variables before it started ("Training: 16 layers, CRTM + land"),
       experiment dir
       `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-land-16layer-1979-2025-no2015`.
+- [ ] 16-layer CRTM + land training on Ursa MI300X (see "Training on Ursa
+      MI300X"): env, launcher, 8-layer smoke and throughput tests done
+      2026-10-28; `ace2-crtm-16layer-train-config-ursa.yaml` (seed 1) to be
+      submitted once the 16-layer dataset is on `/scratch4`.
