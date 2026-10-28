@@ -32,13 +32,24 @@ module load conda
 module load cudatoolkit-standalone/12.8.1
 conda activate /home/jwhitaker/.conda/envs/ace2
 
-# NCCL over Slingshot (ALCF's recommended settings for PyTorch DDP on Polaris).
-export NCCL_NET_GDR_LEVEL=PHB NCCL_CROSS_NIC=1 NCCL_COLLNET_ENABLE=1 NCCL_NET="AWS Libfabric"
-export LD_LIBRARY_PATH=/soft/libraries/aws-ofi-nccl/v1.9.1-aws/lib:/soft/libraries/hwloc/lib:${LD_LIBRARY_PATH}
-export FI_CXI_DISABLE_HOST_REGISTER=1 FI_MR_CACHE_MONITOR=userfaultfd FI_CXI_DEFAULT_CX_MAX=131072
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# DataLoader workers pass tensors over AF_UNIX sockets created under TMPDIR,
+# whose path must be < 108 characters: a long job TMPDIR hung the 2026-10-28
+# smoke test ("OSError: AF_UNIX path too long"). See ace2-training.md.
+echo "ace2_train: job TMPDIR=${TMPDIR:-unset} (${#TMPDIR} chars), using /tmp"
+export TMPDIR=/tmp
 
 NNODES=${NNODES:-$(sort -u ${PBS_NODEFILE} | wc -l)}
+# NCCL over Slingshot (ALCF's recommended settings for PyTorch DDP on Polaris),
+# only between nodes: within a node NCCL uses NVLink. Since 2026-10 (driver
+# 580 / CUDA 13, libfabric 2.3) the aws-ofi-nccl 1.9.1 plugin fails to open a
+# CXI domain and segfaults in the first collective, so 1-node jobs (debug
+# smoke tests) skip it. See ace2-training.md.
+if [ ${NNODES} -gt 1 ]; then
+    export NCCL_NET_GDR_LEVEL=PHB NCCL_CROSS_NIC=1 NCCL_COLLNET_ENABLE=1 NCCL_NET="AWS Libfabric"
+    export LD_LIBRARY_PATH=/soft/libraries/aws-ofi-nccl/v1.9.1-aws/lib:/soft/libraries/hwloc/lib:${LD_LIBRARY_PATH}
+    export FI_CXI_DISABLE_HOST_REGISTER=1 FI_MR_CACHE_MONITOR=userfaultfd FI_CXI_DEFAULT_CX_MAX=131072
+fi
 HOSTFILE=$(mktemp -p ${PBS_O_WORKDIR} .ace2_train_hosts.XXXX)
 sort -u ${PBS_NODEFILE} | head -n ${NNODES} > ${HOSTFILE}
 MASTER=$(head -n 1 ${HOSTFILE})

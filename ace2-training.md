@@ -137,6 +137,22 @@ HGTsfc, not the HF forcing files.
   for any Python started with cwd `/tmp`: don't run Python from `/tmp`.
 - Python `-I` drops the script's directory from `sys.path`, which breaks
   `import ace2_ic` -- the launcher runs without it.
+- **aws-ofi-nccl plugin segfaults on 1-node jobs since 2026-10** (driver
+  580.65.06 / CUDA 13.0, libfabric 2.3.1; found 2026-10-27): every rank dies
+  in the first collective (fme's `dist.barrier` in `prepare_directory`)
+  after `NET/OFI Couldn't open a fabric access domain. RC: -38` -- with the
+  v1.9.1-aws and the libfabric-1.22 builds alike. Without the plugin, 1-node
+  NVLink works. On 2 nodes the plugin works (job 7789746: 0.46 GB
+  all-reduce 0.022 s vs 0.23 s with `NCCL_NET=Socket`). So
+  `run_ace2_train_polaris.sh` sets the NCCL/plugin env only when NNODES > 1.
+  Diagnostics: untracked `nccl_diag/`.
+- **DataLoader workers hang with `OSError: AF_UNIX path too long`**
+  (2026-10-28, 16-layer smoke job 7789826, stuck 35 min after the
+  inference dataset loaded): torch shares tensors between processes over
+  AF_UNIX sockets under TMPDIR (limit 108 chars); the PBS job TMPDIR is
+  `/var/tmp/pbs.<jobid>.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov` (63
+  chars). `run_ace2_train_polaris.sh` now prints it and sets `TMPDIR=/tmp`;
+  the next run went through.
 
 ## Environment
 
@@ -506,6 +522,64 @@ error.
   families to `force_positive_names`. The condensate is intermittent and
   skewed (zero in most cells), so its normalization may need a transform.
 
+## Training: 16 layers, CRTM variables (2026-10-27)
+
+Config `backends/ace2/training/ace2-crtm-16layer-train-config.yaml`
+(generated from the 8-layer ACE2-ERA5-vars config; same architecture,
+forcings, diagnostics, training settings, corrector), data
+`ace2_era5_1deg_16layer` on Eagle (564 months 1979-01..2025-12, crtm
+families added). Prognostic layer families: `air_temperature`,
+`specific_humidity`, `specific_total_condensate`, `ozone_mass_mixing_ratio`,
+`eastward_wind`, `northward_wind` x 16 layers -- 108 input / 114 output
+channels (44/50 at 8 layers). Train 1979-2014 + 2016-2025, 2015 held out.
+Experiment dir `ace2_training/ace2-crtm-16layer-1979-2025-no2015`.
+
+- **Total water for the corrector.** fme 2026.5 finds total water only by
+  the `specific_total_water_` prefix (`ATMOSPHERE_FIELD_NAME_PREFIXES` in
+  `fme/core/atmosphere_data.py`). `fme_train.py` now also replaces
+  `AtmosphereData.specific_total_water` with one that falls back to
+  `specific_humidity_<k>` + `specific_total_condensate_<k>` when the total is
+  absent (data with the total are unaffected). The correctors
+  (`conserve_dry_air`, `moisture_budget_correction:
+  advection_and_precipitation`) and the derived total water path only read
+  total water, so that is all they need: dry air is conserved by adjusting
+  PRESsfc with total water = q + c, and the column budget closes on the
+  TWP of q + c. Checked on CPU with synthetic 16-layer data: total water
+  equals q + c exactly; dry-air global-mean imbalance 178 Pa -> 0.001 Pa;
+  column budget residual 7e-12; no water fields at all still raises
+  KeyError. `force_positive_names` covers all three water/ozone families.
+  **Inference (lw4dvar's `ace2_model.py`) will need the same patch** to run
+  a CRTM checkpoint's corrector.
+- **Condensate normalization floor.** In the 16-layer stats
+  (`stats-1990-01-2019-12`, 1990-2019) condensate std is 8.6e-12 kg/kg in
+  layer 0 (0.01-5.6 hPa), 3.6e-9 in layer 1 (5.6-51 hPa), 2.6e-7 in layer 2
+  (51-91 hPa), then 4.7e-6 and up. Layer 0/1 condensate is ERA5
+  stratospheric noise: zero in all but ~1e-5 / 1e-2 of cells, with rare
+  values 130-580 sigma (layer 2-3 tropopause cirrus is heavy-tailed too, up
+  to ~400 sigma, but physical). Training uses
+  `stats-1990-01-2019-12-condensate-floor`: a copy with the full-field and
+  residual std of `specific_total_condensate_<k>` floored at 1e-6 kg/kg
+  (layers 0-2 changed; recorded in the files' `history`). Plain linear
+  normalization otherwise (fme has no transform; a log/sqrt transform would
+  break q + c = total water); watch the condensate channels.
+- **Loss weights:** fme multiplies prediction and target by the weight
+  before the MSE (`VariableWeightingLoss`), so a channel's share of the loss
+  goes as w^2. To keep each family's 8-layer share when a layer splits into
+  n sub-layers, each gets w8 / sqrt(n) (fixed 2026-10-28; the first version
+  copied w8 to both halves, doubling the 3-D share, and the 32-layer Ursa
+  config's w8 / 4 cut it to a quarter). 16 layers (8-layer k = 2k, 2k+1):
+  air_temperature_0-3, winds 0-1: 0.354, rest 0.707. Vapor and condensate
+  share one set (user's choice, 2026-10-28): layers 0-3 (top-144 hPa;
+  global-mean layer pressures 2.8, 28, 71, 117 hPa) 0.01, like the 32-layer
+  config's stratospheric total water -- not ACE2-ERA5's non-monotonic
+  0.5/0.25 for its top two total-water layers; 4-5 (144-252 hPa) 0.354;
+  6-15 0.707. Ozone (stratosphere-dominated; user's choice, 2026-10-28):
+  layers 0-6 (top-313 hPa; layer 6 mean ~283 hPa) 0.707, 7-15 (below ~313
+  hPa) 0.1 (untuned). Loss shares: 2-D fields ~83%, each 3-D family 2-4%
+  (8-layer: 87%, 3-4%).
+- Memory: like the 8-layer model (probe: 4L = 96 layer channels changes
+  peak memory by <0.3 GB at 1 sample/GPU) -- 4 nodes, no checkpointing.
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -670,3 +744,12 @@ weights.
       each variable's whole month array alive through the `first`/`last`
       views (23 GB per worker at 16 layers, 236 vars; now 8.4 GB, results
       identical) -- likely also the cause of the ~14 GB/worker OOMs on Ursa.
+- [ ] 16-layer CRTM training on Polaris (see "Training: 16 layers, CRTM
+      variables"): config `ace2-crtm-16layer-train-config.yaml`, total-water
+      patch in `fme_train.py`, condensate-floor stats, loss weights (see
+      that section). 1-node smoke test passed 2026-10-28 (job 7790856,
+      `smoke-crtm16.yaml`, untracked; 2 epochs, 1.19 samples/s/GPU like 8
+      layers, inference error 0.61 -> 0.48, no NaN), after fixing three
+      launch problems: the NCCL plugin (above), TMPDIR (below), and inline
+      inference OOM at forward_steps_in_memory 40 (now 20). Full run not
+      yet submitted.
