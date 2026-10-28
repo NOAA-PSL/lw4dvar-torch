@@ -634,7 +634,11 @@ weights.
   input and the ps operator uses it. Our 2014-12-30T00 IC differs from the
   ace2_ic.py (HF-HGTsfc) one by 413 Pa rms in PRESsfc, identical elsewhere.
   ERA5 h500/TMP850 verification is linked, so z500 scores compare directly.
-  Files for 2014-2015: `/scratch4/BMC/gsienkf/whitaker/ace2_training/inference_ours/`.
+  Files for 2014-2015: `/scratch4/BMC/gsienkf/whitaker/ace2_training/inference_ours/`;
+  on Polaris `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/inference_ours/`
+  (built 2026-10-28 on a debug node, ~1 min; the login node's 8 GB cap is too
+  tight). Without `exp.forcing_dir` lw4dvar looks in `path_model/forcing_data/`
+  and stops with "no fetched forcing_*.nc".
 - **Free rollout 2015-01-01..07-13** (`free_rollout: True`, 390 x 12 h,
   same setup as the official-checkpoint and AIFS rollouts of issue #12):
   48-h z500 rms 7.6 m vs 8.9 m for the official checkpoint. Bias change from
