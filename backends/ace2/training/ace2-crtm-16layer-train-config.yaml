@@ -41,7 +41,11 @@
 # - Over ocean soil moisture and snow are 0 and soil temperature is ~SST.
 #   Soil moisture and both snow fields are force_positive; snow fraction is
 #   not capped at 1 by fme (clip downstream).
-# - Loss weights of the four: 1 (default, untuned; ~2% of the loss).
+# - Loss weights: surface_snow_amount_capped 0.1, the other three 1. Snow
+#   amount barely changes in 6 h (residual std 0.36 vs full-field 326 kg/m2,
+#   ratio 899; next largest 38), so at weight 1 a field-sized error cost ~1e6
+#   (smoke test: valid loss 317 vs 20 without land); at 0.1, (w*ratio)^2 ~8000
+#   (h500 19000, TMP850 2500, PRESsfc 1400), tendency weight w^2 0.01.
 # - Deep soil layers left out (only the top layer matters for emissivity);
 #   the model must carry soil memory in its own state.
 experiment_dir: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-land-16layer-1979-2025-no2015
@@ -253,6 +257,7 @@ stepper_training:
       specific_total_condensate_7: 0.707
       specific_total_condensate_8: 0.707
       specific_total_condensate_9: 0.707
+      surface_snow_amount_capped: 0.1
       tendency_of_total_water_path_due_to_advection: 0.5
 stepper:
   step:

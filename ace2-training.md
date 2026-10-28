@@ -622,7 +622,21 @@ Only the top soil layer (the user's choice: it's the one emissivity sees).
 - **Corrector:** soil moisture and both snow fields force_positive; snow
   fraction can exceed 1 (fme has no upper bound), clip downstream. Soil and
   snow water are outside fme's moisture budget (atmosphere only).
-- **Loss weights:** 1 for the four (untuned; ~2% of the loss).
+- **Loss weights:** `surface_snow_amount_capped` 0.1, the other three 1.
+  Smoke test at weight 1 (job 7795087, `smoke-crtm-land16.yaml`, 2 epochs):
+  valid loss 317 -> 142 and inference error 0.72 -> 0.71, vs 20 -> 12 and
+  0.61 -> 0.48 without land. The loss normalizes by the residual std, the
+  network predicts full fields, so a field-sized error costs
+  (w * full/residual std)^2: snow amount's ratio is 899 (326 / 0.36 kg/m2;
+  the residual std is a global mean dominated by cells where snow never
+  changes), next largest snow fraction 38, PRESsfc 38, soil moisture 34,
+  h500 14 (weight 10). No single weight balances both regimes: 0.04 puts
+  field-sized errors at PRESsfc's level (~1300) but tendency-sized errors at
+  w^2 = 0.0016; 0.1 (chosen) gives ~8000 (between TMP850 2500 and h500
+  19000) and w^2 = 0.01. Judge it by snow in a free run. Smoke test at 0.1
+  (job 7795267, `smoke-crtm16.yaml`): valid loss 47.7 -> 21.6, inference
+  error 0.69 -> 0.55, no NaN, 13 min like the others; still above the
+  no-land run (the new channels start with large errors) but falling faster.
 - **Risk:** ACE2 predicts the full field each step (`residual_prediction:
   false`, all channels), and soil memory is slow (top soil moisture changes
   ~3% of its std per 6 h); check snow cover and soil moisture drift in a
