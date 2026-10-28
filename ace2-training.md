@@ -532,7 +532,9 @@ families added). Prognostic layer families: `air_temperature`,
 `specific_humidity`, `specific_total_condensate`, `ozone_mass_mixing_ratio`,
 `eastward_wind`, `northward_wind` x 16 layers -- 108 input / 114 output
 channels (44/50 at 8 layers). Train 1979-2014 + 2016-2025, 2015 held out.
-Experiment dir `ace2_training/ace2-crtm-16layer-1979-2025-no2015`.
+Experiment dir `ace2_training/ace2-crtm-16layer-1979-2025-no2015` (never
+run: before job 7794813 started the config gained the land variables, next
+section).
 
 - **Total water for the corrector.** fme 2026.5 finds total water only by
   the `specific_total_water_` prefix (`ATMOSPHERE_FIELD_NAME_PREFIXES` in
@@ -580,6 +582,51 @@ Experiment dir `ace2_training/ace2-crtm-16layer-1979-2025-no2015`.
   (8-layer: 87%, 3-4%).
 - Memory: like the 8-layer model (probe: 4L = 96 layer channels changes
   peak memory by <0.3 GB at 1 sample/GPU) -- 4 nodes, no checkpointing.
+
+## Training: 16 layers, CRTM + land (2026-10-28)
+
+For satellite surface emissivity, `ace2-crtm-16layer-train-config.yaml` (and
+the untracked `smoke-crtm16.yaml`) were extended, while job 7794813 was still
+queued, with four prognostics: `soil_moisture_0` (ERA5 swvl1, 0-7 cm), `soil_temperature_0`
+(stl1), `surface_snow_amount_capped` and `surface_snow_area_fraction` --
+112 input / 118 output channels. Experiment dir
+`ace2_training/ace2-crtm-land-16layer-1979-2025-no2015`. CRTM's emissivity models also want 10 m
+wind, skin temperature and the surface-type fractions, which the model
+already has; what it lacked was snow and land state (sea ice is a forcing).
+Only the top soil layer (the user's choice: it's the one emissivity sees).
+
+- **Data, 16-layer files (2015-01/07, stats 1990-2019):** no NaNs. Over
+  ocean soil moisture and snow are 0, soil temperature ~SST. Residual/full
+  std: soil_moisture_0 0.029, soil_temperature_0 0.11, snow fraction 0.026,
+  snow amount 0.0002 (deeper soil layers 0.001-0.02). soil_temperature_3's
+  residual std (0.40 K) is larger than layer 2's (0.09) -- unexplained, not
+  used.
+- **Snow amount capped at 1000 kg/m2 (1 m water equivalent):** ERA5 pins
+  snow at 1e4 kg/m2 on the ice sheets (6717 cells, 2.75% of the globe, every
+  month of 2015) and partly glaciated cells hold thousands (snowy non-cap
+  cells: median 41, 90th percentile 3990 kg/m2), so the std is 1720 (562
+  without cap cells) and seasonal snow gets a tiny normalized range.
+  Capped at 1000: mean ~40, std ~190 (area-weighted, 2015). Emissivity
+  doesn't see deeper snow. The 1990-2019 normalization stats (unweighted
+  over grid cells, like every other variable, so polar ice counts more):
+  uncapped mean 1139 / std 3123 / residual std 0.62; capped mean 127 / std
+  326 / residual std 0.36 kg/m2.
+- **Sidecar dataset:** `ace2_dataset.py capped_snow OUTDIR SIDECAR START END
+  [--cap 1000]` writes `ace2_era5_1deg_16layer/snow-capped-1000/YYYYMM0100.nc`
+  (just `surface_snow_amount_capped`, OUTDIR's time/lat/lon/attributes,
+  ~5 s/month on the login node), merged with the main files by fme
+  (`merge:` in every loader; inference uses MergeNoConcatDatasetConfig). The
+  training files are untouched, so the queued CRTM run is unaffected.
+- **Normalization:** `stats-1990-01-2019-12-condensate-floor-land` = the
+  condensate-floor stats + the sidecar's own (`stats` mode on the sidecar).
+- **Corrector:** soil moisture and both snow fields force_positive; snow
+  fraction can exceed 1 (fme has no upper bound), clip downstream. Soil and
+  snow water are outside fme's moisture budget (atmosphere only).
+- **Loss weights:** 1 for the four (untuned; ~2% of the loss).
+- **Risk:** ACE2 predicts the full field each step (`residual_prediction:
+  false`, all channels), and soil memory is slow (top soil moisture changes
+  ~3% of its std per 6 h); check snow cover and soil moisture drift in a
+  30-60 day free run, not just the 6-h loss.
 
 ## Cost estimates
 
@@ -758,5 +805,7 @@ weights.
       launch problems: the NCCL plugin (above), TMPDIR (below), and inline
       inference OOM at forward_steps_in_memory 40 (now 20). Full 120-epoch
       run on 4 nodes submitted 2026-10-28 (job 7794813, capacity queue,
-      seed 0, logs `ace2_crtm16.{out,err}`), experiment dir
-      `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-16layer-1979-2025-no2015`.
+      seed 0, logs `ace2_crtm16.{out,err}`); the config gained the land
+      variables before it started ("Training: 16 layers, CRTM + land"),
+      experiment dir
+      `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-land-16layer-1979-2025-no2015`.

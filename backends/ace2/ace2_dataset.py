@@ -76,6 +76,7 @@ CLI (repo root):
     python backends/ace2/ace2_dataset.py fix_presfc OUTDIR 1979-01 1988-12 --workers 16
     python backends/ace2/ace2_dataset.py add_layer_families OUTDIR 1979-01 1988-12 --workers 16
     python backends/ace2/ace2_dataset.py stats OUTDIR STATSDIR 1990-01 2019-12 --workers 16
+    python backends/ace2/ace2_dataset.py capped_snow OUTDIR SIDECAR 1979-01 2025-12 [--cap 1000]
 `build` skips months whose file exists (resumable; files are written to .tmp
 and renamed), so disjoint month ranges can run as separate jobs into one
 OUTDIR.
@@ -960,6 +961,46 @@ def add_layer_families(args) -> None:
             )
 
 
+def capped_snow(args) -> None:
+    """Write SIDECAR/YYYYMM0100.nc holding surface_snow_amount_capped =
+    min(surface_snow_amount, CAP) for the months of OUTDIR, with OUTDIR's
+    time/latitude/longitude, for fme to merge with OUTDIR (a `merge:` dataset
+    config). The training files are not touched. Why: ERA5's snow water
+    equivalent is pinned at 10 m (1e4 kg/m^2) on the ice sheets and reaches
+    thousands of kg/m^2 in partly glaciated 1-degree cells, so those nearly
+    static values set the normalization (std ~1700 kg/m^2 vs a 41 kg/m^2
+    median of snowy cells) and squeeze seasonal snow into a tiny normalized
+    range; beyond ~1 m water equivalent snow depth no longer matters for
+    surface emissivity. Months whose sidecar exists are skipped."""
+    import netCDF4
+
+    os.makedirs(args.sidecar, exist_ok=True)
+    name = "surface_snow_amount_capped"
+    for m in pd.date_range(pd.Timestamp(args.start), pd.Timestamp(args.end), freq="MS"):
+        src = os.path.join(args.outdir, f"{m:%Y%m%d%H}.nc")
+        dst = os.path.join(args.sidecar, f"{m:%Y%m%d%H}.nc")
+        if not os.path.exists(src) or os.path.exists(dst):
+            continue
+        tmp = dst + ".tmp"
+        with netCDF4.Dataset(src) as d, netCDF4.Dataset(tmp, "w") as o:
+            d.set_auto_mask(False)
+            o.setncatts({k: d.getncattr(k) for k in d.ncattrs()})
+            o.setncattr("history", f"{name} = min(surface_snow_amount, {args.cap:g}) from {src} (ace2_dataset.py capped_snow)")
+            for dim in ("time", "latitude", "longitude"):
+                o.createDimension(dim, None if d.dimensions[dim].isunlimited() else len(d.dimensions[dim]))
+                v = d[dim]
+                w = o.createVariable(dim, v.dtype, v.dimensions)
+                w.setncatts(v.__dict__)
+                w[:] = v[:]
+            snow = d["surface_snow_amount"]
+            v = o.createVariable(name, "f4", snow.dimensions, fill_value=np.float32(np.nan))
+            v.setncatts({k: snow.getncattr(k) for k in snow.ncattrs() if k != "_FillValue"})
+            v.long_name = f"Surface snow amount, capped at {args.cap:g} kg/m**2"
+            v[:] = np.minimum(snow[:], np.float32(args.cap))
+        os.replace(tmp, dst)
+        logging.info(f"wrote {dst}")
+
+
 # ---------------------------------------------------------------------------
 # CO2
 # ---------------------------------------------------------------------------
@@ -1232,6 +1273,12 @@ if __name__ == "__main__":
     st.add_argument("end", nargs="?", default="2019-12", help="last month, inclusive (default 2019-12)")
     st.add_argument("--workers", type=int, default=8, help="months read in parallel (~1 GB each)")
     st.add_argument("--allow_mixed", action="store_true", help="accept months without presfc_reduced_to_hgtsfc=1")
+    cs = sub.add_parser("capped_snow", help="sidecar months with surface_snow_amount capped (for an fme merge dataset)")
+    cs.add_argument("outdir", help="the dataset directory (monthly files)")
+    cs.add_argument("sidecar", help="where the sidecar monthly files are written")
+    cs.add_argument("start", help="first month, YYYY-MM")
+    cs.add_argument("end", help="last month, YYYY-MM (inclusive)")
+    cs.add_argument("--cap", type=float, default=1000.0, help="kg/m**2 (default 1000: 1 m water equivalent)")
     c = sub.add_parser("co2", help="extract ACE2-ERA5's global_mean_co2 from the HF forcing files")
     c.add_argument("path")
     c.add_argument("first_year", type=int)
@@ -1252,5 +1299,7 @@ if __name__ == "__main__":
         fix_presfc(args)
     elif args.mode == "add_layer_families":
         add_layer_families(args)
+    elif args.mode == "capped_snow":
+        capped_snow(args)
     else:
         build(args)

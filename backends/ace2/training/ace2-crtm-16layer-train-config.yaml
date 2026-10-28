@@ -1,5 +1,5 @@
-# ACE2 with 16 layers and CRTM layer variables (ace2-training.md, "CRTM
-# layer variables" and "Training: 16 layers, CRTM variables"): vapor
+# ACE2 with 16 layers, CRTM layer variables and land surface (ace2-training.md,
+# "CRTM layer variables" and "Training: 16 layers, CRTM + land"): vapor
 # (specific_humidity), total condensate (specific_total_condensate) and ozone
 # (ozone_mass_mixing_ratio) replace specific_total_water as prognostics.
 # Everything else as ace2-era5-vars-train-config.yaml (generated from it):
@@ -19,14 +19,32 @@
 #   0.707, 6-7 (252-401 hPa, transition) 0.354, 8-15 (below ~401 hPa,
 #   troposphere) 0.1 (w^2 1/50 of the layers above).
 # - Normalization: ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-
-#   floor (condensate std floored at 1e-6 kg/kg in layers 0-2; see
-#   ace2-training.md).
+#   floor-land (condensate std floored at 1e-6 kg/kg in layers 0-2, plus the
+#   capped snow's stats; see ace2-training.md).
 # - Train 1979-2014 + 2016-2025; 2015 held out (validation, inline inference).
-# - 108 input / 114 output channels; by the memory probe, fits 1 sample/GPU
-#   on 4 Polaris nodes without checkpointing, at the same speed as 8 layers.
+# - 112 input / 118 output channels (108 / 114 without land); by the memory
+#   probe, fits 1 sample/GPU on 4 Polaris nodes without checkpointing, at the
+#   same speed as 8 layers.
 #   Inline inference: forward_steps_in_memory 20 (40 ran out of memory in
 #   fme's total-energy diagnostic, smoke test 2026-10-28).
-experiment_dir: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-16layer-1979-2025-no2015
+# Land surface, for satellite surface emissivity: four more prognostics,
+# soil_moisture_0 (ERA5 swvl1, 0-7 cm, m3/m3), soil_temperature_0 (stl1,
+# 0-7 cm, K), surface_snow_amount_capped (snow water equivalent, kg/m2,
+# capped at 1000) and surface_snow_area_fraction.
+# - Snow is capped because ERA5 pins it at 1e4 kg/m2 on the ice sheets and
+#   has thousands in partly glaciated cells, which set the normalization
+#   (std ~1700 vs a 41 kg/m2 median of snowy cells); emissivity doesn't see
+#   past ~1 m water equivalent. The capped field lives in a sidecar dataset
+#   (ace2_dataset.py capped_snow -> ace2_era5_1deg_16layer/snow-capped-1000),
+#   merged with the main files in every loader; the training files are
+#   untouched.
+# - Over ocean soil moisture and snow are 0 and soil temperature is ~SST.
+#   Soil moisture and both snow fields are force_positive; snow fraction is
+#   not capped at 1 by fme (clip downstream).
+# - Loss weights of the four: 1 (default, untuned; ~2% of the loss).
+# - Deep soil layers left out (only the top layer matters for emissivity);
+#   the model must carry soil memory in its own state.
+experiment_dir: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-land-16layer-1979-2025-no2015
 save_checkpoint: true
 validate_using_ema: true
 max_epochs: 120
@@ -56,12 +74,15 @@ inference:
       - '2015-01-04T12:00:00'
       - '2015-01-04T18:00:00'
     dataset:
-      data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
-      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      merge:
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
     num_data_workers: 8
   aggregator:
     log_histograms: true
-    time_mean_reference_data: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor/time-mean.nc
+    time_mean_reference_data: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/time-mean.nc
 logging:
   log_to_screen: true
   log_to_wandb: false
@@ -73,28 +94,47 @@ train_loader:
   num_data_workers: 8
   prefetch_factor: 4
   dataset:
-    concat:
-    - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
-      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
-      subset:
-        start_time: '1979-01-01T00:00:00'
-        stop_time: '2014-12-31T06:00:00'
-    - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
-      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
-      subset:
-        start_time: '2016-01-01T00:00:00'
-        stop_time: '2025-12-31T06:00:00'
+    merge:
+    - concat:
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '1979-01-01T00:00:00'
+          stop_time: '2014-12-31T06:00:00'
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '2016-01-01T00:00:00'
+          stop_time: '2025-12-31T06:00:00'
+    - concat:
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '1979-01-01T00:00:00'
+          stop_time: '2014-12-31T06:00:00'
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '2016-01-01T00:00:00'
+          stop_time: '2025-12-31T06:00:00'
 validation_loader:
   batch_size: 128
   num_data_workers: 8
   prefetch_factor: 4
   dataset:
-    data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
-    file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
-    subset:
-      start_time: '2015-01-01T00:00:00'
-      stop_time: '2015-12-31T06:00:00'
-      step: 3
+    merge:
+    - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      subset:
+        start_time: '2015-01-01T00:00:00'
+        stop_time: '2015-12-31T06:00:00'
+        step: 3
+    - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      subset:
+        start_time: '2015-01-01T00:00:00'
+        stop_time: '2015-12-31T06:00:00'
+        step: 3
 optimization:
   use_gradient_accumulation: true
   enable_automatic_mixed_precision: false
@@ -236,11 +276,11 @@ stepper:
           checkpointing: 0
       normalization:
         network:
-          global_means_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor/centering.nc
-          global_stds_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor/scaling-full-field.nc
+          global_means_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/centering.nc
+          global_stds_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/scaling-full-field.nc
         residual:
-          global_means_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor/centering.nc
-          global_stds_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor/scaling-residual.nc
+          global_means_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/centering.nc
+          global_stds_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/scaling-residual.nc
       ocean:
         surface_temperature_name: surface_temperature
         ocean_fraction_name: ocean_fraction
@@ -296,6 +336,9 @@ stepper:
         - ozone_mass_mixing_ratio_13
         - ozone_mass_mixing_ratio_14
         - ozone_mass_mixing_ratio_15
+        - soil_moisture_0
+        - surface_snow_amount_capped
+        - surface_snow_area_fraction
         - Q2m
         - PRATEsfc
         - ULWRFsfc
@@ -319,6 +362,10 @@ stepper:
       - Q2m
       - UGRD10m
       - VGRD10m
+      - soil_moisture_0
+      - soil_temperature_0
+      - surface_snow_amount_capped
+      - surface_snow_area_fraction
       - air_temperature_0
       - air_temperature_1
       - air_temperature_2
@@ -530,3 +577,7 @@ stepper:
       - Q2m
       - UGRD10m
       - VGRD10m
+      - soil_moisture_0
+      - soil_temperature_0
+      - surface_snow_amount_capped
+      - surface_snow_area_fraction
