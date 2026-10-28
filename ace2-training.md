@@ -751,5 +751,7 @@ weights.
       `smoke-crtm16.yaml`, untracked; 2 epochs, 1.19 samples/s/GPU like 8
       layers, inference error 0.61 -> 0.48, no NaN), after fixing three
       launch problems: the NCCL plugin (above), TMPDIR (below), and inline
-      inference OOM at forward_steps_in_memory 40 (now 20). Full run not
-      yet submitted.
+      inference OOM at forward_steps_in_memory 40 (now 20). Full 120-epoch
+      run on 4 nodes submitted 2026-10-28 (job 7794813, capacity queue,
+      seed 0, logs `ace2_crtm16.{out,err}`), experiment dir
+      `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-16layer-1979-2025-no2015`.
