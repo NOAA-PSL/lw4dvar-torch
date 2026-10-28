@@ -13,8 +13,8 @@
 #   channel's loss share goes as w^2; each half gets ACE2-ERA5's 8-layer
 #   weight / sqrt(2) (default 1 -> 0.707), keeping every family's 8-layer
 #   share. Vapor and condensate (same weights): layers 0-3 (top-144 hPa,
-#   layer 3 mean ~117 hPa) 0.01, i.e. essentially out of the loss as in the
-#   32-layer config; 4-5 0.354 (ACE2-ERA5's 0.5 for that total-water layer);
+#   layer 3 mean ~117 hPa) 0.1 (w^2 1/50 of the layers below 252 hPa); 4-5
+#   0.354 (ACE2-ERA5's 0.5 for that total-water layer);
 #   6-15 0.707. Ozone (stratosphere-dominated): layers 0-6 (top-313 hPa)
 #   0.707, layers 7-15 (below ~313 hPa, troposphere) 0.1 (w^2 1/50 of the
 #   layers above).
@@ -181,32 +181,32 @@ stepper_training:
       ozone_mass_mixing_ratio_7: 0.1
       ozone_mass_mixing_ratio_8: 0.1
       ozone_mass_mixing_ratio_9: 0.1
-      specific_humidity_0: 0.01
-      specific_humidity_1: 0.01
+      specific_humidity_0: 0.1
+      specific_humidity_1: 0.1
       specific_humidity_10: 0.707
       specific_humidity_11: 0.707
       specific_humidity_12: 0.707
       specific_humidity_13: 0.707
       specific_humidity_14: 0.707
       specific_humidity_15: 0.707
-      specific_humidity_2: 0.01
-      specific_humidity_3: 0.01
+      specific_humidity_2: 0.1
+      specific_humidity_3: 0.1
       specific_humidity_4: 0.354
       specific_humidity_5: 0.354
       specific_humidity_6: 0.707
       specific_humidity_7: 0.707
       specific_humidity_8: 0.707
       specific_humidity_9: 0.707
-      specific_total_condensate_0: 0.01
-      specific_total_condensate_1: 0.01
+      specific_total_condensate_0: 0.1
+      specific_total_condensate_1: 0.1
       specific_total_condensate_10: 0.707
       specific_total_condensate_11: 0.707
       specific_total_condensate_12: 0.707
       specific_total_condensate_13: 0.707
       specific_total_condensate_14: 0.707
       specific_total_condensate_15: 0.707
-      specific_total_condensate_2: 0.01
-      specific_total_condensate_3: 0.01
+      specific_total_condensate_2: 0.1
+      specific_total_condensate_3: 0.1
       specific_total_condensate_4: 0.354
       specific_total_condensate_5: 0.354
       specific_total_condensate_6: 0.707
