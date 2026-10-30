@@ -500,3 +500,285 @@ Every variable and lead improves. Lead 0 is in-sample against obs.
 The two runs differ in hardware and attention kernel as well as in the fixes;
 in a 10-cycle test that difference alone was about 0.8 m on z500, in the
 other direction (our replica of Bo's config was worse).
+
+## raobs admitted for `model_backend: ace2` (2026-10-21)
+
+Motivation: a 2015-01 aifs2-1.0deg-v1.0 cycling comparison showed the AMV
+stream producing a growing, region-specific O-B bias over cycling (see
+integrate_amv_satwnd.md's "AMV cycling-bias investigation" section) that
+tracks almost exactly with when each region's z500 skill degrades --
+strongly suggestive of AMV's own uncorrected bias feeding back through
+cycling, not generic AIFS drift, but AIFS-1.0deg-v1.0 is itself known to
+drift from climate, confounding the comparison. ACE2 is the one backend
+already shown to cycle stably with ps obs alone over a long run (147
+cycles, no detectable drift -- integrate_multiple_backends.md), so it's the
+natural control: if the same AMV bias pattern reappears there, that isolates
+the cause to AMV's own assimilation, not the backend.
+
+**`RAOBS_SUPPORTED_BACKENDS` now includes `'ace2'`** (was `('aifs',
+'aurora')`, `long_window_4dvar_utils.py`). This was a pure guard-list
+change, not a new code path: `get_raobs` (and `get_psobs`, already
+backend-agnostic) have no backend-conditional branches anywhere -- they're
+written purely against `model.decode_state`/`model.pressure_levels`/
+`grid_interp.weights`. `ACE2Model.decode_state` already derives `'t'`/`'u'`/
+`'v'`/`'q'`/`'z'` on the same 13 ERA5 pressure levels, bottom-to-top
+(surface-first), that AIFS/Aurora natively carry
+(`backends/ace2/ace2_model.py`'s `_to_pressure_levels`), and
+`get_grid_interpolator` already wires `model_backend: ace2` to
+`ace2_grid.RectilinearBilinearInterpolator`, whose `.weights(lon, lat, k=4)`
+returns the same `(idx, wts)` shape as every other backend's k-NN
+interpolator -- so the generic code worked by construction.
+
+**Offline-validated only, no GPU run yet** (this worktree's
+`backends/ace2/ACE2-ERA5` submodule is pointer-only, no real checkpoint to
+load): a probe (`get_psobs`/`get_raobs` run end-to-end against the real
+PREPBUFR parquet archive, 2015-01-02 00/12Z) using a fake model object that
+exposes ACE2's actual grid geometry (F90 Gauss-Legendre 180x360,
+south-to-north, lon 0.5..359.5 -- `np.polynomial.legendre.leggauss`) and its
+real `DEFAULT_PLEVS` (1000..50 hPa), with the real
+`ace2_grid.RectilinearBilinearInterpolator` as `grid_interp`:
+`raobs: n_valid=[653, 642]`, all four variables (t/u/v/q) finite, correct
+`(n_obs, n_levels, capacity)` shapes, `interp_wts` summing to 1.0 per
+observation, `interp_idx` within the 64800-point grid. Confirms the
+pipeline, not analysis quality -- no claim about assimilation skill on
+ACE2 until a real cycled run exists.
+
+New configs: `config_test_ace2_ps.yml` / `run_ace2_ps.sh` (ps only -- a
+renamed copy of `config_test_ace2.yml`, the series' baseline, with its own
+`exp_name`/`rpath`/job name/log path), `config_test_ace2_ps_raobs.yml` /
+`run_ace2_ps_raobs.sh` (ps+raobs, t/u/v only -- see "Known issue: ACE2 'q'
+is specific_total_water, not specific_humidity" below), and
+`config_test_ace2_ps_raobs_amv.yml` / `run_ace2_ps_raobs_amv.sh`
+(ps+raobs(t/u/v)+amv, see integrate_amv_satwnd.md) -- all three forked from
+`config_test_ace2.yml`'s validated cycling setup (6h cycling,
+`jc_ps_weight: 32`, 240 cycles). **`ps+raobs+amv` has since been run**
+(11 cycles, in a copy of this repo at
+`.../add-amv-gpsro/lw4dvar-torch-test/`, same code) -- see
+integrate_amv_satwnd.md's "Vertical thinning tied to model levels" for
+what it showed and the follow-up sensitivity sweep now in flight; `ps`/
+`ps+raobs` alone have not been separately evaluated yet.
+
+**Stale path found while copying `config_test_ace2.yml`, worth a separate
+fix**: its `observations.psobs.path` points at
+`.../ML/longWin4DVar/prepbufr_to_parquet/data/prepbufr_parquet`, which no
+longer exists on disk -- apparently left over from before this repo was
+renamed from `longWin4DVar` to `lw4dvar-torch-dev`. `config_test_ace2.yml`
+itself was left untouched (out of scope here), but all three new configs
+above use the working path
+(`.../ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet`, same
+as every AIFS config). `config_test_ace2.yml`/`run_ace2.sh` would currently
+fail at `get_psobs` if run as-is.
+
+## Known issue found and FIXED: NaN gradient through ACE2's derived t/u/v (2026-10-21)
+
+A real `run_ace2_ps_raobs_amv.sh` GPU run got through epoch 1's forward pass
+cleanly (finite `Jtot`) then hit the solver's `non-finite gradient in
+increment` guard right after `loss.backward()`. Root cause: `get_raobs`/
+`get_amv` are the first observation types to ever backprop through ACE2's
+DERIVED `t`/`u`/`v` pressure-level fields (`ps_native`, ACE2's default
+`ps_operator`, only reads NATIVE-level fields, so this was never exercised
+before) -- `ace2_model.py`'s `_to_pressure_levels` had a finite-forward/
+non-finite-gradient division (`0/0`-shaped inside a `torch.where` branch,
+same bug class already fixed once for `gpsro_operator.py`). **Fixed** in
+`ace2_model.py` -- see `integrate_multiple_backends.md`'s "Bug found and
+fixed 2026-10-21" entry for the full diagnosis and fix. Confirmed via a
+CPU-only gradient probe (no GPU needed) that forward values are unchanged
+and the gradient is now finite. Both `run_ace2_ps_raobs.sh` and
+`run_ace2_ps_raobs_amv.sh` were equally exposed (raobs alone reads `t`/`u`/
+`v` the same way) and should both be clear to resubmit.
+
+## Known issue: ACE2 'q' is specific_total_water, not specific_humidity (found 2026-10-21, OPEN)
+
+**Status: partially resolved, 2026-10-22 -- confirmed non-negligible, not
+small.** ACE2's packed-state humidity prognostic is `specific_total_water`
+(water vapor + cloud condensate), not a pure water-vapor specific humidity
+-- unlike AIFS/Aurora, where the native 'q' channel IS ERA5 specific
+humidity. `ACE2Model.decode_state` derives the generic `'q'`/
+`specific_humidity` alias straight from `specific_total_water`
+(`backends/ace2/ace2_model.py`'s `_DERIVED_FROM`), with no separation of
+the condensate term -- and **confirmed structurally unresolvable from
+ACE2's own output**: `ACE2Model._channel_names` has no separate cloud/
+liquid/ice-water channel at all (checked directly), so vapor and
+condensate can never be split apart from ACE2's own fields.
+
+Quantified directly (while planning GPSRO's own ACE2 extension, see
+integrate_gpsro.md's "Plan: extend GPSRO to the ACE2 backend" -> "Results"
+for the full method): true ERA5 specific humidity (ARCO-ERA5 `full_37`,
+same source `ace2_ic.py` uses) vs. ACE2's own decoded `'q'`, same real
+date/grid (2014-12-30T00, F90 180x360). Result: ACE2 is ~0.1-0.6 g/kg
+DRIER than ERA5 at 1000/925 hPa, then consistently ~0.06-0.26 g/kg WETTER
+than ERA5 from 850-250 hPa -- rms difference 15-70% of ERA5's own spatial
+std in that band. The wetter-in-the-free-troposphere sign matches the
+physically expected direction for a condensate-inclusive field vs. pure
+vapor (clouds add mass there), but this is one column/one date, not a
+climatology. **The "expected to be small outside cloudy columns" language
+below is NOT supported by this check** -- 15-70% of spatial std is a real,
+confirmed bias source, not a plausible non-issue. This repo's workaround
+(exclude `specific_humidity` from `raobs.variables` for ACE2) remains the
+right call; GPSRO's own extension to ACE2 has no such escape hatch and
+proceeds with this as a documented, accepted limitation instead.
+
+**Why this matters**: raobs's humidity assimilation depends on 'q' meaning
+true specific humidity in two places that would be silently wrong inside
+cloud: (1) the forward operator just gathers the model's 'q' at the
+observation's matched level and compares it directly to the radiosonde's
+reported specific humidity -- any vapor/condensate conflation becomes a
+spurious O-B there; (2) `raobs_q_error_g_kg`
+(`RAOBS_Q_ERROR_G_KG`/`integrate_prepbufr_obs.md`'s per-level error table)
+was Desroziers-diagnosed from an AIFS run and has never been re-diagnosed
+for ACE2 -- even if the vapor/condensate difference turns out to be small,
+that error table's own scale is unverified for ACE2 regardless.
+
+**Current workaround, not a fix**: both ACE2 configs
+(`config_test_ace2_ps_raobs.yml`, `config_test_ace2_ps_raobs_amv.yml`) set
+`observations.raobs.variables: [temperature, u_component_of_wind,
+v_component_of_wind]`, leaving q out of the ACE2 raobs stream entirely
+(a pure config change -- `observations.raobs.variables` already existed for
+per-config variable restriction, see `_RAOBS_CONFIG_KEYS`/
+`RAOBS_VARIABLE_MODEL_BASE`, no code change needed). t/u/v are unaffected;
+amv never carries humidity, so it has no analogous caveat. **AIFS/Aurora
+configs are untouched by this** -- `observations.raobs.variables` defaults
+to all four variables (temperature/u/v/specific_humidity) unless a config
+explicitly restricts it, so any existing or new AIFS/Aurora raobs config
+(e.g. `config_test_aifs2-1.0deg-v1.0_ps_raobs.yml`) still assimilates q
+exactly as before; this exclusion is ACE2-specific and config-scoped, not a
+change to the default or to the code.
+
+**Quantified 2026-10-22** (see the "Status" update above): one column/date
+comparison against real ERA5 found the difference is NOT small (15-70% of
+ERA5's own spatial std, 850-250 hPa), and is structurally unresolvable from
+ACE2's own output (no separate condensate channel exists to subtract).
+**Decision**: keep the current workaround (q excluded from ACE2's
+`raobs.variables`) rather than re-enable it -- a single column/date isn't
+a full climatology, but there's no evidence here the difference is small
+enough to accept, and no Desroziers-diagnosed ACE2-specific `q_error_g_kg`
+table exists regardless. Revisit only if a multi-date/seasonal version of
+this same check someday shows otherwise.
+
+## GSI comparison: psobs and raobs thinning/QC (2026-10-22, reviewed -- no action taken)
+
+Researched how GSI (NOAA-EMC/GSI, commit `55faa5e7af4f0604bd1ed38b385fd762863ca294`)
+reads/thins/QCs conventional ADPSFC/SFCSHP (surface pressure) and ADPUPA
+(radiosonde) observations -- `src/gsi/read_prepbufr.F90`, `setupps.f90`
+(ps), `setupt.f90`/`setupw.f90`/`setupq.f90` (raobs t/u/v/q) -- to compare
+against this repo's own psobs/raobs QC. Aircraft excluded (covered
+separately by integrate_aircraft_obs.md once revisited). **Recorded here as
+a reference for later work -- no code changed in this pass.**
+
+### GSI surface pressure (ADPSFC/SFCSHP)
+
+Not horizontally thinned (`ithin=0` is standard GSI practice for these
+types -- the raw station network is assimilated as-is, same as this repo).
+No adjustment to the observation itself at read time (ship reports with no
+reported height are reset to SLP instead of station pressure). Per-type
+obs error from a pressure/type-indexed table, floored at 0.3 mb.
+
+`setupps.f90`'s QC: duplicate collocated reports are collapsed/downweighted
+by time difference; H(x) hydrostatically extrapolates the **background**
+pressure from the model's terrain height to the **station's** reported
+elevation (`rdp = (Rd*lapse/g) * dz / T_avg`, `T_avg` blending observed and
+guess near-surface temperature, falling back to a 6.5 K/km lapse rate);
+terrain mismatch is handled by **soft error inflation only**
+(`drbx ~ 0.5*|T_guess-T_obs| + 0.005*|dz|` added into the effective error) --
+**no hard elevation-difference rejection exists**. Gross check is the
+clamped-ratio form, `ratio = |O-B| / clip(obserr, ermin, ermax) > gross`
+(per-type convinfo values), tightened x0.7 if the source quality mark is
+already 3.
+
+### GSI radiosonde (ADPUPA)
+
+PREPBUFR interleaves mandatory and significant levels in one record, and
+GSI reads and keeps **every** level of both kinds (up to 255/sounding) --
+**no vertical thinning/selection at all**. Also not horizontally thinned
+(same `ithin` mechanism as ps, off for ADPUPA). Each level uses its own
+**drift-corrected** lat/lon/time (`kx=120/220/221`), not just the launch
+point.
+
+`setupt.f90`: vertical interpolation is linear in the model's own
+coordinate between bracketing levels. Virtual-vs-sensible is
+**bidirectional and per-observation** -- the guess carries both a
+prognostic virtual-T and a diagnostic sensible-T field, and a per-ob flag
+(from the PREPBUFR VIRTMP program-code history) picks which guess field to
+compare against. Same clamped-ratio gross check as ps. Elevation
+correction applies ONLY to 2m surface reports, never to true upper-air
+levels. `setupw.f90` (wind) has essentially no raob-specific QC -- shares
+the generic vector gross check with every other conventional wind type.
+`setupq.f90` (humidity): the table error is relative-humidity-like,
+converted to an absolute q-error via guess qsat (varies with
+pressure/temperature automatically); no explicit supersaturation clamp or
+hardcoded pressure ceiling in the Fortran itself -- any operational q
+ceiling is enforced upstream in convinfo/production.
+
+### Comparison to this repo + recommendations
+
+**psobs** is already structurally close to GSI -- `preduce` (Benjamin &
+Miller 1990 MAPS reduction, `long_window_4dvar_utils.py`) does the same
+hydrostatic station-elevation adjustment to the background GSI does, and
+`_compute_ps_observation_diagnostics_at_time` already has a similar soft
+error-inflation term (`effective_error = assigned_error +
+zconst*orography_difference`). Differences:
+- This repo adds a **hard** `orography_difference > zthresh` rejection on
+  top of the soft inflation -- GSI has no such hard gate, relying on
+  inflation alone.
+- The gross check here is a plain `|O-B|/qc_error > bg_check`, not GSI's
+  **clamped-ratio** form (`clip(obserr, ermin, ermax)`), and doesn't
+  tighten based on the observation's own prior quality mark.
+- `preduce`'s `T_avg` is always a fixed 6.5 K/km lapse-rate profile; GSI
+  blends in the observed near-surface temperature when available.
+
+**raobs** has one large structural gap: `raobs_parquet.py`'s
+`pressure_match_tolerance_hpa=0.05` snaps each level to the nearest of the
+model's ~13 fixed pressure levels and discards anything not within 0.05 hPa
+-- throwing away essentially every significant level and most mandatory
+levels too. GSI instead interpolates every reported level (mandatory +
+significant) directly against the model's own vertical coordinate, no
+snapping.
+
+**Recommendations, not yet implemented, highest-value first**:
+1. **Switch raobs to native-pressure interpolation, not level-snapping** --
+   reuse the horizontal k-NN x log-pressure vertical bracket stencil
+   (`_amv_horizontal_vertical_stencil`) and the generalized `_amv_thin_slot`
+   built for `aircraft` (see integrate_aircraft_obs.md) instead of
+   `raobs_parquet.py`'s exact-match reader. Would let raobs assimilate the
+   full profile GSI does (including significant levels) instead of a
+   handful of coincidentally-aligned levels.
+2. **Adopt the clamped-ratio gross-check form for psobs**
+   (`clip(obserr, ermin, ermax)` instead of a bare ratio) -- matches what's
+   already implemented for amv/gpsro/aircraft, making psobs consistent with
+   the rest of this repo's own QC convention, not just closer to GSI.
+3. **Re-justify (or drop) psobs's hard `zthresh` orography cutoff** -- GSI
+   gets away with soft inflation alone; worth an A/B test before removing,
+   since it may be compensating for something GSI's richer terrain/error
+   tables handle differently.
+4. **Do not add thinning to psobs or raobs** -- both are deliberately
+   un-thinned in GSI itself too; this repo's existing no-thinning design for
+   both is already right, not a gap.
+5. **Balloon drift is a real gap, but blocked on data, not code** -- the
+   normalized PREPBUFR parquet archive doesn't appear to carry a per-level
+   drift lat/lon/time column at all; would need the upstream
+   `convert_prepbufr_to_parquet.py` converter (sibling repo) extended to
+   carry PREPBUFR's `XDR`/`YDR`/`HRDR` before any reader-side fix is
+   possible.
+6. **Virtual-vs-sensible**: this repo's always-convert-to-sensible-T
+   approach (`common.sensible_temperature`) is a reasonable simplification
+   of GSI's bidirectional per-ob handling, not obviously wrong -- this
+   repo's models carry sensible `t` as the state variable (no prognostic
+   virtual-T guess field the way GSI has), so there's no second field to
+   compare against anyway. No action needed, just a documented rationale.
+
+### Decision (2026-10-22): none of the above implemented
+
+User's call: recommendation 1 (native-pressure interpolation for raobs,
+replacing level-snapping) is explicitly rejected, not just deferred --
+this repo's models carry only ~13-14 coarse pressure levels, unlike GSI's
+60-150+ level guess fields, so interpolating a sonde's significant levels
+onto that coarse a vertical grid is judged not worth the complexity
+(reinstating `pressure_match_tolerance_hpa` nearest/exact-level matching
+is considered the right design for this repo's vertical resolution, not a
+gap to close). This is the same resolution-driven reasoning already
+applied to GPSRO's 1000 m thinning (`integrate_gpsro.md`) and is
+consistent with it. With #1 off the table, #2/#3 (clamped-ratio gross
+check, `zthresh` cutoff) and #5 (balloon drift) are deprioritized too --
+none are planned. #4 (no thinning) was already a confirmation of existing
+behavior, not a change. No code in this repo was altered as a result of
+the GSI comparison.

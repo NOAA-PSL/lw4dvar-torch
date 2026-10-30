@@ -1,0 +1,133 @@
+exp:
+  model_backend: ace2
+
+  nhrs_back: 48
+  restart: False
+  rpath: './output/test_ace2_6h_5d_50it_ps_raobs_aircraft_t2/'
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      use_source_error: True
+    raobs:
+      enabled: True
+      variables: [temperature, u_component_of_wind, v_component_of_wind]
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [ADPUPA]
+      time_tolerance_hours: 3.0
+      quality_mark_max: 3
+      pressure_match_tolerance_hpa: 0.05
+      height_min_m: -1000.
+      height_max_m: 60000.
+      below_station_tolerance_m: 100.
+      error_std: {t: 1.0, u: 2.0, v: 2.0}
+      q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      q_error_fraction: 0.2
+      q_error_floor_kg_kg: 1.e-5
+      q_bg_check: 4.0
+      humidity_min_pressure_hpa: 300.
+    aircraft:
+      enabled: True
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [AIRCAR, AIRCFT]
+      time_tolerance_hours: 1.0
+      report_types: null
+      quality_mark_max: 3
+      pressure_range_hpa: [1000., 50.]
+      use_source_error: True
+      fallback_error_std_t_k: 1.5
+      fallback_error_std_ms: 3.5
+      separate_report_types: True
+      rmesh_km: 120.0
+      pmesh_hpa: 50.0
+      vertical_bin_mode: nearest_level
+      error_floor_t_k: 0.5
+      error_floor_ms: 2.0
+      background_check_stddev: 4.0
+      error_min_t_k: null
+      error_max_t_k: null
+      error_min_ms: null
+      error_max_ms: null
+      # Sensitivity test t2: same as the ps_raobs_aircraft baseline, but
+      # with the static (pressure bin x NH/Tropics/SH region) temperature
+      # bias correction turned on -- see integrate_aircraft_obs.md's
+      # "Static aircraft temperature bias correction" section and
+      # build_aircraft_temperature_bias_table.py for what this is and why
+      # it isn't per-tail. bias_correction_table pinned explicitly (rather
+      # than relying on the code-level default) so this config keeps
+      # working even if the default table path convention ever changes.
+      bias_correction_enabled: True
+      bias_correction_table: 'aircraft_temperature_bias_table.json'
+    amv:
+      enabled: False
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [SATWND]
+      report_types: null
+      quality_mark_max: 3
+      time_tolerance_hours: 1.0
+      pressure_range_hpa: [1000., 50.]
+      use_source_error: True
+      fallback_error_std_ms: 7.0
+      exclude_satellite_ids: []
+      separate_report_types: True
+      separate_satellite_ids: True
+      rmesh_km: 120.0
+      pmesh_hpa: 50.0
+      vertical_bin_mode: nearest_level
+      error_floor_ms: 4.0
+      background_check_stddev: 4.0
+      error_min_ms: null
+      error_max_ms: null
+    gpsro:
+      enabled: False
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/gpsro_parquet'
+      time_tolerance_hours: 1.5
+      impact_height_range_km: [6., 30.]
+      impact_height_spacing_m: 1000.
+      maximum_bending_angle_rad: 0.1
+      quality_flags_disqualifying_mask: 0
+      minimum_percent_confidence: null
+      error_model: {name: ecmwf_seed_v1, fractional_at_0_km: 0.20, fractional_at_10_km: 0.01, absolute_floor_rad: 3.e-6}
+      maximum_simulated_bending_angle_rad: 0.05
+      background_check_stddev: 4.0
+      error_min_rad: null
+      error_max_rad: null
+      top_extrapolation_km: 10.0
+      critical_gradient_n_per_km: 157.0
+      sr_detection_fraction: 0.75
+      sr_screen_height_km: 5.0
+  ic_suffix: '120h_50it'
+  sdate: '2015-01-01T00'
+  n_init: 240
+  dt_init: 6
+  save_levs: [1000, 850, 500, 250, 50]
+  cycle: True
+  exp_name: 'test_ace2_6h_5d_50it_ps_raobs_aircraft_t2'
+
+  path_model: './backends/ace2/ACE2-ERA5/'
+  model_name: 'ace2_era5_ckpt.tar'
+  device: 'cuda'
+  path_output: './output/'
+  ic_cache: '/scratch4/BMC/gsienkf/whitaker/ace2_training/inference_ours/ic_cache/'
+  print_every: 10
+  oberrstart: -1
+  oberrdeltaperday: 0
+  checkpoint_stride: 2
+  control_variables: [air_temperature, specific_total_water, eastward_wind, northward_wind, PRESsfc, surface_temperature, TMP2m, Q2m, UGRD10m, VGRD10m]
+  jc_ps_weight: 32
+
+windows:
+  '5':
+    n_verif: 20
+    dt_verif: 6
+    dt_obs: 6
+    learn_rate: 1.0e-3
+    weight_decay: 1.0e-3
+    max_epoch: 100
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 1
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''

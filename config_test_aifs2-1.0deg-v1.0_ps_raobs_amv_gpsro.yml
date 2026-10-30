@@ -1,0 +1,121 @@
+exp:
+  model_backend: aifs
+  nhrs_back: 48
+  restart: False
+  rpath: './output/aifs2-1.0deg-v1.0-pretraining-ps-raobs-amv-gpsro-gsiqc/'
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      use_source_error: True  # oberrstart: -1 below -- matches the legacy .txt column-7 per-ob error
+    raobs:
+      enabled: True
+      # Every key below is the code-level default, spelled out explicitly
+      # (see config.yml.template).
+      variables: [temperature, u_component_of_wind, v_component_of_wind, specific_humidity]
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [ADPUPA]
+      time_tolerance_hours: 3.0  # dt_obs/2
+      quality_mark_max: 3
+      pressure_match_tolerance_hpa: 0.05
+      height_min_m: -1000.
+      height_max_m: 60000.
+      below_station_tolerance_m: 100.
+      error_std: {t: 1.0, u: 2.0, v: 2.0}
+      q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      q_error_fraction: 0.2
+      q_error_floor_kg_kg: 1.e-5
+      q_bg_check: 4.0
+      humidity_min_pressure_hpa: 300.
+      # station_capacity intentionally omitted -- auto-sized to the
+      # largest slot actually read (no fixed default value to spell out).
+    amv:
+      enabled: True
+      # Every key below is the code-level default, spelled out explicitly
+      # (see config.yml.template).
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [SATWND]
+      report_types: null
+      quality_mark_max: 3
+      time_tolerance_hours: 1.0
+      pressure_range_hpa: [1000., 50.]
+      use_source_error: True
+      fallback_error_std_ms: 7.0
+      exclude_satellite_ids: []
+      separate_report_types: True
+      separate_satellite_ids: True
+      rmesh_km: 120.0
+      pmesh_hpa: 50.0
+      vertical_bin_mode: pmesh
+      error_floor_ms: 4.0
+      background_check_stddev: 4.0
+      error_min_ms: null
+      error_max_ms: null
+      # capacity intentionally omitted -- auto-sized to the largest slot
+      # actually read (no fixed default value to spell out).
+    gpsro:
+      enabled: True
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/gpsro_parquet'
+      # Every key below is the code-level default, spelled out explicitly
+      # (see config.yml.template).
+      time_tolerance_hours: 1.5
+      impact_height_range_km: [6., 40.]
+      impact_height_spacing_m: 1000.
+      maximum_bending_angle_rad: 0.1
+      quality_flags_disqualifying_mask: 0
+      minimum_percent_confidence: null
+      error_model: {name: ecmwf_seed_v1, fractional_at_0_km: 0.20, fractional_at_10_km: 0.01, absolute_floor_rad: 3.e-6}
+      maximum_simulated_bending_angle_rad: 0.05
+      background_check_stddev: 4.0
+      error_min_rad: null
+      error_max_rad: null
+      top_extrapolation_km: 10.0
+      critical_gradient_n_per_km: 157.0
+      sr_detection_fraction: 0.75
+      sr_screen_height_km: 5.0
+      # profile_capacity/level_capacity intentionally omitted -- auto-sized
+      # to the largest slot actually read (no fixed default value to spell
+      # out).
+  ic_suffix: '120h_100it'
+  sdate: '2015-01-01T00'
+  n_init: 100
+  dt_init: 12
+  save_levs: [1000,850,500,250,50]
+  cycle: True
+  exp_name: 'aifs2-1.0deg-v1.0-pretraining-ps-raobs-amv-gpsro-gsiqc'
+
+  model_name: 'aifs-single-mse-2.0-1.0deg-v1.0-pretraining.ckpt'
+  path_model: './backends/aifs/aifs2-1.0deg-v1.0/'
+  aifs_config: 'backends/aifs/aifs_inference_aifs2-1.0deg-v1.0.yaml'
+  device: 'cuda'
+  path_output: './output/'
+  # separate from ic_cache/ic_cache_aifs1/ -- this checkpoint's native grid
+  # (O96, 40320 points) and variable set (89 vars, no wave/snow) differ from
+  # both the official 0.25deg AIFS-single-2.0 and AIFS-single-1.1 checkpoints;
+  # the ERA5 GRIB cache is keyed only by date, not by checkpoint (see
+  # integrate_multiple_backends.md's aifs1 "stale-cache gotcha"), so reusing
+  # either existing cache would silently serve the wrong grid/variables.
+  ic_cache: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/ic_cache/ic_cache_aifs2-1.0deg-v1.0/'
+  print_every: 10
+  oberrstart: -1
+  oberrdeltaperday: 0
+  control_variables: [u, v, t, z, q, sp, msl, 2t, 2d, 10u, 10v, tcw]
+  checkpoint_stride: 0
+  reset_skt_ocean: True
+  skt_ocean_lsm_threshold: 0.5
+
+windows:
+  '5':
+    n_verif: 20
+    dt_verif: 6
+    dt_obs: 6
+    learn_rate: 2.0e-3
+    weight_decay: 1.0e-3
+    max_epoch: 100
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 0.1
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''

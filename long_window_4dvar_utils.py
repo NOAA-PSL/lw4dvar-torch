@@ -133,6 +133,8 @@ import torch
 import xarray
 import yaml
 
+import gpsro_operator
+
 GRAV = 9.80665  # m/s^2
 RD = 287.05  # J/(kg K), dry air gas constant
 RV = 461.5  # J/(kg K), water vapor gas constant
@@ -209,18 +211,84 @@ PSOBS_QC_FLAG_MEANINGS = (
 )
 
 # raobs (radiosonde profile) obs-variable name -> model packed-state base
-# name. AIFS and Aurora share this base-name convention ('t'/'u'/'v'/'q' --
-# see this module's docstring); FCN3/ACE2 have not been checked and
+# name. AIFS, Aurora, and ACE2 share this base-name convention ('t'/'u'/'v'/
+# 'q' -- see this module's docstring); FCN3/SFNO have not been checked and
 # load_config() rejects raobs_enabled for them until they have been (see
 # RAOBS_SUPPORTED_BACKENDS below). 'specific_humidity' (q) has no
 # reference-repo precedent -- see raobs_parquet.py's module docstring.
+# ACE2, 2026-10-21 (see integrate_prepbufr_obs.md): get_raobs/get_amv have no
+# backend-conditional code, and ACE2Model derives 't'/'u'/'v'/'q'/'z' on the
+# same 13 ERA5 pressure levels, bottom-to-top, that AIFS/Aurora natively
+# carry (ace2_model.py's _to_pressure_levels/decode_state), with a
+# .weights(k=4) grid interpolator (ace2_grid.RectilinearBilinearInterpolator)
+# matching the AMV_HORIZONTAL_K/GPSRO_HORIZONTAL_K=4 convention -- so both
+# worked by construction once this guard was lifted. OFFLINE-validated only
+# (no real checkpoint in this worktree's pointer-only ACE2-ERA5 submodule, so
+# no GPU run yet): get_psobs/get_raobs/get_amv run end-to-end against the
+# real parquet archive + a fake model exposing ACE2's actual F90
+# Gauss-Legendre 180x360 grid and DEFAULT_PLEVS, with finite values, sane
+# physical ranges, and interpolation weights summing to 1 -- see
+# integrate_prepbufr_obs.md for the probe. ACE2's 'q' is specific_total_water
+# (vapor + condensate), not a pure water-vapor specific humidity -- usually a
+# small difference outside cloudy columns, but NOT verified against ERA5 q
+# for this repo; treat raobs-q results on ACE2 as unreviewed until checked.
 RAOBS_VARIABLE_MODEL_BASE = {
     'temperature': 't',
     'u_component_of_wind': 'u',
     'v_component_of_wind': 'v',
     'specific_humidity': 'q',
 }
-RAOBS_SUPPORTED_BACKENDS = ('aifs', 'aurora')
+RAOBS_SUPPORTED_BACKENDS = ('aifs', 'aurora', 'ace2')
+
+# amv (satellite-derived wind, read from the PREPBUFR archive's 'SATWND'
+# class) obs-variable name -> model packed-state base name. 'u'/'v' decoding
+# is offline-validated for AIFS/Aurora/ACE2 (get_amv has no backend-
+# conditional code and ACE2's derived 'u'/'v' share AIFS's base-name/level-
+# order convention, same as raobs above -- see the ACE2 note there);
+# FCN3/SFNO have not been checked. See integrate_amv_satwnd.md.
+AMV_VARIABLE_MODEL_BASE = {
+    'u_component_of_wind': 'u',
+    'v_component_of_wind': 'v',
+}
+AMV_SUPPORTED_BACKENDS = ('aifs', 'aurora', 'ace2')
+# Horizontal k-NN neighbors per observation (same convention as psobs/
+# raobs's grid_interp.weights(..., k=4)). Not a config knob -- changing it
+# changes the composite-stencil node count (2*k) throughout get_amv/
+# _compute_amv_observation_diagnostics_at_time together, so it stays a
+# single source of truth here rather than a free-floating YAML value.
+AMV_HORIZONTAL_K = 4
+
+# aircraft (AIRCAR/AIRCFT) obs-variable name -> model packed-state base name.
+# Same backend list as raobs/amv (get_aircraft has no backend-conditional
+# code; offline-validated only, no real GPU run yet -- see
+# integrate_aircraft_obs.md). AIRCAR_HORIZONTAL_K reuses AMV_HORIZONTAL_K's
+# k=4 convention -- same stencil mechanism (_amv_horizontal_vertical_stencil
+# is shared verbatim).
+AIRCRAFT_VARIABLE_MODEL_BASE = {
+    'temperature': 't',
+    'u_component_of_wind': 'u',
+    'v_component_of_wind': 'v',
+}
+AIRCRAFT_SUPPORTED_BACKENDS = ('aifs', 'aurora', 'ace2')
+
+# gpsro (GPS radio-occultation bending angle) needs temperature, specific
+# humidity, and geopotential on every model pressure level. Extended to
+# 'ace2' 2026-10-22 (still not checked for FCN3/SFNO) -- confirmed directly
+# (not assumed from the raobs/amv precedent) that ACE2Model.decode_state's
+# 't'/'q'/'z' share one level set (self._plevs, no AIFS-style q-subset
+# padding needed), are in the required bottom-to-top order, and that
+# backpropagating through the 'z' (geopotential) derivation -- exercised
+# here for the FIRST time, raobs/amv never read 'z' -- produces finite
+# gradients (a CPU-only probe, since this derivation's code path differs
+# structurally from the t/u/v/q block the 2026-10-21 NaN-gradient fix
+# patched). See integrate_gpsro.md "Plan: extend GPSRO to the ACE2
+# backend" for the full checklist, including the still-open ACE2 'q' vs
+# ERA5 specific-humidity bias this inherits from raobs (now load-bearing,
+# not just an optional caveat) and ACE2's much lower model top (50 hPa,
+# ~20 km) requiring its own impact_height_range_km/top_extrapolation_km
+# tuning rather than reusing AIFS's defaults.
+GPSRO_SUPPORTED_BACKENDS = ('aifs', 'aurora', 'ace2')
+GPSRO_HORIZONTAL_K = 4
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +385,124 @@ _RAOBS_CONFIG_KEYS = {
     'station_capacity': 'raobs_station_capacity',
 }
 
+# Nested `exp.observations.amv.<key>` -> flat `exp[<value>]` key, same
+# convention as psobs/raobs above. Ported from the `long-window-4dvar`
+# reference repo's `observation_sources.py` ('upper_air', source=
+# 'prepbufr', prepbufr_classes=['SATWND']) -- see integrate_amv_satwnd.md
+# for the full design and why the defaults below are what they are.
+#
+# Thinning (rmesh_km/pmesh_hpa) and the background gross check
+# (background_check_stddev/error_min_ms/error_max_ms) are ported from
+# GSI's actual SATWND treatment (`read_satwnd.f90`'s `rmesh`/`pmesh`
+# box-thinning via `convthin`'s `map3grids_m`, and `setupw.f90`'s
+# clamped-ratio gross check) -- see integrate_amv_satwnd.md "GSI
+# comparison" for the exact source lines and why composite-stencil
+# superobbing was replaced with this.
+_AMV_CONFIG_KEYS = {
+    'path': 'amv_path',
+    'prepbufr_classes': 'amv_prepbufr_classes',
+    'report_types': 'amv_report_types',
+    'quality_mark_max': 'amv_quality_mark_max',
+    'time_tolerance_hours': 'amv_time_tolerance_hours',
+    'pressure_range_hpa': 'amv_pressure_range_hpa',
+    'use_source_error': 'amv_use_source_error',
+    'fallback_error_std_ms': 'amv_fallback_error_std_ms',
+    'exclude_satellite_ids': 'amv_exclude_satellite_ids',
+    'separate_report_types': 'amv_separate_report_types',
+    'separate_satellite_ids': 'amv_separate_satellite_ids',
+    'rmesh_km': 'amv_rmesh_km',
+    'pmesh_hpa': 'amv_pmesh_hpa',
+    'vertical_bin_mode': 'amv_vertical_bin_mode',
+    'error_floor_ms': 'amv_error_floor_ms',
+    'background_check_stddev': 'amv_background_check_stddev',
+    'error_min_ms': 'amv_error_min_ms',
+    'error_max_ms': 'amv_error_max_ms',
+    'capacity': 'amv_capacity',
+}
+
+# Nested `exp.observations.aircraft.<key>` -> flat `exp[<value>]` key, same
+# convention as amv above. Aircraft (AIRCAR/AIRCFT) is read, thinned, and
+# forward-operated exactly like amv (vectorized read, native-pressure point
+# stencil, GSI box thinning) EXCEPT it carries two independent sub-streams
+# -- temperature ('t', report_type 133-style mass reports) and wind ('uv',
+# report_type 233-style wind reports) -- because the archive reports them
+# as mutually exclusive rows (see aircraft_parquet.py/
+# integrate_aircraft_obs.md). `rmesh_km`/`pmesh_hpa`/`vertical_bin_mode`/
+# `background_check_stddev` apply to BOTH sub-streams identically (one
+# thinning policy, not two); error floors/clamps are per-sub-stream since
+# temperature (K) and wind (m/s) are different units.
+_AIRCRAFT_CONFIG_KEYS = {
+    'path': 'aircraft_path',
+    'prepbufr_classes': 'aircraft_prepbufr_classes',
+    'report_types': 'aircraft_report_types',
+    'quality_mark_max': 'aircraft_quality_mark_max',
+    'time_tolerance_hours': 'aircraft_time_tolerance_hours',
+    'pressure_range_hpa': 'aircraft_pressure_range_hpa',
+    'use_source_error': 'aircraft_use_source_error',
+    'fallback_error_std_t_k': 'aircraft_fallback_error_std_t_k',
+    'fallback_error_std_ms': 'aircraft_fallback_error_std_ms',
+    'separate_report_types': 'aircraft_separate_report_types',
+    'rmesh_km': 'aircraft_rmesh_km',
+    'pmesh_hpa': 'aircraft_pmesh_hpa',
+    'vertical_bin_mode': 'aircraft_vertical_bin_mode',
+    'error_floor_t_k': 'aircraft_error_floor_t_k',
+    'error_floor_ms': 'aircraft_error_floor_ms',
+    'background_check_stddev': 'aircraft_background_check_stddev',
+    'error_min_t_k': 'aircraft_error_min_t_k',
+    'error_max_t_k': 'aircraft_error_max_t_k',
+    'error_min_ms': 'aircraft_error_min_ms',
+    'error_max_ms': 'aircraft_error_max_ms',
+    'capacity': 'aircraft_capacity',
+    # Static pressure x region temperature bias-correction table -- see
+    # build_aircraft_temperature_bias_table.py / integrate_aircraft_obs.md.
+    # NOT per-tail (per-tail needs either this repo's own, admittedly-
+    # imperfect ACE2 cycling to estimate online, or an external GSI run's
+    # tail numbers, which share no overlap with this archive's own tail
+    # IDs -- checked directly, zero overlap even for the same cycle date).
+    'bias_correction_enabled': 'aircraft_bias_correction_enabled',
+    'bias_correction_table': 'aircraft_bias_correction_table',
+}
+
+# Nested `exp.observations.gpsro.<key>` -> flat `exp[<value>]` key, same
+# convention as the others above. Ported from the `long-window-4dvar`
+# reference repo's `observation_sources.py` ('gpsro', source='parquet') --
+# see integrate_gpsro.md for the full design and simplifications made
+# relative to the reference (no frozen/quantile-scaled background check,
+# no profile-shape QC, only the 'ecmwf_seed_v1' error model).
+#
+# error_min_rad/error_max_rad, top_extrapolation_km, and the SR
+# (super-refraction) keys below are ported from GSI's actual GPSRO
+# treatment (`read_gps.f90`/`setupbend.f90`), not from the JAX reference
+# -- see integrate_gpsro.md "GSI comparison". `impact_height_spacing_m`
+# (vertical thinning) is KEPT despite GSI not thinning GPSRO at all
+# (confirmed directly) -- briefly removed, then restored the same day,
+# 2026-10-20: GSI's own forecast models carry 60-150+ vertical levels, so
+# an unthinned profile still has real degrees of freedom to fit against;
+# this repo's 14-level model backends don't, so removing thinning
+# inflated gpsro's effective weight in the loss by ~(levels-per-profile /
+# 14), confirmed in a real run (gpsro's Jo grew ~6-7x and dominated the
+# total loss) -- see integrate_gpsro.md "GSI comparison".
+_GPSRO_CONFIG_KEYS = {
+    'path': 'gpsro_path',
+    'time_tolerance_hours': 'gpsro_time_tolerance_hours',
+    'impact_height_range_km': 'gpsro_impact_height_range_km',
+    'impact_height_spacing_m': 'gpsro_impact_height_spacing_m',
+    'maximum_bending_angle_rad': 'gpsro_maximum_bending_angle_rad',
+    'quality_flags_disqualifying_mask': 'gpsro_quality_flags_disqualifying_mask',
+    'minimum_percent_confidence': 'gpsro_minimum_percent_confidence',
+    'error_model': 'gpsro_error_model',
+    'maximum_simulated_bending_angle_rad': 'gpsro_maximum_simulated_bending_angle_rad',
+    'background_check_stddev': 'gpsro_background_check_stddev',
+    'error_min_rad': 'gpsro_error_min_rad',
+    'error_max_rad': 'gpsro_error_max_rad',
+    'top_extrapolation_km': 'gpsro_top_extrapolation_km',
+    'critical_gradient_n_per_km': 'gpsro_critical_gradient_n_per_km',
+    'sr_detection_fraction': 'gpsro_sr_detection_fraction',
+    'sr_screen_height_km': 'gpsro_sr_screen_height_km',
+    'profile_capacity': 'gpsro_profile_capacity',
+    'level_capacity': 'gpsro_level_capacity',
+}
+
 
 def _resolve_observations_config(exp):
     """Parse `exp['observations']` (`psobs:`/`raobs:` blocks) into the flat
@@ -336,9 +522,9 @@ def _resolve_observations_config(exp):
     config was nested.
     """
     observations = exp.get('observations', {}) or {}
-    unknown = set(observations) - {'psobs', 'raobs'}
+    unknown = set(observations) - {'psobs', 'raobs', 'amv', 'aircraft', 'gpsro'}
     if unknown:
-        raise ValueError(f"exp.observations has unknown keys {sorted(unknown)} (expected 'psobs' and/or 'raobs')")
+        raise ValueError(f"exp.observations has unknown keys {sorted(unknown)} (expected 'psobs', 'raobs', 'amv', 'aircraft', and/or 'gpsro')")
 
     psobs = observations.get('psobs', {}) or {}
     unknown_psobs = set(psobs) - set(_PSOBS_CONFIG_KEYS)
@@ -361,6 +547,45 @@ def _resolve_observations_config(exp):
                 exp[dst_key] = raobs[src_key]
         exp.setdefault('raobs_variables', ['temperature', 'u_component_of_wind', 'v_component_of_wind', 'specific_humidity'])
         exp.setdefault('raobs_path', exp['obspath'])
+
+    amv = observations.get('amv', {}) or {}
+    unknown_amv = set(amv) - set(_AMV_CONFIG_KEYS) - {'enabled'}
+    if unknown_amv:
+        raise ValueError(f"exp.observations.amv has unknown keys {sorted(unknown_amv)}")
+    exp['amv_enabled'] = bool(amv.get('enabled', False))
+    if exp['amv_enabled']:
+        for src_key, dst_key in _AMV_CONFIG_KEYS.items():
+            if src_key in amv:
+                exp[dst_key] = amv[src_key]
+        exp.setdefault('amv_path', exp['obspath'])
+
+    aircraft = observations.get('aircraft', {}) or {}
+    unknown_aircraft = set(aircraft) - set(_AIRCRAFT_CONFIG_KEYS) - {'enabled'}
+    if unknown_aircraft:
+        raise ValueError(f"exp.observations.aircraft has unknown keys {sorted(unknown_aircraft)}")
+    exp['aircraft_enabled'] = bool(aircraft.get('enabled', False))
+    if exp['aircraft_enabled']:
+        for src_key, dst_key in _AIRCRAFT_CONFIG_KEYS.items():
+            if src_key in aircraft:
+                exp[dst_key] = aircraft[src_key]
+        exp.setdefault('aircraft_path', exp['obspath'])
+        exp.setdefault('aircraft_bias_correction_enabled', False)
+        exp.setdefault(
+            'aircraft_bias_correction_table',
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), 'aircraft_temperature_bias_table.json'),
+        )
+
+    gpsro = observations.get('gpsro', {}) or {}
+    unknown_gpsro = set(gpsro) - set(_GPSRO_CONFIG_KEYS) - {'enabled'}
+    if unknown_gpsro:
+        raise ValueError(f"exp.observations.gpsro has unknown keys {sorted(unknown_gpsro)}")
+    exp['gpsro_enabled'] = bool(gpsro.get('enabled', False))
+    if exp['gpsro_enabled']:
+        for src_key, dst_key in _GPSRO_CONFIG_KEYS.items():
+            if src_key in gpsro:
+                exp[dst_key] = gpsro[src_key]
+        if 'gpsro_path' not in exp:
+            raise ValueError("exp.observations.gpsro.path is required (the GPSRO parquet archive root -- a different archive than observations.psobs.path)")
 
 
 def load_config(config_path='config.yml'):
@@ -485,8 +710,8 @@ def load_config(config_path='config.yml'):
             raise ValueError(
                 f"observations.raobs.enabled is only supported for model_backend in "
                 f"{RAOBS_SUPPORTED_BACKENDS}, got {backend!r} -- the 't'/'u'/'v'/'q' base-name "
-                "forward operator has only been exercised for AIFS/Aurora so far "
-                "(see RAOBS_VARIABLE_MODEL_BASE)."
+                "forward operator has only been exercised for AIFS/Aurora (real runs) and ACE2 "
+                "(offline-validated, no GPU run yet) so far (see RAOBS_VARIABLE_MODEL_BASE)."
             )
         variables = exp['raobs_variables']
         unsupported = set(variables) - set(RAOBS_VARIABLE_MODEL_BASE)
@@ -498,6 +723,34 @@ def load_config(config_path='config.yml'):
         if not variables:
             raise ValueError("observations.raobs.variables must be non-empty when observations.raobs.enabled is True")
         exp['raobs_variables'] = list(variables)
+
+    # amv (satellite-derived winds, SATWND class): off by default, same
+    # backend guard pattern as raobs -- see integrate_amv_satwnd.md.
+    if exp.get('amv_enabled', False) and backend not in AMV_SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"observations.amv.enabled is only supported for model_backend in "
+            f"{AMV_SUPPORTED_BACKENDS}, got {backend!r} -- the 'u'/'v' base-name "
+            "forward operator has only been exercised for AIFS/Aurora (real runs) and ACE2 "
+            "(offline-validated, no GPU run yet) so far."
+        )
+
+    # aircraft (AIRCAR/AIRCFT): off by default, same backend guard pattern
+    # as raobs/amv -- see integrate_aircraft_obs.md.
+    if exp.get('aircraft_enabled', False) and backend not in AIRCRAFT_SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"observations.aircraft.enabled is only supported for model_backend in "
+            f"{AIRCRAFT_SUPPORTED_BACKENDS}, got {backend!r} -- the 't'/'u'/'v' base-name "
+            "forward operator has only been exercised for raobs/amv on these backends so far."
+        )
+
+    # gpsro (GPS-RO bending angle): off by default, same backend guard
+    # pattern as raobs/amv -- see integrate_gpsro.md.
+    if exp.get('gpsro_enabled', False) and backend not in GPSRO_SUPPORTED_BACKENDS:
+        raise ValueError(
+            f"observations.gpsro.enabled is only supported for model_backend in "
+            f"{GPSRO_SUPPORTED_BACKENDS}, got {backend!r} -- the 't'/'q'/'z' base-name "
+            "forward operator has only been exercised for AIFS/Aurora so far."
+        )
     return exp, windows
 
 
@@ -545,6 +798,8 @@ def log_window(exp, logger):
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
     logger.info('   raobs_enabled: ' + (str(exp['raobs_variables']) if exp.get('raobs_enabled', False) else '(off, psobs only)'))
+    logger.info('   amv_enabled: ' + ('True (SATWND, GSI-style box-thinned)' if exp.get('amv_enabled', False) else '(off)'))
+    logger.info('   gpsro_enabled: ' + ('True (bending angle, 1D Abel operator)' if exp.get('gpsro_enabled', False) else '(off)'))
     if exp['model_backend'] == 'fcn3':
         logger.info('   atmo_chunk_size: ' + str(exp.get('atmo_chunk_size', 2)))
         logger.info('   grid_interp: ' + str(exp.get('grid_interp', 'bilinear')))
@@ -1168,6 +1423,923 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
 
 
 # ---------------------------------------------------------------------------
+# amv (satellite-derived wind) -- GSI-style box thinning
+# ---------------------------------------------------------------------------
+#
+# Originally ported from the `long-window-4dvar` (JAX/NeuralGCM) reference
+# repo's `observation_sources.py` ('upper_air', source='prepbufr',
+# prepbufr_classes=['SATWND']) and `prepbufr_parquet.py`
+# (`load_prepbufr_upper_air_points`/`aggregate_upper_air_superobs`), which
+# group raw vectors sharing the SAME fixed interpolation stencil (same
+# k-NN horizontal neighbors + same bracketing pressure-level pair) into one
+# inverse-variance-weighted composite superob. That design matches the
+# reference's REGULAR lat/lon grid, where "same stencil" is exactly one
+# native grid cell -- but on this repo's irregular k-NN grid, "same exact
+# ordered k=4-NN tuple" turns out to be a much finer partition (empirically
+# ~5-30 km on AIFS's ~112 km-spacing O96 grid -- see integrate_amv_satwnd.md
+# "GSI comparison"), so compression was minimal (~1.13x) and millions of
+# near-raw-density, mutually correlated wind vectors entered the loss
+# essentially independently, overwhelming the ps+raobs terms and (combined
+# with no gross-error QC at all) measurably degrading forecast skill.
+#
+# Replaced with GSI's actual SATWND treatment, confirmed directly from
+# `read_satwnd.f90`/`setupw.f90` (NOAA-EMC/GSI): a physical horizontal x
+# vertical thinning MESH (`rmesh_km` x `pmesh_hpa`, independent of the
+# model's native grid resolution, same as GSI's `convinfo` `rmesh`/`pmesh`
+# columns), keeping exactly ONE observation per mesh cell -- the one with
+# the lowest "badness" score (GSI's `crit1`, here `time_offset_hours/6 +
+# 0.5`, tie-broken by source error since this repo's parquet archive
+# doesn't carry the AMV-specific QI/EE fields GSI itself prefers) -- not an
+# average. This is simpler (no in-group error-correlation bookkeeping) and
+# structurally caps the assimilated density at one ob per mesh cell,
+# independent of the model grid.
+
+
+def _amv_horizontal_vertical_stencil(grid_interp, lon, lat, pressure_hpa, levels_hpa, k, device):
+    """Per-point k-NN horizontal (grid_interp) + log-pressure vertical
+    bracket stencil. `levels_hpa` need not be sorted. Returns
+    (horizontal_idx (n,k) int64, horizontal_wts (n,k) float64,
+    level_lo_idx (n,) int32, level_hi_idx (n,) int32, vertical_frac (n,)
+    float64 in [0, 1], 0 at level_lo and 1 at level_hi). Pressures outside
+    `levels_hpa`'s range are clipped to the nearest end (get_amv already
+    intersects the read-time `pressure_range_hpa` filter with the model's
+    own level range, so this should rarely bind)."""
+    n = len(lon)
+    if n == 0:
+        return (
+            np.zeros((0, k), dtype=np.int64), np.zeros((0, k), dtype=np.float64),
+            np.zeros(0, dtype=np.int32), np.zeros(0, dtype=np.int32),
+            np.zeros(0, dtype=np.float64),
+        )
+    idx_t, wts_t = grid_interp.weights(np.asarray(lon), np.asarray(lat), k=k, device=device)
+    horizontal_idx = idx_t.detach().cpu().numpy().astype(np.int64)
+    horizontal_wts = wts_t.detach().cpu().numpy().astype(np.float64)
+
+    levels_hpa = np.asarray(levels_hpa, dtype=np.float64)
+    order = np.argsort(levels_hpa)
+    sorted_levels = levels_hpa[order]
+    pressure = np.clip(np.asarray(pressure_hpa, dtype=np.float64), sorted_levels[0], sorted_levels[-1])
+    upper_position = np.searchsorted(sorted_levels, pressure, side='left')
+    upper_position = np.clip(upper_position, 1, sorted_levels.size - 1)
+    lower_position = upper_position - 1
+    log_p = np.log(pressure)
+    log_lo = np.log(sorted_levels[lower_position])
+    log_hi = np.log(sorted_levels[upper_position])
+    frac = np.where(log_hi > log_lo, (log_p - log_lo) / np.where(log_hi > log_lo, log_hi - log_lo, 1.), 0.)
+    frac = np.clip(frac, 0., 1.)
+    level_lo_idx = order[lower_position].astype(np.int32)
+    level_hi_idx = order[upper_position].astype(np.int32)
+    return horizontal_idx, horizontal_wts, level_lo_idx, level_hi_idx, frac
+
+
+def _amv_thin_slot(
+    lat, lon, pressure_hpa, components, error_std, report_type, time_offset_hours,
+    horizontal_idx, horizontal_wts, level_lo_idx, level_hi_idx, vertical_frac,
+    k, separate_report_types,
+    rmesh_km, pmesh_hpa, error_floor, vertical_bin_mode='pmesh',
+    satellite_id=None, separate_satellite_ids=False, extra_fields=None,
+):
+    """GSI-style box thinning of one verification slot's raw point
+    observations -- shared by `get_amv` (`components={'u_component_of_wind':
+    u, 'v_component_of_wind': v}`, `satellite_id` set) and `get_aircraft`
+    (`components={'temperature': t}` or `{'u_component_of_wind': u,
+    'v_component_of_wind': v}`, `satellite_id=None`, `extra_fields=
+    {'aircraft_id': ...}` -- see integrate_aircraft_obs.md for why aircraft
+    temperature and wind are thinned as two SEPARATE calls, not one
+    combined 3-variable call: the archive reports them as mutually
+    exclusive rows, so a single shared box would silently keep only a
+    temperature OR a wind row per box). `components` values and
+    `extra_fields` values are carried through and subset by the same
+    selection as every other per-row field -- this function itself has no
+    opinion on how many/which variables are attached to a selected raw
+    observation.
+
+    `satellite_id`/`separate_satellite_ids` are AMV-specific (SATWND's
+    satellite identity): when `satellite_id` is None (the default), it is
+    omitted from both the grouping key and the output -- used by any
+    caller, like aircraft, with no comparable per-row identity to group by.
+
+    Below, "raw AMV points" in the historical docstring text generalizes to
+    "raw points" for any caller.
+    keep exactly ONE raw wind vector per (horizontal rmesh_km bin x
+    vertical bin [x report_type] [x satellite_id]) box -- the one
+    with the lowest `crit1` "badness" score, not an average. See the
+    module-level comment above and integrate_amv_satwnd.md's "GSI
+    comparison" for why (ported from `read_satwnd.f90`'s own thinning).
+
+    The horizontal bin is a reduced (near-equal-area) lat/lon mesh: latitude
+    bands of height ~rmesh_km, longitude bins per band narrowed by
+    cos(latitude) so bin width stays ~rmesh_km at every latitude -- GSI's
+    own `make3grids` earth mesh does the equivalent. This is INDEPENDENT of
+    the model's native grid, unlike the old same-k-NN-tuple grouping.
+
+    `vertical_bin_mode` (default `'pmesh'`, GSI's own scheme): a fixed-width
+    `pmesh_hpa`-hPa pressure bin, independent of the model's own vertical
+    levels -- correct for GSI's own 64-150+ level host models, but on a
+    model with few real vertical degrees of freedom (e.g. ACE2's 8 native
+    layers) a uniform-width mesh keeps more vertically-independent-looking
+    observations than the model can actually resolve, AND the single kept
+    observation per bin (selected purely by time-closeness, not pressure)
+    can land anywhere within that bin's span, arbitrarily far from any real
+    model level -- see integrate_amv_satwnd.md "Vertical thinning tied to
+    model levels" for the diagnosis (ACE2, 2026-10-21).
+    `vertical_bin_mode='nearest_level'` bins by the observation's own
+    nearest MODEL pressure level instead (`level_lo_idx`/`level_hi_idx`/
+    `vertical_frac`, already computed by `_amv_horizontal_vertical_stencil`
+    for the forward-operator stencil -- no new computation needed): the
+    vertical bin count becomes exactly the model's own level count, and
+    every kept observation is, by construction, closer to its assigned
+    level than to any other (the Voronoi cell of that level in
+    log-pressure) -- not just probably close, as a weighted/combined score
+    would only encourage. `pmesh_hpa` is unused in this mode. Selection
+    *within* a bin is still GSI's own `crit1` (time-closeness) either way --
+    this only changes where bin boundaries fall, not how ties within a bin
+    are broken.
+
+    `crit1 = time_offset_hours/6 + 0.5` is GSI's own formula for every
+    SATWND type (`read_satwnd.f90` line ~1214); GSI tightens this further
+    for some types using the AMV-specific QI/expected-error fields, which
+    this repo's parquet archive doesn't carry (see integrate_amv_satwnd.md)
+    -- a small source-error tie-break (`+ 1e-3 * sigma`) substitutes for
+    that, preferring the better-quality member when times are equal.
+
+    The output values ARE the selected raw observation's own values and its
+    own (horizontal k-NN x vertical log-p) stencil -- no averaging, so no
+    in-group error-correlation combination is needed either."""
+    extra_fields = extra_fields or {}
+    count = int(np.asarray(lat).size)
+    if count == 0:
+        empty_dtypes = {
+            'lat': np.float32, 'lon': np.float32, 'pressure_hpa': np.float32,
+            'error_std': np.float32, 'report_type': np.int32, 'component_count': np.int32,
+        }
+        for name, arr in components.items():
+            empty_dtypes[name] = np.asarray(arr).dtype if np.asarray(arr).size else np.float32
+        for name, arr in extra_fields.items():
+            empty_dtypes[name] = np.asarray(arr).dtype if np.asarray(arr).size else object
+        if satellite_id is not None:
+            empty_dtypes['satellite_id'] = np.int32
+        result = {name: np.empty(0, dtype=dtype) for name, dtype in empty_dtypes.items()}
+        result['node_point_idx'] = np.empty((0, 2 * k), dtype=np.int64)
+        result['node_level_idx'] = np.empty((0, 2 * k), dtype=np.int32)
+        result['node_weights'] = np.empty((0, 2 * k), dtype=np.float32)
+        return result
+
+    report_type = np.asarray(report_type, dtype=np.int32)
+    if satellite_id is not None:
+        satellite_id = np.asarray(satellite_id, dtype=np.int32)
+    lat_arr = np.asarray(lat, dtype=np.float64)
+    lon_arr = np.asarray(lon, dtype=np.float64)
+    pressure_arr = np.asarray(pressure_hpa, dtype=np.float64)
+
+    sigma = np.asarray(error_std, dtype=np.float64)
+    if np.any(~np.isfinite(sigma)) or np.any(sigma <= 0.):
+        raise ValueError('component error_std must be finite and positive.')
+    sigma = np.maximum(float(error_floor), sigma)
+
+    # Reduced horizontal mesh: lat bands of height ~rmesh_km, lon bins per
+    # band narrowed by cos(lat) to keep near-equal-area cells.
+    km_per_deg_lat = 111.19
+    nlat_bins = max(1, int(round(180. * km_per_deg_lat / float(rmesh_km))))
+    lat_band = np.clip(((lat_arr + 90.) / 180. * nlat_bins).astype(np.int64), 0, nlat_bins - 1)
+    band_center_lat = (lat_band + 0.5) * (180. / nlat_bins) - 90.
+    nlon_bins = np.maximum(1, np.round(
+        360. * np.cos(np.radians(band_center_lat)) * km_per_deg_lat / float(rmesh_km)
+    )).astype(np.int64)
+    lon_bin = np.clip((lon_arr / 360. * nlon_bins).astype(np.int64), 0, nlon_bins - 1)
+    if vertical_bin_mode == 'nearest_level':
+        # Nearest model pressure level (by the SAME log-p bracket already
+        # computed for the forward-operator stencil) as the vertical bin
+        # key, instead of GSI's fixed-width pmesh_hpa mesh -- see the
+        # docstring above.
+        vertical_bin = np.where(
+            np.asarray(vertical_frac) < 0.5,
+            np.asarray(level_lo_idx), np.asarray(level_hi_idx),
+        ).astype(np.int64)
+    elif vertical_bin_mode == 'pmesh':
+        vertical_bin = np.floor(pressure_arr / float(pmesh_hpa)).astype(np.int64)
+    else:
+        raise ValueError(f"vertical_bin_mode must be 'pmesh' or 'nearest_level', got {vertical_bin_mode!r}")
+
+    key_parts = [lat_band[:, None], lon_bin[:, None], vertical_bin[:, None]]
+    if separate_report_types:
+        key_parts.append(report_type[:, None].astype(np.int64))
+    if separate_satellite_ids and satellite_id is not None:
+        key_parts.append(satellite_id[:, None].astype(np.int64))
+    keys = np.concatenate(key_parts, axis=1)
+    _, inverse, group_sizes = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    inverse = np.asarray(inverse).reshape(-1)
+    group_count = group_sizes.size
+
+    timedif = np.asarray(time_offset_hours, dtype=np.float64)
+    crit1 = timedif / 6. + 0.5 + 1.e-3 * sigma
+
+    # Vectorized argmin-per-group: sort by (group, score), take each
+    # group's first row in that order (same unique/searchsorted idiom used
+    # elsewhere in this module).
+    order = np.lexsort((crit1, inverse))
+    sorted_inverse = inverse[order]
+    first_pos = np.searchsorted(sorted_inverse, np.arange(group_count))
+    best_idx = order[first_pos]
+
+    per_point_node_weights = np.concatenate((
+        horizontal_wts * (1. - vertical_frac)[:, None],
+        horizontal_wts * vertical_frac[:, None],
+    ), axis=1)
+
+    order_out = np.argsort(best_idx)
+    sel = best_idx[order_out]
+    result = {
+        'lat': lat_arr[sel].astype(np.float32),
+        'lon': lon_arr[sel].astype(np.float32),
+        'pressure_hpa': pressure_arr[sel].astype(np.float32),
+        'error_std': sigma[sel].astype(np.float32),
+        'report_type': report_type[sel],
+        'component_count': group_sizes[order_out].astype(np.int32),
+        'node_point_idx': np.tile(horizontal_idx[sel], (1, 2)).astype(np.int64),
+        'node_level_idx': np.repeat(
+            np.stack((level_lo_idx[sel], level_hi_idx[sel]), axis=1), k, axis=1
+        ).astype(np.int32),
+        'node_weights': per_point_node_weights[sel].astype(np.float32),
+    }
+    if satellite_id is not None:
+        result['satellite_id'] = satellite_id[sel]
+    for name, values in components.items():
+        result[name] = np.asarray(values, dtype=np.float64)[sel].astype(np.float32)
+    for name, values in extra_fields.items():
+        result[name] = np.asarray(values, dtype=object)[sel]
+    return result
+
+
+def get_amv(exp, model, logger, grid_interp, psobs_traj):
+    """Read quality-controlled satellite-derived wind (AMV) observations
+    from the PREPBUFR parquet archive's 'SATWND' class and GSI-style box-
+    thin them to one observation per mesh cell (see the module comment
+    above). Returns `None` if `exp['amv_enabled']` is not True -- callers
+    (`compute_optimal`, `compute_loss_4dvar`, `compute_ps_observation_hx`,
+    `save_trajectory_diagnostics`) all accept `amv_traj=None` and skip the
+    amv term entirely, so a config that never sets `amv_enabled`
+    assimilates exactly as before.
+
+    Piggybacks on psobs's obs-slot grid (same `step_lo`/`alpha` time
+    bracketing), same as get_raobs -- real SATWND reports are available at
+    any synoptic hour, so this needs no independent time grid.
+    """
+    if not exp.get('amv_enabled', False):
+        return None
+    from amv_parquet import DEFAULT_AMV_CLASSES, load_amv_parquet
+
+    device = model.device
+    dt_obs = exp['dt_obs']
+    date = exp['date']
+    vdate = copy.copy(date)
+    verification_times = []
+    for _ in range(len(psobs_traj['step_lo'])):
+        verification_times.append(vdate)
+        vdate = add_hours(vdate, dt_obs)
+    n_obs = len(verification_times)
+
+    u_levels = np.asarray(model.pressure_levels('u'), dtype=np.float64)
+    v_levels = np.asarray(model.pressure_levels('v'), dtype=np.float64)
+    if u_levels.shape != v_levels.shape or not np.allclose(u_levels, v_levels):
+        raise ValueError("amv_enabled requires model 'u' and 'v' to share the same pressure levels.")
+
+    default_pressure_range = (float(u_levels.max()), float(u_levels.min()))
+    configured_range = exp.get('amv_pressure_range_hpa', default_pressure_range)
+    pressure_min = max(float(min(configured_range)), float(u_levels.min()))
+    pressure_max = min(float(max(configured_range)), float(u_levels.max()))
+    if pressure_min >= pressure_max:
+        raise ValueError('amv_pressure_range_hpa does not overlap the model pressure levels.')
+
+    points = load_amv_parquet(
+        exp.get('amv_path', exp['obspath']),
+        verification_times,
+        time_tolerance_hours=exp.get('amv_time_tolerance_hours', 1.),
+        prepbufr_classes=exp.get('amv_prepbufr_classes', DEFAULT_AMV_CLASSES),
+        report_types=exp.get('amv_report_types'),
+        quality_mark_max=exp.get('amv_quality_mark_max', 3),
+        pressure_range_hpa=(pressure_max, pressure_min),
+        use_source_error=exp.get('amv_use_source_error', True),
+        fallback_error_std_ms=exp.get('amv_fallback_error_std_ms', 7.),
+        exclude_satellite_ids=exp.get('amv_exclude_satellite_ids', ()),
+        logger=logger,
+    )
+
+    k = AMV_HORIZONTAL_K
+    separate_report_types = exp.get('amv_separate_report_types', True)
+    separate_satellite_ids = exp.get('amv_separate_satellite_ids', True)
+    error_floor_ms = exp.get('amv_error_floor_ms', 4.)
+    # GSI-style thinning mesh: rmesh_km (horizontal) x a vertical bin,
+    # independent of the model's native grid -- see _amv_thin_slot and
+    # integrate_amv_satwnd.md. Default 120 km matches the conventional-data
+    # example in the GSI User's Guide (section 3.4.7).
+    rmesh_km = float(exp.get('amv_rmesh_km', 120.))
+    pmesh_hpa = float(exp.get('amv_pmesh_hpa', 50.))
+    # vertical_bin_mode: 'pmesh' (default, GSI's own fixed-width pmesh_hpa
+    # mesh -- 50 hPa is a starting point, not a confirmed operational SATWND
+    # value) or 'nearest_level' (bins by the model's own nearest pressure
+    # level instead -- for a model with few real vertical degrees of
+    # freedom, e.g. ACE2's 8 native layers, this both caps the vertical bin
+    # count at the model's own level count and guarantees the kept
+    # observation is closer to its assigned level than to any other, by
+    # construction -- see _amv_thin_slot's docstring and
+    # integrate_amv_satwnd.md "Vertical thinning tied to model levels").
+    vertical_bin_mode = exp.get('amv_vertical_bin_mode', 'pmesh')
+    if vertical_bin_mode not in ('pmesh', 'nearest_level'):
+        raise ValueError(
+            f"amv_vertical_bin_mode must be 'pmesh' or 'nearest_level', got {vertical_bin_mode!r}"
+        )
+
+    thinned_by_slot = []
+    for j in range(n_obs):
+        horizontal_idx, horizontal_wts, level_lo_idx, level_hi_idx, vertical_frac = (
+            _amv_horizontal_vertical_stencil(
+                grid_interp, points['lon'][j], points['lat'][j], points['pressure_hpa'][j],
+                u_levels, k, device,
+            )
+        )
+        thinned_by_slot.append(_amv_thin_slot(
+            points['lat'][j], points['lon'][j], points['pressure_hpa'][j],
+            {
+                'u_component_of_wind': points['u_component_of_wind'][j],
+                'v_component_of_wind': points['v_component_of_wind'][j],
+            },
+            points['error_std'][j], points['report_type'][j],
+            points['time_offset_hours'][j],
+            horizontal_idx, horizontal_wts, level_lo_idx, level_hi_idx, vertical_frac,
+            k, separate_report_types,
+            rmesh_km, pmesh_hpa, error_floor_ms, vertical_bin_mode=vertical_bin_mode,
+            satellite_id=points['satellite_id'][j], separate_satellite_ids=separate_satellite_ids,
+        ))
+
+    counts = [int(thinned_by_slot[j]['lat'].size) for j in range(n_obs)]
+    capacity = int(exp.get('amv_capacity', max(1, max(counts) if counts else 1)))
+    if counts and max(counts) > capacity:
+        raise ValueError(f"amv thinned count {max(counts)} exceeds configured amv_capacity {capacity}")
+
+    amv_traj = {
+        'n_valid': torch.as_tensor(counts, dtype=torch.int32, device=device),
+        'levels_hpa': torch.as_tensor(u_levels, dtype=torch.float32, device=device),
+    }
+    scalar_fields = {
+        'lat': torch.float32, 'lon': torch.float32, 'pressure_hpa': torch.float32,
+        'u_component_of_wind': torch.float32, 'v_component_of_wind': torch.float32,
+        'error_std': torch.float32, 'report_type': torch.int32, 'satellite_id': torch.int32,
+        'component_count': torch.int32,
+    }
+    for name, dtype in scalar_fields.items():
+        padded = torch.zeros((n_obs, capacity), dtype=dtype, device=device)
+        for j in range(n_obs):
+            n = counts[j]
+            if n:
+                padded[j, :n] = torch.as_tensor(thinned_by_slot[j][name], device=device)
+        amv_traj[name] = padded
+    mask = torch.zeros((n_obs, capacity), dtype=torch.bool, device=device)
+    for j in range(n_obs):
+        mask[j, :counts[j]] = True
+    amv_traj['mask'] = mask
+
+    for name, dtype in (('node_point_idx', torch.int64), ('node_level_idx', torch.int64)):
+        padded = torch.zeros((n_obs, capacity, 2 * k), dtype=dtype, device=device)
+        for j in range(n_obs):
+            n = counts[j]
+            if n:
+                padded[j, :n] = torch.as_tensor(thinned_by_slot[j][name], dtype=dtype, device=device)
+        amv_traj[name] = padded
+    padded_weights = torch.zeros((n_obs, capacity, 2 * k), dtype=torch.float32, device=device)
+    for j in range(n_obs):
+        n = counts[j]
+        if n:
+            padded_weights[j, :n] = torch.as_tensor(thinned_by_slot[j]['node_weights'], device=device)
+    amv_traj['node_weights'] = padded_weights
+
+    # Background gross check (GSI's setupw.f90, Stage C -- see
+    # integrate_amv_satwnd.md "GSI comparison"): ratio = |O-B| /
+    # clip(error, error_min_ms, error_max_ms) > background_check_stddev
+    # rejects the observation. error_min_ms/error_max_ms default to no
+    # clamping (plain |O-B|/error, same convention as raobs's q_bg_check
+    # and gpsro's background_check_stddev) -- set both to adopt GSI's full
+    # clamped-ratio form.
+    bgc = exp.get('amv_background_check_stddev', 4.0)
+    amv_traj['background_check_stddev'] = float(bgc) if bgc else None
+    if exp.get('amv_error_min_ms') is not None:
+        amv_traj['error_min_ms'] = float(exp['amv_error_min_ms'])
+    if exp.get('amv_error_max_ms') is not None:
+        amv_traj['error_max_ms'] = float(exp['amv_error_max_ms'])
+
+    amv_traj['n_steps'] = psobs_traj['n_steps']
+    amv_traj['step_lo'] = psobs_traj['step_lo']
+    amv_traj['alpha'] = psobs_traj['alpha']
+    return amv_traj
+
+
+# ---------------------------------------------------------------------------
+# aircraft (AIRCAR/AIRCFT) -- see integrate_aircraft_obs.md
+# ---------------------------------------------------------------------------
+#
+# Structurally the same as amv (vectorized read, native-pressure point
+# stencil, GSI box thinning, same `_amv_horizontal_vertical_stencil`/
+# `_amv_thin_slot` machinery) EXCEPT the archive reports aircraft
+# temperature and wind as mutually exclusive rows (confirmed directly:
+# report_type 133 = temperature-only, 233 = wind-only, zero rows have
+# both), so get_aircraft thins them as two INDEPENDENT sub-streams ('t',
+# 'uv') -- a single shared thinning box keyed across all three variables
+# would otherwise silently keep only a temperature OR a wind row per box.
+# `aircraft_traj` is therefore `{'t': {...}, 'uv': {...}, <shared keys>}`,
+# not one flat dict of padded fields the way amv_traj is.
+
+_aircraft_bias_table_cache = {}
+
+
+def _load_aircraft_temperature_bias_table(path):
+    """Static pressure x region aircraft temperature bias table (K) --
+    see build_aircraft_temperature_bias_table.py / integrate_aircraft_obs.md
+    for what this is and why it's NOT per-tail. Cached in-process (read
+    once per path, reused across every cycle/window in a run).
+
+    Returns `(bin_hi, bin_lo, values)`: `bin_hi`/`bin_lo` are the pressure
+    bin edges (hPa, high/surface first), and `values[region]` is a
+    same-length array of mean O-B (NaN where the source archive had no
+    data for that bin/region -- new combination, nothing to correct).
+    """
+    if path not in _aircraft_bias_table_cache:
+        with open(path) as f:
+            raw = json.load(f)
+        edges = raw['pressure_bin_edges_hpa']
+        bin_hi = np.asarray(edges[:-1], dtype=np.float64)
+        bin_lo = np.asarray(edges[1:], dtype=np.float64)
+        regions = ('NH', 'Tropics', 'SH')
+        values = {r: np.full(len(bin_hi), np.nan) for r in regions}
+        for i in range(len(bin_hi)):
+            label = f'{int(bin_lo[i])}-{int(bin_hi[i])}'
+            for r in regions:
+                v = raw['table'][label][r]['mean_omb_k']
+                if v is not None:
+                    values[r][i] = v
+        _aircraft_bias_table_cache[path] = (bin_hi, bin_lo, values)
+    return _aircraft_bias_table_cache[path]
+
+
+def _aircraft_temperature_bias_correction(pressure_hpa, lat, path):
+    """Per-observation bias (K) to SUBTRACT from the raw temperature
+    observation (`corrected = raw - bias`), looked up by (pressure bin,
+    region) from the static table in `path`. 0 wherever the table has no
+    data for that bin/region (outside the table's pressure range, or a
+    region/bin combination the source archive didn't cover) -- an
+    unknown correction is better left as no correction than guessed at.
+    """
+    bin_hi, bin_lo, values = _load_aircraft_temperature_bias_table(path)
+    pressure_hpa = np.asarray(pressure_hpa, dtype=np.float64)
+    region = np.where(lat > 20., 'NH', np.where(lat < -20., 'SH', 'Tropics'))
+    bias = np.zeros_like(pressure_hpa)
+    for i in range(len(bin_hi)):
+        in_bin = (pressure_hpa <= bin_hi[i]) & (pressure_hpa > bin_lo[i])
+        if not in_bin.any():
+            continue
+        for r in ('NH', 'Tropics', 'SH'):
+            v = values[r][i]
+            if np.isfinite(v):
+                sel = in_bin & (region == r)
+                bias[sel] = v
+    return bias
+
+
+def get_aircraft(exp, model, logger, grid_interp, psobs_traj):
+    """Read quality-controlled aircraft (AIRCAR/AIRCFT) temperature and
+    wind observations and GSI-style box-thin them, independently per
+    sub-stream (see the module comment above). Returns `None` if
+    `exp['aircraft_enabled']` is not True -- callers all accept
+    `aircraft_traj=None` and skip the aircraft term entirely, so a config
+    that never sets `aircraft_enabled` assimilates exactly as before.
+
+    Piggybacks on psobs's obs-slot grid, same as get_raobs/get_amv.
+    """
+    if not exp.get('aircraft_enabled', False):
+        return None
+    from aircraft_parquet import DEFAULT_AIRCRAFT_CLASSES, load_aircraft_parquet
+
+    device = model.device
+    dt_obs = exp['dt_obs']
+    date = exp['date']
+    vdate = copy.copy(date)
+    verification_times = []
+    for _ in range(len(psobs_traj['step_lo'])):
+        verification_times.append(vdate)
+        vdate = add_hours(vdate, dt_obs)
+    n_obs = len(verification_times)
+
+    t_levels = np.asarray(model.pressure_levels('t'), dtype=np.float64)
+    u_levels = np.asarray(model.pressure_levels('u'), dtype=np.float64)
+    v_levels = np.asarray(model.pressure_levels('v'), dtype=np.float64)
+    if u_levels.shape != v_levels.shape or not np.allclose(u_levels, v_levels):
+        raise ValueError("aircraft_enabled requires model 'u' and 'v' to share the same pressure levels.")
+
+    # Pressure range read: intersection of BOTH variable groups' model
+    # level ranges (in practice identical sets for the backends this
+    # supports, but computed safely in case they ever differ) -- same
+    # pattern as get_amv, extended to cover 't' too.
+    model_min = max(float(t_levels.min()), float(u_levels.min()))
+    model_max = min(float(t_levels.max()), float(u_levels.max()))
+    default_pressure_range = (model_max, model_min)
+    configured_range = exp.get('aircraft_pressure_range_hpa', default_pressure_range)
+    pressure_min = max(float(min(configured_range)), model_min)
+    pressure_max = min(float(max(configured_range)), model_max)
+    if pressure_min >= pressure_max:
+        raise ValueError('aircraft_pressure_range_hpa does not overlap the model pressure levels.')
+
+    points = load_aircraft_parquet(
+        exp.get('aircraft_path', exp['obspath']),
+        verification_times,
+        time_tolerance_hours=exp.get('aircraft_time_tolerance_hours', 1.),
+        prepbufr_classes=exp.get('aircraft_prepbufr_classes', DEFAULT_AIRCRAFT_CLASSES),
+        report_types=exp.get('aircraft_report_types'),
+        quality_mark_max=exp.get('aircraft_quality_mark_max', 3),
+        pressure_range_hpa=(pressure_max, pressure_min),
+        use_source_error=exp.get('aircraft_use_source_error', True),
+        fallback_error_std_t_k=exp.get('aircraft_fallback_error_std_t_k', 1.5),
+        fallback_error_std_ms=exp.get('aircraft_fallback_error_std_ms', 3.5),
+        logger=logger,
+    )
+
+    # Static pressure x region temperature bias correction (NOT per-tail --
+    # see build_aircraft_temperature_bias_table.py / integrate_aircraft_obs.md).
+    # Applied here, on the raw 't' observation before thinning, so every
+    # downstream consumer (thinning, the forward operator, the loss term,
+    # the diagnostics writer) sees "the observation" as already corrected --
+    # no other code path needs to know this happened. Wind ('uv') is left
+    # untouched, same scope as GSI's own aircraft bias correction (and a
+    # real-data check found no systematic per-tail wind bias to correct --
+    # see integrate_aircraft_obs.md).
+    if exp.get('aircraft_bias_correction_enabled', False):
+        bias_table_path = exp['aircraft_bias_correction_table']
+        for j in range(n_obs):
+            if points['t']['temperature'][j].size:
+                bias = _aircraft_temperature_bias_correction(
+                    points['t']['pressure_hpa'][j], points['t']['lat'][j], bias_table_path,
+                )
+                points['t']['temperature'][j] = points['t']['temperature'][j] - bias
+
+    k = AMV_HORIZONTAL_K
+    separate_report_types = exp.get('aircraft_separate_report_types', True)
+    error_floor_t_k = exp.get('aircraft_error_floor_t_k', 0.5)
+    error_floor_ms = exp.get('aircraft_error_floor_ms', 2.0)
+    # Same GSI-style thinning mesh for both sub-streams -- one thinning
+    # policy, not two (see module comment above).
+    rmesh_km = float(exp.get('aircraft_rmesh_km', 120.))
+    pmesh_hpa = float(exp.get('aircraft_pmesh_hpa', 50.))
+    vertical_bin_mode = exp.get('aircraft_vertical_bin_mode', 'pmesh')
+    if vertical_bin_mode not in ('pmesh', 'nearest_level'):
+        raise ValueError(
+            f"aircraft_vertical_bin_mode must be 'pmesh' or 'nearest_level', got {vertical_bin_mode!r}"
+        )
+
+    def _thin_substream(sub_points, sub_levels, component_names, error_floor):
+        thinned_by_slot = []
+        for j in range(n_obs):
+            horizontal_idx, horizontal_wts, level_lo_idx, level_hi_idx, vertical_frac = (
+                _amv_horizontal_vertical_stencil(
+                    grid_interp, sub_points['lon'][j], sub_points['lat'][j], sub_points['pressure_hpa'][j],
+                    sub_levels, k, device,
+                )
+            )
+            components = {name: sub_points[name][j] for name in component_names}
+            thinned_by_slot.append(_amv_thin_slot(
+                sub_points['lat'][j], sub_points['lon'][j], sub_points['pressure_hpa'][j],
+                components, sub_points['error_std'][j], sub_points['report_type'][j],
+                sub_points['time_offset_hours'][j],
+                horizontal_idx, horizontal_wts, level_lo_idx, level_hi_idx, vertical_frac,
+                k, separate_report_types,
+                rmesh_km, pmesh_hpa, error_floor, vertical_bin_mode=vertical_bin_mode,
+                extra_fields={'aircraft_id': sub_points['aircraft_id'][j]},
+            ))
+        return thinned_by_slot
+
+    thinned_t = _thin_substream(points['t'], t_levels, ['temperature'], error_floor_t_k)
+    thinned_uv = _thin_substream(
+        points['uv'], u_levels, ['u_component_of_wind', 'v_component_of_wind'], error_floor_ms,
+    )
+
+    def _pad_substream(thinned_by_slot, levels_array, scalar_fields):
+        counts = [int(thinned_by_slot[j]['lat'].size) for j in range(n_obs)]
+        capacity = int(exp.get('aircraft_capacity', max(1, max(counts) if counts else 1)))
+        if counts and max(counts) > capacity:
+            raise ValueError(f"aircraft thinned count {max(counts)} exceeds configured aircraft_capacity {capacity}")
+        traj = {
+            'n_valid': torch.as_tensor(counts, dtype=torch.int32, device=device),
+            'levels_hpa': torch.as_tensor(levels_array, dtype=torch.float32, device=device),
+        }
+        for name, dtype in scalar_fields.items():
+            padded = torch.zeros((n_obs, capacity), dtype=dtype, device=device)
+            for j in range(n_obs):
+                n = counts[j]
+                if n:
+                    padded[j, :n] = torch.as_tensor(thinned_by_slot[j][name], device=device)
+            traj[name] = padded
+        mask = torch.zeros((n_obs, capacity), dtype=torch.bool, device=device)
+        for j in range(n_obs):
+            mask[j, :counts[j]] = True
+        traj['mask'] = mask
+        for name, dtype in (('node_point_idx', torch.int64), ('node_level_idx', torch.int64)):
+            padded = torch.zeros((n_obs, capacity, 2 * k), dtype=dtype, device=device)
+            for j in range(n_obs):
+                n = counts[j]
+                if n:
+                    padded[j, :n] = torch.as_tensor(thinned_by_slot[j][name], dtype=dtype, device=device)
+            traj[name] = padded
+        padded_weights = torch.zeros((n_obs, capacity, 2 * k), dtype=torch.float32, device=device)
+        for j in range(n_obs):
+            n = counts[j]
+            if n:
+                padded_weights[j, :n] = torch.as_tensor(thinned_by_slot[j]['node_weights'], device=device)
+        traj['node_weights'] = padded_weights
+        # aircraft_id: diagnostic-only identity metadata (for future
+        # per-aircraft bias-correction work -- not used anywhere in this
+        # pass), kept as a plain numpy object array of strings, NOT a torch
+        # tensor (it never participates in any differentiable computation).
+        # '' pads unused slots.
+        aircraft_id = np.full((n_obs, capacity), '', dtype=object)
+        for j in range(n_obs):
+            n = counts[j]
+            if n:
+                aircraft_id[j, :n] = thinned_by_slot[j]['aircraft_id']
+        traj['aircraft_id'] = aircraft_id
+        return traj
+
+    aircraft_traj = {
+        't': _pad_substream(thinned_t, t_levels, {
+            'lat': torch.float32, 'lon': torch.float32, 'pressure_hpa': torch.float32,
+            'temperature': torch.float32, 'error_std': torch.float32,
+            'report_type': torch.int32, 'component_count': torch.int32,
+        }),
+        'uv': _pad_substream(thinned_uv, u_levels, {
+            'lat': torch.float32, 'lon': torch.float32, 'pressure_hpa': torch.float32,
+            'u_component_of_wind': torch.float32, 'v_component_of_wind': torch.float32,
+            'error_std': torch.float32, 'report_type': torch.int32, 'component_count': torch.int32,
+        }),
+    }
+
+    # Background gross check (same convention as amv -- see get_amv),
+    # applied identically to both sub-streams; error floors/clamps are
+    # per-sub-stream (temperature K vs wind m/s are different units).
+    bgc = exp.get('aircraft_background_check_stddev', 4.0)
+    aircraft_traj['background_check_stddev'] = float(bgc) if bgc else None
+    if exp.get('aircraft_error_min_t_k') is not None:
+        aircraft_traj['error_min_t_k'] = float(exp['aircraft_error_min_t_k'])
+    if exp.get('aircraft_error_max_t_k') is not None:
+        aircraft_traj['error_max_t_k'] = float(exp['aircraft_error_max_t_k'])
+    if exp.get('aircraft_error_min_ms') is not None:
+        aircraft_traj['error_min_ms'] = float(exp['aircraft_error_min_ms'])
+    if exp.get('aircraft_error_max_ms') is not None:
+        aircraft_traj['error_max_ms'] = float(exp['aircraft_error_max_ms'])
+
+    aircraft_traj['n_steps'] = psobs_traj['n_steps']
+    aircraft_traj['step_lo'] = psobs_traj['step_lo']
+    aircraft_traj['alpha'] = psobs_traj['alpha']
+    return aircraft_traj
+
+
+def _compute_aircraft_observation_diagnostics_at_time(decoded, aircraft_traj, oind):
+    """Aircraft H(x) for one verification-time slot -- temperature ('t')
+    and wind ('uv') sub-streams evaluated independently, each against its
+    own fixed 2*k-node stencil, same mechanism as
+    `_compute_amv_observation_diagnostics_at_time` (duplicated rather than
+    generalized -- short function, keeps amv's own validated version
+    untouched; see integrate_aircraft_obs.md).
+
+    Background gross check: same ported GSI form as amv, with separate
+    (temperature K / wind m/s) clamp bounds, both evaluated at the CURRENT
+    state every loss call.
+    """
+    results = {}
+    background_check = aircraft_traj.get('background_check_stddev')
+
+    sub_t = aircraft_traj['t']
+    field_t = decoded['t']
+    gathered_t = field_t[sub_t['node_level_idx'][oind], sub_t['node_point_idx'][oind]]
+    model_obspace_t = (gathered_t * sub_t['node_weights'][oind]).sum(dim=-1)
+    observation_t = sub_t['temperature'][oind]
+    interpolation_failed_t = ~torch.isfinite(model_obspace_t)
+    used_t = sub_t['mask'][oind] & ~interpolation_failed_t
+    safe_model_obspace_t = torch.where(interpolation_failed_t, torch.zeros_like(model_obspace_t), model_obspace_t)
+    innovation_t = observation_t - safe_model_obspace_t
+    effective_error_t = sub_t['error_std'][oind]
+    if background_check:
+        qc_error_t = effective_error_t
+        lo = aircraft_traj.get('error_min_t_k')
+        hi = aircraft_traj.get('error_max_t_k')
+        if lo is not None or hi is not None:
+            qc_error_t = qc_error_t.clamp(min=lo if lo is not None else 0., max=hi if hi is not None else float('inf'))
+        used_t = used_t & (innovation_t.abs() <= float(background_check) * qc_error_t).detach()
+    results['t'] = (innovation_t, safe_model_obspace_t, effective_error_t, used_t)
+
+    sub_uv = aircraft_traj['uv']
+    mask_uv = sub_uv['mask'][oind]
+    for obs_key, base in (('u_component_of_wind', 'u'), ('v_component_of_wind', 'v')):
+        field = decoded[base]
+        gathered = field[sub_uv['node_level_idx'][oind], sub_uv['node_point_idx'][oind]]
+        model_obspace = (gathered * sub_uv['node_weights'][oind]).sum(dim=-1)
+        observation = sub_uv[obs_key][oind]
+        interpolation_failed = ~torch.isfinite(model_obspace)
+        used = mask_uv & ~interpolation_failed
+        safe_model_obspace = torch.where(interpolation_failed, torch.zeros_like(model_obspace), model_obspace)
+        innovation = observation - safe_model_obspace
+        effective_error = sub_uv['error_std'][oind]
+        if background_check:
+            qc_error = effective_error
+            lo = aircraft_traj.get('error_min_ms')
+            hi = aircraft_traj.get('error_max_ms')
+            if lo is not None or hi is not None:
+                qc_error = qc_error.clamp(min=lo if lo is not None else 0., max=hi if hi is not None else float('inf'))
+            used = used & (innovation.abs() <= float(background_check) * qc_error).detach()
+        results[base] = (innovation, safe_model_obspace, effective_error, used)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# gpsro (GPS radio-occultation bending angle)
+# ---------------------------------------------------------------------------
+#
+# Ported from the `long-window-4dvar` (JAX/NeuralGCM) reference repo's
+# `gpsro_parquet.py` (reader/QC/thinning/error model) and `gpsro_operator.py`
+# (the differentiable 1D Abel-transform bending-angle forward operator,
+# cross-validated directly against the reference -- see integrate_gpsro.md).
+# Each profile's levels keep their OWN (possibly height-drifting) tangent-
+# point lat/lon, so each (profile, level) gets its own horizontally
+# interpolated model column -- not one column per profile.
+#
+# Deliberately simpler than the reference in two places (see
+# integrate_gpsro.md for why): the background/sanity check here is a plain
+# fixed-stddev threshold evaluated at the CURRENT state every loss call
+# (same convention as raobs's `q_bg_check`), not the reference's frozen,
+# quantile-scaled-by-lead-time scheme; and the reference's purely
+# observation-side profile-shape QC (`gpsro_profile_quality_control`) is not
+# ported at all -- the reference's own config defaults it OFF too.
+
+
+def get_gpsro(exp, model, logger, grid_interp, psobs_traj):
+    """Read quality-controlled, vertically thinned GPS-RO bending-angle
+    profiles and build the fixed per-(profile, level) composite
+    interpolation stencil the 1D Abel-transform operator needs. Returns
+    `None` if `exp['gpsro_enabled']` is not True -- callers all accept
+    `gpsro_traj=None` and skip the gpsro term entirely.
+
+    Piggybacks on psobs's obs-slot grid (same `step_lo`/`alpha` time
+    bracketing), same as get_raobs/get_amv.
+    """
+    if not exp.get('gpsro_enabled', False):
+        return None
+    from gpsro_parquet import load_gpsro_profiles
+
+    device = model.device
+    dt_obs = exp['dt_obs']
+    date = exp['date']
+    vdate = copy.copy(date)
+    verification_times = []
+    for _ in range(len(psobs_traj['step_lo'])):
+        verification_times.append(vdate)
+        vdate = add_hours(vdate, dt_obs)
+    n_obs = len(verification_times)
+
+    t_levels = np.asarray(model.pressure_levels('t'), dtype=np.float64)
+    q_levels = np.asarray(model.pressure_levels('q'), dtype=np.float64)
+    z_levels = np.asarray(model.pressure_levels('z'), dtype=np.float64)
+    if not np.array_equal(t_levels, z_levels):
+        raise ValueError("gpsro_enabled requires model 't' and 'z' to share the same pressure levels.")
+    # AIFS/Aurora's 'q' omits the top couple of 't'/'z' levels (e.g. AIFS-
+    # single-2.0: 10/50 hPa -- see integrate_prepbufr_obs.md) since
+    # stratospheric humidity is negligible. Rather than require an exact
+    # match (losing those levels -- and hence tangent-height support --
+    # from the whole column), pad 'q' with zero (dry) at any 't'/'z' level
+    # it doesn't have; this must be a strict SUBSET, in the same relative
+    # order, or there's a real level mismatch the padding can't fix.
+    q_present_idx = np.full(q_levels.size, -1, dtype=np.int64)
+    for i, level in enumerate(q_levels):
+        matches = np.flatnonzero(np.isclose(t_levels, level))
+        if matches.size != 1:
+            raise ValueError(
+                "gpsro_enabled requires every model 'q' pressure level to be exactly one of "
+                f"'t'/'z''s levels; {level!r} is not (t/z levels: {t_levels.tolist()!r})."
+            )
+        q_present_idx[i] = matches[0]
+    if np.any(np.diff(q_present_idx) <= 0):
+        raise ValueError(
+            "gpsro_enabled requires model 'q' levels to appear in the same relative order as 't'/'z''s."
+        )
+
+    data = load_gpsro_profiles(
+        exp['gpsro_path'], verification_times,
+        time_tolerance_hours=exp.get('gpsro_time_tolerance_hours', 1.5),
+        impact_height_range_km=exp.get('gpsro_impact_height_range_km', (6., 40.)),
+        impact_height_spacing_m=exp.get('gpsro_impact_height_spacing_m', 1000.),
+        maximum_bending_angle_rad=exp.get('gpsro_maximum_bending_angle_rad', .1),
+        quality_flags_disqualifying_mask=exp.get('gpsro_quality_flags_disqualifying_mask', 0),
+        minimum_percent_confidence=exp.get('gpsro_minimum_percent_confidence'),
+        error_model=exp.get('gpsro_error_model'),
+        logger=logger,
+    )
+    by_time = data['by_time']
+
+    profile_counts = [len(profiles) for profiles in by_time]
+    level_counts = [
+        max((len(p['bending_angle_rad']) for p in profiles), default=0) for profiles in by_time
+    ]
+    profile_capacity = int(exp.get('gpsro_profile_capacity', max(1, max(profile_counts, default=1))))
+    level_capacity = int(exp.get('gpsro_level_capacity', max(1, max(level_counts, default=1))))
+    if max(profile_counts, default=0) > profile_capacity:
+        raise ValueError(
+            f"gpsro profile count {max(profile_counts)} exceeds configured gpsro_profile_capacity {profile_capacity}"
+        )
+    if max(level_counts, default=0) > level_capacity:
+        raise ValueError(
+            f"gpsro level count {max(level_counts)} exceeds configured gpsro_level_capacity {level_capacity}"
+        )
+
+    k = GPSRO_HORIZONTAL_K
+    level_shape = (n_obs, profile_capacity, level_capacity)
+    latitude = np.zeros(level_shape, dtype=np.float32)
+    longitude = np.zeros(level_shape, dtype=np.float32)
+    impact_height = np.full(level_shape, 1000. * min(exp.get('gpsro_impact_height_range_km', (6., 40.))), dtype=np.float32)
+    bending_angle = np.zeros(level_shape, dtype=np.float32)
+    error_std = np.ones(level_shape, dtype=np.float32)
+    curvature = np.full(level_shape, 6371000., dtype=np.float32)
+    undulation = np.zeros(level_shape, dtype=np.float32)
+    mask = np.zeros(level_shape, dtype=bool)
+    satellite_id = np.full((n_obs, profile_capacity), -1, dtype=np.int32)
+
+    for j, profiles in enumerate(by_time):
+        for p_index, profile in enumerate(profiles):
+            n_levels = len(profile['bending_angle_rad'])
+            sl = (j, p_index, slice(0, n_levels))
+            latitude[sl] = profile['latitude_deg_north']
+            longitude[sl] = np.mod(profile['longitude_deg_east'], 360.)
+            impact_height[sl] = profile['impact_height_m']
+            bending_angle[sl] = profile['bending_angle_rad']
+            error_std[sl] = profile['error_std_rad']
+            curvature[sl] = profile['earth_local_radius_curvature_m']
+            undulation[sl] = profile['geoid_undulation_m']
+            mask[(j, p_index, slice(0, n_levels))] = True
+            satellite_id[j, p_index] = profile['satellite_id']
+
+    interp_idx = torch.zeros((n_obs, profile_capacity, level_capacity, k), dtype=torch.long, device=device)
+    interp_wts = torch.zeros((n_obs, profile_capacity, level_capacity, k), dtype=torch.float32, device=device)
+    for j in range(n_obs):
+        flat_lon = longitude[j].reshape(-1)
+        flat_lat = latitude[j].reshape(-1)
+        idx, wts = grid_interp.weights(flat_lon, flat_lat, k=k, device=device)
+        interp_idx[j] = idx.reshape(profile_capacity, level_capacity, k)
+        interp_wts[j] = wts.reshape(profile_capacity, level_capacity, k)
+
+    gpsro_traj = {
+        'n_valid': torch.as_tensor(profile_counts, dtype=torch.int32, device=device),
+        'pressure_hpa': torch.as_tensor(t_levels, dtype=torch.float32, device=device),
+        'n_t_levels': t_levels.size,
+        'q_present_idx': torch.as_tensor(q_present_idx, dtype=torch.long, device=device),
+        'latitude': torch.as_tensor(latitude, device=device),
+        'longitude': torch.as_tensor(longitude, device=device),
+        'impact_height_m': torch.as_tensor(impact_height, device=device),
+        'bending_angle_rad': torch.as_tensor(bending_angle, device=device),
+        'error_std_rad': torch.as_tensor(error_std, device=device),
+        'earth_local_radius_curvature_m': torch.as_tensor(curvature, device=device),
+        'geoid_undulation_m': torch.as_tensor(undulation, device=device),
+        'mask': torch.as_tensor(mask, device=device),
+        'satellite_id': torch.as_tensor(satellite_id, device=device),
+        'interp_idx': interp_idx,
+        'interp_wts': interp_wts,
+        'maximum_simulated_bending_angle_rad': float(exp.get('gpsro_maximum_simulated_bending_angle_rad', .05)),
+        # Background gross check (GSI's setupbend.f90, Stage C -- see
+        # integrate_gpsro.md "GSI comparison"): ratio = |O-B| /
+        # clip(error, error_min_rad, error_max_rad) > background_check_stddev
+        # rejects the observation. error_min_rad/error_max_rad default to
+        # no clamping (plain |O-B|/error, this repo's prior convention) --
+        # set both to adopt GSI's full clamped-ratio form.
+        'background_check_stddev': exp.get('gpsro_background_check_stddev', 4.),
+        'error_min_rad': exp.get('gpsro_error_min_rad'),
+        'error_max_rad': exp.get('gpsro_error_max_rad'),
+        # Model-top extension + super-refraction screen, both ported from
+        # GSI (`setupbend.f90`) -- see gpsro_operator.py's
+        # bending_angle_column_validity_diagnostics docstring and
+        # integrate_gpsro.md "GSI comparison". Default 10 km reclaims
+        # AIFS-single-2.0's 31-40 km band (the default
+        # impact_height_range_km upper bound) that was previously rejected
+        # outright for falling above the model's own ~31 km top.
+        'top_extrapolation_m': 1000. * float(exp.get('gpsro_top_extrapolation_km', 10.)),
+        'critical_gradient_n_per_km': exp.get(
+            'gpsro_critical_gradient_n_per_km', gpsro_operator.GSI_CRITICAL_REFRACTIVITY_GRADIENT_N_PER_KM,
+        ),
+        'sr_detection_fraction': exp.get(
+            'gpsro_sr_detection_fraction', gpsro_operator.GSI_SUPER_REFRACTION_DETECTION_FRACTION,
+        ),
+        'sr_screen_height_m': 1000. * float(exp.get(
+            'gpsro_sr_screen_height_km', gpsro_operator.GSI_SUPER_REFRACTION_SCREEN_HEIGHT_M / 1000.,
+        )),
+        'n_steps': psobs_traj['n_steps'],
+        'step_lo': psobs_traj['step_lo'],
+        'alpha': psobs_traj['alpha'],
+    }
+    return gpsro_traj
+
+
+# ---------------------------------------------------------------------------
 # forward operator (station-elevation surface pressure) + QC
 # ---------------------------------------------------------------------------
 
@@ -1381,6 +2553,146 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
     return results
 
 
+def _compute_amv_observation_diagnostics_at_time(decoded, amv_traj, oind):
+    """AMV H(x) for one verification-time slot.
+
+    Each thinned observation's fixed 2*k-node stencil (`node_point_idx`/
+    `node_level_idx`/`node_weights`, from get_amv/_amv_thin_slot) is
+    applied directly to the CURRENT decoded u/v field -- no grid_interp
+    call needed here, since the stored weights already fold in both the
+    horizontal k-NN weights and the vertical log-pressure blend.
+
+    Background gross check (GSI's `setupw.f90`, ported as
+    `amv_background_check_stddev`/`amv_error_min_ms`/`amv_error_max_ms` --
+    see get_amv and integrate_amv_satwnd.md "GSI comparison"): rejects an
+    observation whose |O-B| exceeds `background_check_stddev * clip(error,
+    error_min_ms, error_max_ms)`, evaluated at the CURRENT state on every
+    loss call (same convention as raobs's `q_bg_check`/gpsro's
+    `background_check_stddev` -- simpler than GSI's own frozen,
+    once-before-optimization check).
+    """
+    node_point_idx = amv_traj['node_point_idx'][oind]   # (capacity, 2k)
+    node_level_idx = amv_traj['node_level_idx'][oind]   # (capacity, 2k)
+    node_weights = amv_traj['node_weights'][oind]       # (capacity, 2k)
+    mask = amv_traj['mask'][oind]
+    background_check = amv_traj.get('background_check_stddev')
+    error_min_ms = amv_traj.get('error_min_ms')
+    error_max_ms = amv_traj.get('error_max_ms')
+    results = {}
+    for obs_key, base in AMV_VARIABLE_MODEL_BASE.items():
+        field = decoded[base]                             # (n_levels, n_grid_points)
+        gathered = field[node_level_idx, node_point_idx]   # (capacity, 2k)
+        model_obspace = (gathered * node_weights).sum(dim=-1)
+        observation = amv_traj[obs_key][oind]
+        interpolation_failed = ~torch.isfinite(model_obspace)
+        used = mask & ~interpolation_failed
+        safe_model_obspace = torch.where(interpolation_failed, torch.zeros_like(model_obspace), model_obspace)
+        innovation = observation - safe_model_obspace
+        effective_error = amv_traj['error_std'][oind]
+        if background_check:
+            qc_error = effective_error
+            if error_min_ms is not None or error_max_ms is not None:
+                lo = error_min_ms if error_min_ms is not None else 0.
+                hi = error_max_ms if error_max_ms is not None else float('inf')
+                qc_error = qc_error.clamp(min=lo, max=hi)
+            used = used & (innovation.abs() <= float(background_check) * qc_error).detach()
+        results[base] = (innovation, safe_model_obspace, effective_error, used)
+    return results
+
+
+def _compute_gpsro_observation_diagnostics_at_time(decoded, gpsro_traj, grid_interp, oind):
+    """GPS-RO bending-angle H(x) for one verification-time slot.
+
+    Each (profile, level) gets its OWN horizontally interpolated model
+    column (`grid_interp.interp`'s idx/wts broadcast over whatever leading
+    shape they're given -- no change needed there, see
+    integrate_gpsro.md), then the full column is handed to the 1D
+    Abel-transform operator (`gpsro_operator.simulate_bending_angles`).
+
+    `used` additionally requires the model-column validity predicate
+    (`bending_angle_columns_are_valid` -- thermodynamic sanity, a
+    supported tangent point (optionally extrapolated above the model top,
+    `top_extrapolation_m`), non-reversing refractional height, and a
+    super-refraction screen -- all three ported from GSI's
+    `setupbend.f90`, see get_gpsro/integrate_gpsro.md "GSI comparison")
+    and a background gross check (GSI's own clamped-ratio form when
+    `error_min_rad`/`error_max_rad` are set, a plain fixed-stddev
+    multiplier otherwise -- evaluated at the CURRENT state every loss
+    call, simpler than GSI's frozen, once-before-optimization version).
+    """
+    idx = gpsro_traj['interp_idx'][oind]     # (profile_capacity, level_capacity, k)
+    wts = gpsro_traj['interp_wts'][oind]
+    mask = gpsro_traj['mask'][oind]          # (profile_capacity, level_capacity)
+
+    # 'q' may omit the top couple of 't'/'z' levels (e.g. AIFS-single-2.0:
+    # 10/50 hPa, negligible stratospheric humidity -- see get_gpsro).
+    # Scatter it onto the full 't'/'z' level axis, zero (dry) at any level
+    # it doesn't have, so every base shares one consistent column before
+    # interpolation.
+    q_field = decoded['q']
+    if q_field.shape[0] != gpsro_traj['n_t_levels']:
+        q_field = torch.zeros(
+            (gpsro_traj['n_t_levels'],) + q_field.shape[1:], dtype=q_field.dtype, device=q_field.device,
+        )
+        q_field[gpsro_traj['q_present_idx']] = decoded['q']
+    fields = {'t': decoded['t'], 'q': q_field, 'z': decoded['z']}
+
+    columns = {}
+    for base in ('t', 'q', 'z'):
+        # fields[base]: (n_model_levels, n_grid_points) -> (n_model_levels, profile_capacity, level_capacity)
+        interpolated = grid_interp.interp(idx, wts, fields[base])
+        columns[base] = interpolated.movedim(0, -1)   # -> (profile_capacity, level_capacity, n_model_levels)
+
+    pressure_hpa = gpsro_traj['pressure_hpa']
+    latitude = gpsro_traj['latitude'][oind]
+    curvature = gpsro_traj['earth_local_radius_curvature_m'][oind]
+    undulation = gpsro_traj['geoid_undulation_m'][oind]
+    impact_height = gpsro_traj['impact_height_m'][oind]
+
+    model_equivalent = gpsro_operator.simulate_bending_angles(
+        columns['t'], columns['q'], columns['z'], pressure_hpa,
+        latitude, curvature, undulation, impact_height, mask,
+    )
+    column_valid = gpsro_operator.bending_angle_columns_are_valid(
+        columns['t'], columns['q'], columns['z'], pressure_hpa,
+        latitude, curvature, undulation, impact_height,
+        top_extrapolation_m=gpsro_traj.get('top_extrapolation_m', 0.),
+        critical_gradient_n_per_km=gpsro_traj.get('critical_gradient_n_per_km'),
+        sr_detection_fraction=gpsro_traj.get(
+            'sr_detection_fraction', gpsro_operator.GSI_SUPER_REFRACTION_DETECTION_FRACTION,
+        ),
+        sr_screen_height_m=gpsro_traj.get(
+            'sr_screen_height_m', gpsro_operator.GSI_SUPER_REFRACTION_SCREEN_HEIGHT_M,
+        ),
+    )
+    observation = gpsro_traj['bending_angle_rad'][oind]
+    effective_error = gpsro_traj['error_std_rad'][oind]
+    maximum_angle = gpsro_traj['maximum_simulated_bending_angle_rad']
+
+    interpolation_failed = ~torch.isfinite(model_equivalent)
+    safe_model_equivalent = torch.where(interpolation_failed, torch.zeros_like(model_equivalent), model_equivalent)
+    simulated_angle_ok = ~interpolation_failed & (safe_model_equivalent > 0.) & (safe_model_equivalent <= maximum_angle)
+    innovation = observation - safe_model_equivalent
+    used = mask & column_valid & simulated_angle_ok
+    # Background gross check (GSI's setupbend.f90, Stage C -- see
+    # get_gpsro and integrate_gpsro.md "GSI comparison"): ratio = |O-B| /
+    # clip(error, error_min_rad, error_max_rad) > background_check_stddev
+    # rejects the observation, evaluated at the CURRENT state every loss
+    # call (same convention as raobs's q_bg_check/amv's own clamped check
+    # -- simpler than GSI's frozen, once-before-optimization version).
+    background_check = gpsro_traj.get('background_check_stddev')
+    if background_check:
+        error_min_rad = gpsro_traj.get('error_min_rad')
+        error_max_rad = gpsro_traj.get('error_max_rad')
+        qc_error = effective_error
+        if error_min_rad is not None or error_max_rad is not None:
+            lo = error_min_rad if error_min_rad is not None else 0.
+            hi = error_max_rad if error_max_rad is not None else float('inf')
+            qc_error = qc_error.clamp(min=lo, max=hi)
+        used = used & (innovation.abs() <= float(background_check) * qc_error).detach()
+    return innovation, safe_model_equivalent, effective_error, used
+
+
 def _resolve_loss_interp_specs(model, exp):
     """Which decoded fields must be linearly time-interpolated between the two
     bracketing 6h model states for a sub-6h obs slot.
@@ -1415,6 +2727,15 @@ def _resolve_loss_interp_specs(model, exp):
     # raobs observations share psobs's obs-slot grid (see get_raobs).
     if exp.get('raobs_enabled', False):
         names |= {RAOBS_VARIABLE_MODEL_BASE[v] for v in exp['raobs_variables']}
+    # amv (SATWND, box-thinned) needs 'u'/'v' decoded the same time-
+    # interpolated way, sharing psobs's obs-slot grid exactly like raobs
+    # above (see get_amv).
+    if exp.get('amv_enabled', False):
+        names |= set(AMV_VARIABLE_MODEL_BASE.values())
+    # gpsro needs t/q decoded the same time-interpolated way ('z' is
+    # already always included above) -- see get_gpsro.
+    if exp.get('gpsro_enabled', False):
+        names |= {'t', 'q'}
     specs = []
     for base in sorted(names):
         if not model.is_known_variable(base):
@@ -1490,11 +2811,15 @@ def _resolve_control_mask(model, exp, n_vars, device):
 
 @torch.no_grad()
 def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, grid_interp,
-                              interp_specs, step_start=0, raobs_traj=None):
+                              interp_specs, step_start=0, raobs_traj=None, amv_traj=None,
+                              aircraft_traj=None, gpsro_traj=None):
     """Evaluate a trajectory at every surface-pressure observation slot.
     Post-optimization diagnostics only -- no gradients anywhere here.
 
-    Returns two or three output grids.
+    Always returns six values (`obs_trajectory, model_trajectory,
+    raobs_trajectory, amv_trajectory, aircraft_trajectory,
+    gpsro_trajectory`); the last four are `None` when `raobs_traj`/
+    `amv_traj`/`aircraft_traj`/`gpsro_traj` is `None`.
       - `model_trajectory`: the decoded model state at every 6h step, from
         `step_start` to `n_steps` inclusive (native rollout cadence).
       - `obs_trajectory`: H(x)/QC at every obs slot `j` with
@@ -1502,7 +2827,12 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
         loss (`_interp_decoded` over `interp_specs`). Slots earlier than
         `step_start` are omitted -- the caller pads them.
       - `raobs_trajectory` (only when `raobs_traj` is not None): the same
-        shape of thing, per raobs variable -- see `_record_raobs`.
+        shape of thing, per raobs variable -- see `_record_obs`.
+      - `amv_trajectory` (only when `amv_traj` is not None): the same shape
+        of thing, per amv (u/v) variable -- see `_record_obs`.
+      - `gpsro_trajectory` (only when `gpsro_traj` is not None): H(x)/
+        column-validity fields on `(time, profile_slot, level_slot)` --
+        see `_record_obs`.
 
     `step_start`: the 6h-step index `model_state` sits at. 0 for the
     background; `dt_verif // 6` for a latent analysis (valid at
@@ -1528,6 +2858,9 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
     diagnostics = {}
     model_outputs = {}
     raobs_diagnostics = {base: {} for base in raobs_traj['variables']} if raobs_traj is not None else None
+    amv_diagnostics = {base: {} for base in AMV_VARIABLE_MODEL_BASE.values()} if amv_traj is not None else None
+    aircraft_diagnostics = {base: {} for base in AIRCRAFT_VARIABLE_MODEL_BASE.values()} if aircraft_traj is not None else None
+    gpsro_diagnostics = {} if gpsro_traj is not None else None
 
     def _record_obs(j, decoded_j):
         innovation, model_equivalent, effective_error, available, used, qc_flag = \
@@ -1551,6 +2884,33 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
                     'used': used_r,
                 }.items():
                     raobs_diagnostics[base].setdefault(name, []).append(value.detach().cpu().numpy())
+        if amv_traj is not None:
+            amv_results = _compute_amv_observation_diagnostics_at_time(decoded_j, amv_traj, j)
+            for base, (innovation_a, model_equivalent_a, effective_error_a, used_a) in amv_results.items():
+                for name, value in {
+                    'model_equivalent': model_equivalent_a,
+                    'effective_error': effective_error_a,
+                    'used': used_a,
+                }.items():
+                    amv_diagnostics[base].setdefault(name, []).append(value.detach().cpu().numpy())
+        if aircraft_traj is not None:
+            aircraft_results = _compute_aircraft_observation_diagnostics_at_time(decoded_j, aircraft_traj, j)
+            for base, (innovation_c, model_equivalent_c, effective_error_c, used_c) in aircraft_results.items():
+                for name, value in {
+                    'model_equivalent': model_equivalent_c,
+                    'effective_error': effective_error_c,
+                    'used': used_c,
+                }.items():
+                    aircraft_diagnostics[base].setdefault(name, []).append(value.detach().cpu().numpy())
+        if gpsro_traj is not None:
+            innovation_g, model_equivalent_g, effective_error_g, used_g = \
+                _compute_gpsro_observation_diagnostics_at_time(decoded_j, gpsro_traj, grid_interp, j)
+            for name, value in {
+                'model_equivalent': model_equivalent_g,
+                'effective_error': effective_error_g,
+                'used': used_g,
+            }.items():
+                gpsro_diagnostics.setdefault(name, []).append(value.detach().cpu().numpy())
 
     f_state = model_state
     decoded_prev = model.decode_state(f_state)
@@ -1590,7 +2950,22 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
             base: {name: np.stack(v, axis=0) for name, v in fields.items()}
             for base, fields in raobs_diagnostics.items()
         }
-    return obs_trajectory, model_trajectory, raobs_trajectory
+    amv_trajectory = None
+    if amv_traj is not None:
+        amv_trajectory = {
+            base: {name: np.stack(v, axis=0) for name, v in fields.items()}
+            for base, fields in amv_diagnostics.items()
+        }
+    aircraft_trajectory = None
+    if aircraft_traj is not None:
+        aircraft_trajectory = {
+            base: {name: np.stack(v, axis=0) for name, v in fields.items()}
+            for base, fields in aircraft_diagnostics.items()
+        }
+    gpsro_trajectory = None
+    if gpsro_traj is not None:
+        gpsro_trajectory = {name: np.stack(v, axis=0) for name, v in gpsro_diagnostics.items()}
+    return obs_trajectory, model_trajectory, raobs_trajectory, amv_trajectory, aircraft_trajectory, gpsro_trajectory
 
 
 # ---------------------------------------------------------------------------
@@ -1617,7 +2992,8 @@ def _apply_control_mask(state, keep_mask, ref_state, state_layout):
 
 def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif_ic,
                        psobs_traj, epoch, exp, grid_interp, print_every, interp_specs,
-                       keep_mask=None, ref_state1=None, jc_ref=None, raobs_traj=None):
+                       keep_mask=None, ref_state1=None, jc_ref=None, raobs_traj=None, amv_traj=None,
+                       aircraft_traj=None, gpsro_traj=None):
     """Latent-space 4D-Var cost function, with sub-6h observations.
 
     `latent_increment` lives in the model's latent space -- AIFS's hidden-
@@ -1666,6 +3042,17 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     needed) -- `None` (the default) assimilates surface pressure only,
     unchanged from before raobs existed.
 
+    `amv_traj` (from `get_amv`, present iff `exp['amv_enabled']` is True):
+    satellite-derived wind (box-thinned SATWND) terms, added to `J` the same
+    way, same obs-slot grid -- `None` (the default) leaves assimilation
+    unchanged from before amv existed.
+
+    `aircraft_traj` (from `get_aircraft`, present iff
+    `exp['aircraft_enabled']` is True): aircraft (AIRCAR/AIRCFT) temperature
+    and wind terms, added to `J` the same way, same obs-slot grid -- `None`
+    (the default) leaves assimilation unchanged from before aircraft
+    existed. See integrate_aircraft_obs.md.
+
     `jc_ref` (from `compute_optimal`, present iff `exp['jc_ps_weight']` is
     set): `(field, bg_p_6h, bg_p_12h, weights, factor)` -- the pressure
     field used ('sp' where the backend has it, else 'msl' -- FCN3), the
@@ -1710,6 +3097,9 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     do_print = print_every > 0 and (epoch % print_every == 0 or epoch == 1)
     Jol = [None] * n_obs
     Jraobs = [None] * n_obs if raobs_traj is not None else None
+    Jamv = [None] * n_obs if amv_traj is not None else None
+    Jaircraft = [None] * n_obs if aircraft_traj is not None else None
+    Jgpsro = [None] * n_obs if gpsro_traj is not None else None
 
     def _obs_term(j, decoded_j):
         innovation, model_equivalent, effective_error, available, used, qc_flag = \
@@ -1735,6 +3125,45 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         if do_print:
             print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): raobs J {Jt.item() if torch.is_tensor(Jt) else Jt}, "
                   f"obs used {counts}")
+        return Jt
+
+    def _amv_term(j, decoded_j):
+        results = _compute_amv_observation_diagnostics_at_time(decoded_j, amv_traj, j)
+        Jt = 0.
+        counts = {}
+        for base, (innovation, model_equivalent, effective_error, used) in results.items():
+            innov = torch.where(used, innovation, torch.zeros_like(innovation))
+            err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
+            Jt = Jt + ((innov / err) ** 2).sum()
+            counts[base] = int(used.sum().item())
+        if do_print:
+            print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): amv J {Jt.item() if torch.is_tensor(Jt) else Jt}, "
+                  f"obs used {counts}")
+        return Jt
+
+    def _aircraft_term(j, decoded_j):
+        results = _compute_aircraft_observation_diagnostics_at_time(decoded_j, aircraft_traj, j)
+        Jt = 0.
+        counts = {}
+        for base, (innovation, model_equivalent, effective_error, used) in results.items():
+            innov = torch.where(used, innovation, torch.zeros_like(innovation))
+            err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
+            Jt = Jt + ((innov / err) ** 2).sum()
+            counts[base] = int(used.sum().item())
+        if do_print:
+            print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): aircraft J {Jt.item() if torch.is_tensor(Jt) else Jt}, "
+                  f"obs used {counts}")
+        return Jt
+
+    def _gpsro_term(j, decoded_j):
+        innovation, model_equivalent, effective_error, used = \
+            _compute_gpsro_observation_diagnostics_at_time(decoded_j, gpsro_traj, grid_interp, j)
+        innov = torch.where(used, innovation, torch.zeros_like(innovation))
+        err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
+        Jt = ((innov / err) ** 2).sum()
+        if do_print:
+            print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): gpsro J {Jt.item()}, "
+                  f"{int(used.sum().item())} levels used (out of {int(gpsro_traj['n_valid'][j])} profiles)")
         return Jt
 
     jc_sp = {}
@@ -1767,11 +3196,23 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             Jol[j] = _obs_term(j, decoded_j)
             if raobs_traj is not None:
                 Jraobs[j] = _raobs_term(j, decoded_j)
+            if amv_traj is not None:
+                Jamv[j] = _amv_term(j, decoded_j)
+            if aircraft_traj is not None:
+                Jaircraft[j] = _aircraft_term(j, decoded_j)
+            if gpsro_traj is not None:
+                Jgpsro[j] = _gpsro_term(j, decoded_j)
         decoded_prev = decoded_cur
 
     J = sum(Jol)
+    if amv_traj is not None:
+        J = J + sum(Jamv)
+    if gpsro_traj is not None:
+        J = J + sum(Jgpsro)
     if raobs_traj is not None:
         J = J + sum(Jraobs)
+    if aircraft_traj is not None:
+        J = J + sum(Jaircraft)
     if jc_ref is not None:
         jc_field, bg1, bg2, jc_w, jc_factor = jc_ref
         delta = ((jc_sp[2] - bg2) - (jc_sp[1] - bg1)) / 100.0   # hPa
@@ -1787,7 +3228,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     return J, Jol_np
 
 
-def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj=None):
+def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj=None, amv_traj=None, aircraft_traj=None, gpsro_traj=None):
     """Optimize a latent-space increment against the ps obs.
 
     No backend's encoder/decoder is used to produce a corrected t=0
@@ -1945,7 +3386,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # loss surface for the fixed `increment`. No-op for AIFS.
         model._prime_noise()
         optimizer.zero_grad()
-        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, raobs_traj)
+        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, raobs_traj, amv_traj, aircraft_traj, gpsro_traj)
 
         if not torch.isfinite(loss):
             logger.warning(f'epoch={epoch}: non-finite loss ({loss.item()}), stopping optimization early')
@@ -2073,16 +3514,16 @@ def _pad_leading(arr, n_lead, fill):
     return np.concatenate([pad, arr], axis=0)
 
 
-def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif_ic, psobs_traj, save_levs, grid_interp, logger, raobs_traj=None):
+def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif_ic, psobs_traj, save_levs, grid_interp, logger, raobs_traj=None, amv_traj=None, aircraft_traj=None, gpsro_traj=None):
     interp_specs = _resolve_loss_interp_specs(model, exp)
     timestep_h = int(round(model.timestep.total_seconds() / 3600))
     dt_obs = exp['dt_obs']
     n_obs = int(psobs_traj['n_valid'].shape[0])
     step_lo = psobs_traj['step_lo'].tolist()
 
-    background, initial_traj, raobs_background = compute_ps_observation_hx(
+    background, initial_traj, raobs_background, amv_background, aircraft_background, gpsro_background = compute_ps_observation_hx(
         model, input_encoded, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=0,
-        raobs_traj=raobs_traj,
+        raobs_traj=raobs_traj, amv_traj=amv_traj, aircraft_traj=aircraft_traj, gpsro_traj=gpsro_traj,
     )
 
     # The latent analysis_state is valid at input_encoded.date + dt_verif
@@ -2093,9 +3534,9 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
     shift_hours = (analysis_state.date - input_encoded.date).total_seconds() / 3600.0
     step_start = int(round(shift_hours / timestep_h))
     j_start = sum(1 for s in step_lo if s < step_start)
-    analysis, final_traj, raobs_analysis = compute_ps_observation_hx(
+    analysis, final_traj, raobs_analysis, amv_analysis, aircraft_analysis, gpsro_analysis = compute_ps_observation_hx(
         model, analysis_state, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=step_start,
-        raobs_traj=raobs_traj,
+        raobs_traj=raobs_traj, amv_traj=amv_traj, aircraft_traj=aircraft_traj, gpsro_traj=gpsro_traj,
     )
     analysis['model_equivalent'] = _pad_leading(analysis['model_equivalent'], j_start, np.nan)
     analysis['used'] = _pad_leading(analysis['used'], j_start, False)
@@ -2104,6 +3545,17 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
         for base in raobs_traj['variables']:
             raobs_analysis[base]['model_equivalent'] = _pad_leading(raobs_analysis[base]['model_equivalent'], j_start, np.nan)
             raobs_analysis[base]['used'] = _pad_leading(raobs_analysis[base]['used'], j_start, False)
+    if amv_traj is not None:
+        for base in AMV_VARIABLE_MODEL_BASE.values():
+            amv_analysis[base]['model_equivalent'] = _pad_leading(amv_analysis[base]['model_equivalent'], j_start, np.nan)
+            amv_analysis[base]['used'] = _pad_leading(amv_analysis[base]['used'], j_start, False)
+    if aircraft_traj is not None:
+        for base in AIRCRAFT_VARIABLE_MODEL_BASE.values():
+            aircraft_analysis[base]['model_equivalent'] = _pad_leading(aircraft_analysis[base]['model_equivalent'], j_start, np.nan)
+            aircraft_analysis[base]['used'] = _pad_leading(aircraft_analysis[base]['used'], j_start, False)
+    if gpsro_traj is not None:
+        gpsro_analysis['model_equivalent'] = _pad_leading(gpsro_analysis['model_equivalent'], j_start, np.nan)
+        gpsro_analysis['used'] = _pad_leading(gpsro_analysis['used'], j_start, False)
 
     available = background['available'].astype(bool)
     used = background['used'].astype(bool)
@@ -2191,6 +3643,33 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
             exp, raobs_traj, raobs_background, raobs_analysis, valid_times, lead_hours, ofile_raobs, logger,
         )
 
+    if amv_traj is not None:
+        ofile_amv = (
+            exp['path_output'] + exp['date'] + '_amv_diagnostics_' + exp['window_name'] + 'h'
+            + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
+        )
+        save_amv_diagnostics(
+            exp, amv_traj, amv_background, amv_analysis, valid_times, lead_hours, ofile_amv, logger,
+        )
+
+    if aircraft_traj is not None:
+        ofile_aircraft = (
+            exp['path_output'] + exp['date'] + '_aircraft_diagnostics_' + exp['window_name'] + 'h'
+            + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
+        )
+        save_aircraft_diagnostics(
+            exp, aircraft_traj, aircraft_background, aircraft_analysis, valid_times, lead_hours, ofile_aircraft, logger,
+        )
+
+    if gpsro_traj is not None:
+        ofile_gpsro = (
+            exp['path_output'] + exp['date'] + '_gpsro_diagnostics_' + exp['window_name'] + 'h'
+            + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
+        )
+        save_gpsro_diagnostics(
+            exp, gpsro_traj, gpsro_background, gpsro_analysis, valid_times, lead_hours, ofile_gpsro, logger,
+        )
+
     ofile2 = exp['path_output'] + exp['date'] + '_control_forecast_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
     ofile3 = exp['path_output'] + exp['date'] + '_optimal_forecast_' + exp['window_name'] + 'h' + exp['suffix'] + '_' + str(exp['max_epoch']) + 'it.nc'
     _ = save_xr_trajectory(model, initial_traj, save_levs, ofile2, start_date=str(input_encoded.date))
@@ -2271,6 +3750,242 @@ def save_raobs_diagnostics(exp, raobs_traj, background, analysis, valid_times, l
     encoding = {name: {'zlib': True, 'complevel': 2} for name in ds.data_vars}
     ds.to_netcdf(ofile, encoding=encoding)
     logger.info('saved raobs diagnostics: ' + ofile)
+    return ofile
+
+
+_AMV_BASE_LONG_NAME = {v: k for k, v in AMV_VARIABLE_MODEL_BASE.items()}
+_AMV_BASE_UNITS = {'u': 'm s-1', 'v': 'm s-1'}
+
+
+def save_amv_diagnostics(exp, amv_traj, background, analysis, valid_times, lead_hours, ofile, logger):
+    """Save per-variable AMV (satellite-derived wind) O-B/O-A diagnostics,
+    mirroring the raobs diagnostics netCDF -- but each `superob_slot` is one
+    GSI-style box-thinned observation with its OWN pressure (no shared
+    level coordinate -- see get_amv/_amv_thin_slot), recorded as a per-
+    (time, superob_slot) field instead of a dimension coordinate.
+    Dimension/variable names keep the `superob_*` spelling from the earlier
+    composite-stencil-superobbing design (now a kept-single-ob design, GSI's
+    `ithin`/`rmesh`/`pmesh` box thinning, not an average) for diagnostics
+    continuity.
+    """
+    dt_obs = exp['dt_obs']
+    n_obs, capacity = amv_traj['lat'].shape
+    ds = xarray.Dataset(
+        coords={
+            'time': ('time', valid_times),
+            'superob_slot': ('superob_slot', np.arange(capacity, dtype=np.int32)),
+            'lead_time_hours': ('time', lead_hours),
+        },
+        attrs={
+            'title': '4D-Var satellite-derived wind (AMV, SATWND, GSI-style box-thinned) observation diagnostics',
+            'window_start': str(exp['date']),
+            'window_length_hours': int(exp['n_verif'] * exp['dt_verif']),
+            'dt_obs_hours': int(dt_obs),
+            'innovation_convention': 'observation_minus_model',
+            'forward_operator': 'fixed stencil (single kept observation) -- horizontal k-NN x log-pressure vertical bracket, see get_amv',
+            'history': 'Created by long_window_4dvar.py',
+        },
+    )
+    dims = ('time', 'superob_slot')
+    mask = amv_traj['mask'].detach().cpu().numpy().astype(bool)
+    for name, long_name, units in (
+        ('lat', 'kept observation latitude', 'degrees_north'),
+        ('lon', 'kept observation longitude', 'degrees_east'),
+        ('pressure_hpa', 'kept observation pressure', 'hPa'),
+        ('report_type', 'PREPBUFR report type (kept observation)', '1'),
+        ('satellite_id', 'satellite id (kept observation)', '1'),
+        ('component_count', 'raw wind vectors found in this thinning box (1 kept)', '1'),
+    ):
+        values = amv_traj[name].detach().cpu().numpy()
+        values = np.where(mask, values, np.nan) if np.issubdtype(values.dtype, np.floating) else values
+        ds['superob_'+name] = (dims, values)
+        ds['superob_'+name].attrs.update({'long_name': long_name, 'units': units})
+
+    for base in AMV_VARIABLE_MODEL_BASE.values():
+        long_name = _AMV_BASE_LONG_NAME[base]
+        units = _AMV_BASE_UNITS[base]
+        observation = amv_traj[{'u': 'u_component_of_wind', 'v': 'v_component_of_wind'}[base]].detach().cpu().numpy().astype(np.float32)
+        background_hx = background[base]['model_equivalent'].astype(np.float32)
+        analysis_hx = analysis[base]['model_equivalent'].astype(np.float32)
+        background_used = background[base]['used'].astype(bool)
+        analysis_used = analysis[base]['used'].astype(bool)
+
+        ds[base+'_observation'] = (dims, np.where(mask, observation, np.nan))
+        ds[base+'_observation'].attrs.update({'long_name': long_name+' observation (kept observation, GSI-style box-thinned)', 'units': units})
+        ds[base+'_background'] = (dims, np.where(mask, background_hx, np.nan))
+        ds[base+'_background'].attrs.update({'long_name': long_name+' background model equivalent H(x_b)', 'units': units})
+        ds[base+'_analysis'] = (dims, np.where(mask, analysis_hx, np.nan))
+        ds[base+'_analysis'].attrs.update({'long_name': long_name+' analysis model equivalent H(x_a)', 'units': units})
+        ds[base+'_omb'] = (dims, np.where(mask, observation - background_hx, np.nan))
+        ds[base+'_omb'].attrs.update({'long_name': long_name+' observation minus background', 'units': units})
+        ds[base+'_oma'] = (dims, np.where(mask, observation - analysis_hx, np.nan))
+        ds[base+'_oma'].attrs.update({'long_name': long_name+' observation minus analysis', 'units': units})
+        ds[base+'_used'] = (dims, background_used.astype(np.int8))
+        ds[base+'_used'].attrs.update({'long_name': long_name+' observation used in the background loss', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+        ds[base+'_analysis_used'] = (dims, analysis_used.astype(np.int8))
+        ds[base+'_analysis_used'].attrs.update({'long_name': long_name+' observation used when reevaluated at the analysis', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+
+    encoding = {name: {'zlib': True, 'complevel': 2} for name in ds.data_vars}
+    ds.to_netcdf(ofile, encoding=encoding)
+    logger.info('saved amv diagnostics: ' + ofile)
+    return ofile
+
+
+_AIRCRAFT_BASE_LONG_NAME = {'t': 'temperature', 'u': 'eastward wind', 'v': 'northward wind'}
+_AIRCRAFT_BASE_UNITS = {'t': 'K', 'u': 'm s-1', 'v': 'm s-1'}
+# which aircraft_traj sub-stream ('t' or 'uv') carries each base's kept
+# observation/stencil fields -- see get_aircraft's module comment.
+_AIRCRAFT_BASE_SUBSTREAM = {'t': 't', 'u': 'uv', 'v': 'uv'}
+
+
+def save_aircraft_diagnostics(exp, aircraft_traj, background, analysis, valid_times, lead_hours, ofile, logger):
+    """Save per-variable aircraft (AIRCAR/AIRCFT) O-B/O-A diagnostics,
+    mirroring `save_amv_diagnostics` -- but with TWO independent slot
+    dimensions (`t_slot`, `uv_slot`), one per thinned sub-stream (see
+    get_aircraft's module comment for why temperature and wind are thinned
+    independently), each carrying its own kept observation's lat/lon/
+    pressure/report_type/aircraft_id/component_count.
+    """
+    dt_obs = exp['dt_obs']
+    n_obs, t_capacity = aircraft_traj['t']['lat'].shape
+    _, uv_capacity = aircraft_traj['uv']['lat'].shape
+    ds = xarray.Dataset(
+        coords={
+            'time': ('time', valid_times),
+            't_slot': ('t_slot', np.arange(t_capacity, dtype=np.int32)),
+            'uv_slot': ('uv_slot', np.arange(uv_capacity, dtype=np.int32)),
+            'lead_time_hours': ('time', lead_hours),
+        },
+        attrs={
+            'title': '4D-Var aircraft (AIRCAR/AIRCFT, GSI-style box-thinned) observation diagnostics',
+            'window_start': str(exp['date']),
+            'window_length_hours': int(exp['n_verif'] * exp['dt_verif']),
+            'dt_obs_hours': int(dt_obs),
+            'innovation_convention': 'observation_minus_model',
+            'forward_operator': 'fixed stencil (single kept observation) -- horizontal k-NN x log-pressure vertical bracket, see get_aircraft',
+            'note': 'temperature (t_slot) and wind (uv_slot) are independently thinned sub-streams -- see get_aircraft',
+            'history': 'Created by long_window_4dvar.py',
+        },
+    )
+    for slot_name, sub_key in (('t_slot', 't'), ('uv_slot', 'uv')):
+        dims = ('time', slot_name)
+        sub = aircraft_traj[sub_key]
+        mask = sub['mask'].detach().cpu().numpy().astype(bool)
+        for name, long_name, units in (
+            ('lat', 'kept observation latitude', 'degrees_north'),
+            ('lon', 'kept observation longitude', 'degrees_east'),
+            ('pressure_hpa', 'kept observation pressure', 'hPa'),
+            ('report_type', 'PREPBUFR report type (kept observation)', '1'),
+            ('component_count', 'raw reports found in this thinning box (1 kept)', '1'),
+        ):
+            values = sub[name].detach().cpu().numpy()
+            values = np.where(mask, values, np.nan) if np.issubdtype(values.dtype, np.floating) else values
+            ds[sub_key+'_'+name] = (dims, values)
+            ds[sub_key+'_'+name].attrs.update({'long_name': long_name, 'units': units})
+        aircraft_id = np.where(mask, sub['aircraft_id'], '')
+        ds[sub_key+'_aircraft_id'] = (dims, aircraft_id.astype(str))
+        ds[sub_key+'_aircraft_id'].attrs.update({
+            'long_name': 'kept observation aircraft identifier (ACID) -- metadata only, not used for '
+                          'thinning/grouping or any bias correction in this pass',
+        })
+
+    for base in AIRCRAFT_VARIABLE_MODEL_BASE.values():
+        sub_key = _AIRCRAFT_BASE_SUBSTREAM[base]
+        slot_name = sub_key + '_slot'
+        dims = ('time', slot_name)
+        sub = aircraft_traj[sub_key]
+        mask = sub['mask'].detach().cpu().numpy().astype(bool)
+        obs_key = {v: k for k, v in AIRCRAFT_VARIABLE_MODEL_BASE.items()}[base]
+        long_name = _AIRCRAFT_BASE_LONG_NAME[base]
+        units = _AIRCRAFT_BASE_UNITS[base]
+        observation = sub[obs_key].detach().cpu().numpy().astype(np.float32)
+        background_hx = background[base]['model_equivalent'].astype(np.float32)
+        analysis_hx = analysis[base]['model_equivalent'].astype(np.float32)
+        background_used = background[base]['used'].astype(bool)
+        analysis_used = analysis[base]['used'].astype(bool)
+
+        ds[base+'_observation'] = (dims, np.where(mask, observation, np.nan))
+        ds[base+'_observation'].attrs.update({'long_name': long_name+' observation (kept observation, GSI-style box-thinned)', 'units': units})
+        ds[base+'_background'] = (dims, np.where(mask, background_hx, np.nan))
+        ds[base+'_background'].attrs.update({'long_name': long_name+' background model equivalent H(x_b)', 'units': units})
+        ds[base+'_analysis'] = (dims, np.where(mask, analysis_hx, np.nan))
+        ds[base+'_analysis'].attrs.update({'long_name': long_name+' analysis model equivalent H(x_a)', 'units': units})
+        ds[base+'_omb'] = (dims, np.where(mask, observation - background_hx, np.nan))
+        ds[base+'_omb'].attrs.update({'long_name': long_name+' observation minus background', 'units': units})
+        ds[base+'_oma'] = (dims, np.where(mask, observation - analysis_hx, np.nan))
+        ds[base+'_oma'].attrs.update({'long_name': long_name+' observation minus analysis', 'units': units})
+        ds[base+'_used'] = (dims, background_used.astype(np.int8))
+        ds[base+'_used'].attrs.update({'long_name': long_name+' observation used in the background loss', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+        ds[base+'_analysis_used'] = (dims, analysis_used.astype(np.int8))
+        ds[base+'_analysis_used'].attrs.update({'long_name': long_name+' observation used when reevaluated at the analysis', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+
+    encoding = {name: {'zlib': True, 'complevel': 2} for name in ds.data_vars}
+    ds.to_netcdf(ofile, encoding=encoding)
+    logger.info('saved aircraft diagnostics: ' + ofile)
+    return ofile
+
+
+def save_gpsro_diagnostics(exp, gpsro_traj, background, analysis, valid_times, lead_hours, ofile, logger):
+    """Save GPS-RO bending-angle O-B/O-A diagnostics on `(time, profile_slot,
+    level_slot)` -- both are plain indices with no cross-time identity,
+    same convention as psobs's `observation_slot`."""
+    dt_obs = exp['dt_obs']
+    n_obs, profile_capacity, level_capacity = gpsro_traj['mask'].shape
+    ds = xarray.Dataset(
+        coords={
+            'time': ('time', valid_times),
+            'profile_slot': ('profile_slot', np.arange(profile_capacity, dtype=np.int32)),
+            'level_slot': ('level_slot', np.arange(level_capacity, dtype=np.int32)),
+            'lead_time_hours': ('time', lead_hours),
+        },
+        attrs={
+            'title': '4D-Var GPS radio-occultation bending-angle observation diagnostics',
+            'window_start': str(exp['date']),
+            'window_length_hours': int(exp['n_verif'] * exp['dt_verif']),
+            'dt_obs_hours': int(dt_obs),
+            'innovation_convention': 'observation_minus_model',
+            'forward_operator': gpsro_operator.GPSRO_OPERATOR_VERSION+' (1D Abel transform)',
+            'history': 'Created by long_window_4dvar.py',
+        },
+    )
+    mask = gpsro_traj['mask'].detach().cpu().numpy().astype(bool)
+    level_dims = ('time', 'profile_slot', 'level_slot')
+    for name, dims, long_name, units in (
+        ('latitude', ('time', 'profile_slot', 'level_slot'), 'tangent-point latitude', 'degrees_north'),
+        ('longitude', ('time', 'profile_slot', 'level_slot'), 'tangent-point longitude', 'degrees_east'),
+        ('impact_height_m', level_dims, 'impact height', 'm'),
+        ('satellite_id', ('time', 'profile_slot'), 'satellite id', '1'),
+    ):
+        values = gpsro_traj[name].detach().cpu().numpy()
+        ds['gpsro_'+name] = (dims, values)
+        ds['gpsro_'+name].attrs.update({'long_name': long_name, 'units': units})
+
+    observation = gpsro_traj['bending_angle_rad'].detach().cpu().numpy().astype(np.float32)
+    background_hx = background['model_equivalent'].astype(np.float32)
+    analysis_hx = analysis['model_equivalent'].astype(np.float32)
+    background_used = background['used'].astype(bool)
+    analysis_used = analysis['used'].astype(bool)
+
+    ds['bending_angle_observation'] = (level_dims, np.where(mask, observation, np.nan))
+    ds['bending_angle_observation'].attrs.update({'long_name': 'observed bending angle', 'units': 'rad'})
+    ds['bending_angle_background'] = (level_dims, np.where(mask, background_hx, np.nan))
+    ds['bending_angle_background'].attrs.update({'long_name': 'background model equivalent H(x_b)', 'units': 'rad'})
+    ds['bending_angle_analysis'] = (level_dims, np.where(mask, analysis_hx, np.nan))
+    ds['bending_angle_analysis'].attrs.update({'long_name': 'analysis model equivalent H(x_a)', 'units': 'rad'})
+    ds['bending_angle_omb'] = (level_dims, np.where(mask, observation - background_hx, np.nan))
+    ds['bending_angle_omb'].attrs.update({'long_name': 'observation minus background', 'units': 'rad'})
+    ds['bending_angle_oma'] = (level_dims, np.where(mask, observation - analysis_hx, np.nan))
+    ds['bending_angle_oma'].attrs.update({'long_name': 'observation minus analysis', 'units': 'rad'})
+    ds['bending_angle_error_std'] = (level_dims, np.where(mask, gpsro_traj['error_std_rad'].detach().cpu().numpy(), np.nan))
+    ds['bending_angle_error_std'].attrs.update({'long_name': 'assigned observation-error standard deviation', 'units': 'rad'})
+    ds['bending_angle_used'] = (level_dims, background_used.astype(np.int8))
+    ds['bending_angle_used'].attrs.update({'long_name': 'observation used in the background loss', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+    ds['bending_angle_analysis_used'] = (level_dims, analysis_used.astype(np.int8))
+    ds['bending_angle_analysis_used'].attrs.update({'long_name': 'observation used when reevaluated at the analysis', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+
+    encoding = {name: {'zlib': True, 'complevel': 2} for name in ds.data_vars}
+    ds.to_netcdf(ofile, encoding=encoding)
+    logger.info('saved gpsro diagnostics: ' + ofile)
     return ofile
 
 

@@ -1,0 +1,160 @@
+{
+  "description": "Static aircraft temperature bias-correction table (K), pressure bin x region, mean O-B (observation minus background/first-guess, NOT bias-corrected) from a real, independent GSI operational archive -- see build_aircraft_temperature_bias_table.py and integrate_aircraft_obs.md for how/why. Subtract this value from the raw observed temperature before assimilation (observation = raw_observation - table_value).",
+  "source": "2022-01-01 to 2022-01-19 real GDAS diag_conv_t_ges ncdiag (76 cycles, aircraft itype 130/131/133/134/135)",
+  "innovation_convention": "observation_minus_background (OmF, unadjusted)",
+  "pressure_bin_edges_hpa": [
+    1000,
+    850,
+    700,
+    500,
+    400,
+    300,
+    250,
+    200,
+    150,
+    100,
+    50
+  ],
+  "table": {
+    "850-1000": {
+      "NH": {
+        "n": 1182779,
+        "mean_omb_k": 0.39166826009750366
+      },
+      "Tropics": {
+        "n": 50413,
+        "mean_omb_k": 0.6331456899642944
+      },
+      "SH": {
+        "n": 41207,
+        "mean_omb_k": 0.0824325829744339
+      }
+    },
+    "700-850": {
+      "NH": {
+        "n": 803747,
+        "mean_omb_k": 0.22387787699699402
+      },
+      "Tropics": {
+        "n": 36380,
+        "mean_omb_k": 0.36377382278442383
+      },
+      "SH": {
+        "n": 16665,
+        "mean_omb_k": 0.0065425969660282135
+      }
+    },
+    "500-700": {
+      "NH": {
+        "n": 1226638,
+        "mean_omb_k": 0.13379642367362976
+      },
+      "Tropics": {
+        "n": 52087,
+        "mean_omb_k": 0.4749961495399475
+      },
+      "SH": {
+        "n": 20427,
+        "mean_omb_k": 0.016789350658655167
+      }
+    },
+    "400-500": {
+      "NH": {
+        "n": 547113,
+        "mean_omb_k": 0.06714560836553574
+      },
+      "Tropics": {
+        "n": 19559,
+        "mean_omb_k": 0.04786769300699234
+      },
+      "SH": {
+        "n": 7478,
+        "mean_omb_k": -0.17095398902893066
+      }
+    },
+    "300-400": {
+      "NH": {
+        "n": 523727,
+        "mean_omb_k": 0.046256814152002335
+      },
+      "Tropics": {
+        "n": 14000,
+        "mean_omb_k": 0.18464295566082
+      },
+      "SH": {
+        "n": 5326,
+        "mean_omb_k": -0.022866813465952873
+      }
+    },
+    "250-300": {
+      "NH": {
+        "n": 498297,
+        "mean_omb_k": 0.15133942663669586
+      },
+      "Tropics": {
+        "n": 22246,
+        "mean_omb_k": 0.6740748286247253
+      },
+      "SH": {
+        "n": 5670,
+        "mean_omb_k": 0.38934117555618286
+      }
+    },
+    "200-250": {
+      "NH": {
+        "n": 1582404,
+        "mean_omb_k": 0.16861243546009064
+      },
+      "Tropics": {
+        "n": 68368,
+        "mean_omb_k": 0.7281192541122437
+      },
+      "SH": {
+        "n": 19312,
+        "mean_omb_k": 0.554641842842102
+      }
+    },
+    "150-200": {
+      "NH": {
+        "n": 384204,
+        "mean_omb_k": 0.34196799993515015
+      },
+      "Tropics": {
+        "n": 23775,
+        "mean_omb_k": 0.8105137944221497
+      },
+      "SH": {
+        "n": 16561,
+        "mean_omb_k": 0.7468193173408508
+      }
+    },
+    "100-150": {
+      "NH": {
+        "n": 659,
+        "mean_omb_k": 1.0238089561462402
+      },
+      "Tropics": {
+        "n": 233,
+        "mean_omb_k": 1.341815710067749
+      },
+      "SH": {
+        "n": 0,
+        "mean_omb_k": null
+      }
+    },
+    "50-100": {
+      "NH": {
+        "n": 0,
+        "mean_omb_k": null
+      },
+      "Tropics": {
+        "n": 0,
+        "mean_omb_k": null
+      },
+      "SH": {
+        "n": 0,
+        "mean_omb_k": null
+      }
+    }
+  }
+}

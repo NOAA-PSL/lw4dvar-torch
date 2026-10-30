@@ -393,7 +393,18 @@ class ACE2Model(forecast_model.LatentForecastModel):
             lo = (k - 1).clamp(0, nlay - 1)
             hi = k.clamp(0, nlay - 1)
             x_lo, x_hi = torch.gather(lnp_mid, 0, lo), torch.gather(lnp_mid, 0, hi)
-            w = torch.where(hi > lo, (lnp_t - x_lo) / (x_hi - x_lo), torch.zeros_like(lnp_t))
+            # hi == lo (target level at/beyond the native layer-midpoint
+            # range) makes this branch's own division 0/0 -- torch.where
+            # masks the VALUE correctly, but 0 * inf = NaN still
+            # contaminates the GRADIENT unless the denominator itself is
+            # guarded before dividing (same finite-forward/non-finite-
+            # local-gradient pattern as gpsro_operator.py's masked-column
+            # substitution -- see integrate_gpsro.md "NaN-gradient-
+            # contamination fix"; found here 2026-10-21 when raobs/amv
+            # became the first observation types to ever backprop through
+            # this derivation -- psobs only reads native-level fields).
+            safe_denom = torch.where(hi > lo, x_hi - x_lo, torch.ones_like(x_hi))
+            w = torch.where(hi > lo, (lnp_t - x_lo) / safe_denom, torch.zeros_like(lnp_t))
             for b in need:
                 f = flat[self._layer_cols[_DERIVED_FROM[b]]]
                 v = (1 - w) * torch.gather(f, 0, lo) + w * torch.gather(f, 0, hi)

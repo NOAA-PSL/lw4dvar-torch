@@ -1,0 +1,20 @@
+# Aircraft temperature sensitivity tests (2026-10-23 to 2026-10-26)
+
+All derived from `config_test_ace2_ps_raobs_aircraft.yml` /
+`run_ace2_ps_raobs_aircraft.sh` (own `rpath`/`exp_name` aside).
+
+- **t1** (`config_test_ace2_ps_raobs_aircraft_t1.yml` /
+  `run_ace2_ps_raobs_aircraft_t1.sh`): aircraft temperature turned off --
+  wind only.
+- **t2** (`config_test_ace2_ps_raobs_aircraft_t2.yml` /
+  `run_ace2_ps_raobs_aircraft_t2.sh`): aircraft temperature bias correction
+  turned on, using the 2022-based table (`aircraft_temperature_bias_table.json`)
+  -- see `integrate_aircraft_obs.md`'s "Static aircraft temperature bias
+  correction" section.
+- **t3** (`config_test_ace2_ps_raobs_aircraft_t3.yml` /
+  `run_ace2_ps_raobs_aircraft_t3.sh`): same as t2, but using the 2015-native
+  table (`aircraft_temperature_bias_table_2015.json`, built from 123 real
+  2015-01 GSI cnvstat cycles) instead. The two tables agree in sign almost
+  everywhere but 2015 runs smaller in magnitude, and SH's lower/mid-
+  troposphere flips sign between the two years -- t3 tests whether that
+  difference matters.

@@ -210,7 +210,7 @@ backends/sfno/ngc_cache/
 # user-trained checkpoint (not from ecmwf's HF repo), referenced via a
 # symlink to its real location on scratch (see
 # integrate_aifs2-1deg-v1.0_backend.md) -- not portable/committable.
-backends/aifs/aifs2-1.0deg-v1.0/
+#backends/aifs/aifs2-1.0deg-v1.0/
 
 # per-experiment config symlink + run artifacts (SLURM logs, cached ICs,
 # per-run output dirs) -- config.yml.template is the tracked, real config

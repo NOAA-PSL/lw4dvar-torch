@@ -112,6 +112,256 @@ exp:
       # integer only if you need a stable shape across configs/runs.
       #station_capacity: 1000
 
+    # --- amv (satellite-derived wind) settings -- omit this whole block (the
+    # default) or leave `enabled: False` to assimilate without it, unchanged.
+    # Reads the SAME normalized PREPBUFR parquet archive's 'SATWND' class
+    # (GOES/JMA/EUMETSAT/MODIS cloud-drift and water-vapor winds, already
+    # merged/QC'd into the operational PREPBUFR feed) -- NOT the separate
+    # raw-BUFR GOES-16 `amv_parquet` archive (a future, NOT-yet-integrated
+    # stream; see integrate_amv_satwnd.md for why and what adding it would
+    # take). Only model_backend aifs/aurora are supported so far (see
+    # AMV_SUPPORTED_BACKENDS) -- the 'u'/'v' base-name forward operator has
+    # only been exercised for those two.
+    #
+    # Raw SATWND wind vectors are heavily spatially/vertically correlated
+    # (adjacent satellite pixels) -- they are ALWAYS thinned (GSI-style
+    # horizontal x vertical mesh box, keeping exactly ONE observation per
+    # box -- ported from GSI's own `read_satwnd.f90`/`setupw.f90`, see
+    # integrate_amv_satwnd.md "GSI comparison" for why composite-stencil
+    # superobbing was replaced with this) before entering the loss; there
+    # is no "assimilate raw" option.
+    amv:
+      enabled: False
+      #path: same as observations.psobs.path by default -- the same parquet archive, SATWND class
+      #prepbufr_classes: [SATWND]
+      #time_tolerance_hours: 1.0  # tighter than psobs/raobs's default -- satellite reports are time-tagged precisely
+      #report_types: null  # null = every SATWND report type; set a list to restrict the network
+      #quality_mark_max: 3
+      # Pressure range (hPa) of winds to read, intersected with the model's
+      # own pressure-level range at run time (so this rarely needs changing).
+      #pressure_range_hpa: [1000., 50.]
+      #use_source_error: True  # True: use each report's own wind_error_ms instead of fallback_error_std_ms
+      #fallback_error_std_ms: 7.0
+      # Satellite ids to EXCLUDE from this SATWND stream -- for later use
+      # once a second, raw GOES-16 `amv_parquet` stream is added alongside
+      # this one, to avoid double-counting the same real observations (see
+      # integrate_amv_satwnd.md). Empty by default; harmless to leave empty
+      # with no second stream configured.
+      #exclude_satellite_ids: []
+      # Thinning-box grouping keys, in addition to the horizontal/vertical
+      # mesh cell -- both default True, so distinct report types/satellites
+      # never compete for the same box even if co-located.
+      #separate_report_types: True
+      #separate_satellite_ids: True
+      # GSI-style thinning mesh (ported from `read_satwnd.f90`'s own
+      # `rmesh`/`pmesh`, INDEPENDENT of the model's native grid resolution):
+      # at most one observation is kept per (rmesh_km horizontal x
+      # pmesh_hpa vertical [x report_type] [x satellite_id]) box -- the one
+      # with the lowest GSI-style "badness" score (closest to the
+      # verification time, tie-broken by assigned error -- GSI itself also
+      # uses the AMV producer's own quality-indicator/expected-error
+      # fields here, which this repo's parquet archive doesn't carry).
+      # 120 km matches the conventional-data example in the GSI User's
+      # Guide (ithin/rmesh/pmesh, section 3.4.7); 50 hPa is a reasonable
+      # starting point, not a confirmed operational SATWND value -- tune
+      # both against your model's native grid/level spacing.
+      #rmesh_km: 120.0
+      #pmesh_hpa: 50.0
+      # vertical_bin_mode: 'pmesh' (default, above) or 'nearest_level' --
+      # bins by the model's own nearest pressure level instead of a
+      # fixed-width pmesh_hpa mesh. On a model with few real vertical
+      # degrees of freedom (e.g. ACE2's 8 native layers vs. a uniform
+      # pmesh_hpa mesh which doesn't know that), 'nearest_level' both caps
+      # the vertical bin count at the model's own level count and
+      # guarantees the kept observation is closer to its assigned level
+      # than to any other, by construction -- pmesh_hpa is unused in this
+      # mode. See integrate_amv_satwnd.md "Vertical thinning tied to model
+      # levels".
+      #vertical_bin_mode: pmesh
+      # Floor on the per-observation assigned error (source or fallback).
+      #error_floor_ms: 4.0
+      # Background gross check (GSI's `setupw.f90`): reject an observation
+      # whose |O-B| exceeds background_check_stddev * clip(error,
+      # error_min_ms, error_max_ms), evaluated at the CURRENT state every
+      # loss call. error_min_ms/error_max_ms default to no clamping (plain
+      # |O-B|/error, same convention as raobs_q_bg_check/
+      # gpsro_background_check_stddev) -- set both to adopt GSI's full
+      # clamped-ratio form. Set background_check_stddev: 0 (or null) to
+      # disable the gross check entirely.
+      #background_check_stddev: 4.0
+      #error_min_ms: null
+      #error_max_ms: null
+      # Fixed per-slot capacity (padding size) -- by default (this key
+      # omitted) sized to the largest slot actually read. Thinning keeps
+      # far fewer observations than the old superobbing design, so this
+      # can be much smaller than before.
+      #capacity: 100000
+
+    # --- aircraft (AIRCAR/AIRCFT temperature + wind) settings -- omit this
+    # whole block (the default) or leave `enabled: False` to assimilate
+    # without it, unchanged. Reads the SAME normalized PREPBUFR parquet
+    # archive's 'AIRCAR'/'AIRCFT' classes. Only model_backend aifs/aurora/
+    # ace2 are supported so far (see AIRCRAFT_SUPPORTED_BACKENDS) -- the
+    # 't'/'u'/'v' base-name forward operator reuses the same decode path
+    # already exercised for raobs/amv on those three. See
+    # integrate_aircraft_obs.md.
+    #
+    # Structurally identical to amv (vectorized read, native-pressure point
+    # stencil, GSI-style box thinning -- always thinned, no "assimilate
+    # raw" option) EXCEPT temperature and wind are thinned as TWO
+    # INDEPENDENT sub-streams: the archive reports AIRCAR/AIRCFT
+    # temperature and wind as mutually exclusive rows (report_type 133 =
+    # temperature-only mass report, 233 = wind-only report, for the SAME
+    # physical observation -- confirmed directly, zero rows carry both), so
+    # a single shared thinning box keyed across all three variables would
+    # otherwise silently keep only a temperature OR a wind row per box.
+    # GSI's own convinfo treats these as separate thinning types for
+    # exactly this reason.
+    aircraft:
+      enabled: False
+      #path: same as observations.psobs.path by default -- the same parquet archive, AIRCAR/AIRCFT classes
+      #prepbufr_classes: [AIRCAR, AIRCFT]
+      #time_tolerance_hours: 1.0  # tighter than psobs/raobs's default, same as amv -- high-rate reports are time-tagged precisely
+      #report_types: null  # null = every AIRCAR/AIRCFT report type; set a list to restrict the network
+      #quality_mark_max: 3
+      # Pressure range (hPa) read, intersected with the model's own
+      # pressure-level range at run time (so this rarely needs changing).
+      #pressure_range_hpa: [1000., 50.]
+      #use_source_error: True  # True: use each report's own temperature_error_c/wind_error_ms instead of the fallback_error_std_* below
+      #fallback_error_std_t_k: 1.5
+      #fallback_error_std_ms: 3.5
+      # Thinning-box grouping key, in addition to the horizontal/vertical
+      # mesh cell -- default True, same convention as amv's
+      # separate_report_types (no separate_satellite_ids analogue here --
+      # aircraft has no satellite identity).
+      #separate_report_types: True
+      # GSI-style thinning mesh (same scheme/defaults as amv -- see amv's
+      # comment above), applied IDENTICALLY to both the temperature and
+      # wind sub-streams (one thinning policy, not two).
+      #rmesh_km: 120.0
+      #pmesh_hpa: 50.0
+      #vertical_bin_mode: pmesh  # or: nearest_level -- see amv's comment above
+      # Floor on the per-observation assigned error (source or fallback),
+      # per sub-stream (different units).
+      #error_floor_t_k: 0.5
+      #error_floor_ms: 2.0
+      # Background gross check (same ported GSI form as amv/raobs/gpsro),
+      # evaluated at the CURRENT state every loss call, applied identically
+      # to both sub-streams; error_min/max clamp bounds are per-sub-stream
+      # (temperature K vs wind m/s). Set background_check_stddev: 0 (or
+      # null) to disable the gross check entirely.
+      #background_check_stddev: 4.0
+      #error_min_t_k: null
+      #error_max_t_k: null
+      #error_min_ms: null
+      #error_max_ms: null
+      # Fixed per-slot capacity (padding size), shared by both sub-streams
+      # -- by default (this key omitted) each sub-stream is independently
+      # sized to its own largest slot actually read.
+      #capacity: 100000
+      # Static pressure x region temperature bias correction (default
+      # False -- opt in). NOT per-tail: per-tail would need either this
+      # repo's own ACE2 cycling to estimate online (which has its own
+      # known issues, so this deliberately doesn't use it) or an external
+      # GSI run's tail numbers, which share zero overlap with this
+      # archive's own tail IDs (checked directly -- every PREPBUFR
+      # extraction appears to independently anonymize tail numbers, not
+      # just a fleet-turnover effect). Instead this subtracts a static
+      # (pressure bin, NH/Tropics/SH region) mean O-B looked up from
+      # `bias_correction_table`, built once from a real, independent GSI
+      # operational archive -- see build_aircraft_temperature_bias_table.py
+      # and integrate_aircraft_obs.md. Wind is not corrected (same scope
+      # as GSI's own aircraft_t_bc; a real-data check found no systematic
+      # per-tail wind bias to correct, unlike temperature).
+      #bias_correction_enabled: False
+      #bias_correction_table: aircraft_temperature_bias_table.json  # repo-root-relative default
+
+    # --- gpsro (GPS radio-occultation bending angle) settings -- omit this
+    # whole block (the default) or leave `enabled: False` to assimilate
+    # without it, unchanged. Reads a DIFFERENT, Hive-partitioned archive
+    # (`<path>/year=YYYY/month=MM/day=DD/*.parquet`, one flat
+    # candidate-bending-angle-table file per cycle) -- NOT the PREPBUFR
+    # archive psobs/raobs/amv share, so `path` is required with no
+    # fallback. Only model_backend aifs/aurora are supported so far (see
+    # GPSRO_SUPPORTED_BACKENDS) -- the 't'/'q'/'z' forward operator (a
+    # differentiable 1D Abel-transform bending-angle simulator, ported and
+    # cross-validated against the `long-window-4dvar` reference repo's
+    # JAX implementation) has only been exercised for those two. See
+    # integrate_gpsro.md.
+    gpsro:
+      enabled: False
+      path: '/path/to/gpsro_parquet'
+      #time_tolerance_hours: 1.5
+      # Impact-height window (km) read -- intersected with whatever the
+      # forward operator can actually support: the model's own vertical
+      # extent PLUS top_extrapolation_km below (AIFS-single-2.0's top is
+      # ~31 km; the default 40 km upper bound here is covered by the
+      # default 10 km extrapolation -- see integrate_gpsro.md).
+      #impact_height_range_km: [6., 40.]
+      # Vertical thinning: keep at most one level per this spacing (m),
+      # walking bottom-to-top. GSI itself does NOT thin GPSRO (confirmed
+      # directly against read_gps.f90/setupbend.f90) -- but GSI's own
+      # forecast models carry 60-150+ vertical levels, so an unthinned
+      # profile still has real degrees of freedom to fit against. This
+      # repo's 14-level model backends (AIFS-single-2.0: top 10 hPa) do
+      # not: removing this thinning (tried 2026-10-20) inflated gpsro's
+      # effective weight in the loss by ~(levels-per-profile / 14),
+      # confirmed in a real run (gpsro's Jo grew ~6-7x and dominated the
+      # total loss over raobs/amv) -- see integrate_gpsro.md "GSI
+      # comparison". Kept at the original 1000 m default.
+      #impact_height_spacing_m: 1000.
+      #maximum_bending_angle_rad: 0.1  # read-time sanity bound
+      #quality_flags_disqualifying_mask: 0  # nonzero: reject levels whose source QFRO bits intersect this mask
+      #minimum_percent_confidence: null  # null: no producer-confidence floor
+      # Observation-error model -- 'ecmwf_seed_v1' (the only one
+      # implemented so far) is a simple fractional-plus-floor analytic
+      # placeholder, NOT a reviewed/Desroziers-diagnosed profile (unlike
+      # raobs's q_error_g_kg table -- see integrate_gpsro.md for why this
+      # starts simpler).
+      #error_model: {name: ecmwf_seed_v1, fractional_at_0_km: 0.20, fractional_at_10_km: 0.01, absolute_floor_rad: 3.e-6}
+      # Simulated-bending-angle sanity bound and background check,
+      # evaluated at the CURRENT state every loss call (same convention as
+      # raobs's q_bg_check -- simpler than GSI's frozen,
+      # once-before-optimization version; see integrate_gpsro.md). null
+      # turns the background check off.
+      #maximum_simulated_bending_angle_rad: 0.05
+      #background_check_stddev: 4.0
+      # GSI-style clamped-ratio gross check (setupbend.f90): ratio =
+      # |O-B| / clip(error, error_min_rad, error_max_rad) >
+      # background_check_stddev. Both null (default) means no clamping --
+      # plain |O-B|/error, this repo's prior convention. Set both to adopt
+      # GSI's full clamped-ratio form.
+      #error_min_rad: null
+      #error_max_rad: null
+      # Model-top extension (ported from GSI's setupbend.f90, which
+      # extends its own discrete grid the equivalent way, via nsig_ext):
+      # trust the top model layer's own exponential-decay scale height up
+      # to this many km ABOVE the model's native top refractional height,
+      # instead of rejecting any tangent point above it outright. No
+      # operator-math change needed -- exponential_top_bending_angle
+      # already extrapolates correctly that far; this only widens how far
+      # the validity mask is willing to trust it. Default 10 km reclaims
+      # AIFS-single-2.0's ~31-40 km band (previously ~0% used, confirmed
+      # in a real run's diagnostics) that impact_height_range_km's default
+      # upper bound already reads but the old validity check discarded.
+      #top_extrapolation_km: 10.0
+      # Super-refraction (SR) screen, a simplified port of GSI's
+      # setupbend.f90 SR check (reject-only, no ray relocation above a
+      # detected SR layer -- see integrate_gpsro.md "GSI comparison"):
+      # reject a ray below sr_screen_height_km whose column has, at or
+      # below its own impact height, a layer with |refractivity gradient|
+      # >= sr_detection_fraction * critical_gradient_n_per_km. Defaults
+      # are GSI's own values (157 N-units/km is the literature critical
+      # gradient at which a ray becomes trapped/ducted). Set
+      # critical_gradient_n_per_km to null/0 to disable this check.
+      #critical_gradient_n_per_km: 157.0
+      #sr_detection_fraction: 0.75
+      #sr_screen_height_km: 5.0
+      # Fixed per-slot (profile, level) capacities -- by default (both keys
+      # omitted) sized to the largest slot actually read.
+      #profile_capacity: 1000
+      #level_capacity: 60
+
   ic_suffix: '96h_100it' # pkl file info for restart
   sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
   n_init: 24 # number of DA cycles

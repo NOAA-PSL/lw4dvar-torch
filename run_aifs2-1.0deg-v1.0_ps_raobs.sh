@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J lw4dvar_aifs2_1p0deg_v1p0_ps_raobs
-#SBATCH -o lw4dvar_aifs2_1p0deg_v1p0_ps_raobs_%j.out
-#SBATCH -e lw4dvar_aifs2_1p0deg_v1p0_ps_raobs_%j.out
+#SBATCH -o logs/lw4dvar_aifs2_1p0deg_v1p0_ps_raobs_%j.out
+#SBATCH -e logs/lw4dvar_aifs2_1p0deg_v1p0_ps_raobs_%j.out
 #SBATCH --account=gpu-ai4wp
-#SBATCH -t 12:20:00
+#SBATCH -t 06:10:00
 #SBATCH --partition=u1-h100
 #SBATCH --gres=gpu:h100:1
 #SBATCH --mem=96g
@@ -24,14 +24,13 @@ module load cuda/12.8.1
 # aifs2-1.0deg-v1.0-requirements.txt/aifs2-1.0deg-v1.0-spec.txt).
 source /scratch4/BMC/gsienkf/Bo.Huang/extApps/miniconda3/bin/activate lwaifs2
 
-# Step 2 of integrate_prepbufr_obs.md: psobs + raobs (temperature/u/v), both
-# read from the normalized PREPBUFR parquet archive via
-# config_test_aifs2-1.0deg-v1.0_ps_raobs.yml. A fresh (restart: False) run
-# from the same sdate as config_test_aifs2-1.0deg-v1.0.yml-1st's original
-# psobs-only parquet baseline, for a clean before/after comparison.
+# Observation-ablation series (2/4): ps + raobs. Same sdate/n_init/window as
+# the ps-only / ps+raobs+amv / ps+raobs+amv+gpsro siblings, varying ONLY the
+# observations block -- see integrate_prepbufr_obs.md.
 
 # ERA5 initial-condition/verification fetches (backends/aifs/aifs_ic.py)
 # need internet access, which this H100 node does not have -- the
 # ic_cache_aifs2-1.0deg-v1.0/ directory must already be warmed from a login
-# node before this job runs (see backends/aifs/aifs_prefetch_ic.py).
+# node before this job runs (see backends/aifs/aifs_prefetch_ic.py). Already
+# warmed through 2015-07 for this checkpoint, well past this run's range.
 python -u long_window_4dvar.py config_test_aifs2-1.0deg-v1.0_ps_raobs.yml

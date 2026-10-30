@@ -1237,6 +1237,42 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
     fetch -- ACE2's PRESsfc is consistent with it). `'logpinterp'` is still
     allowed explicitly but would search the biased derived z (~2 hPa of ps);
     `'ps'` and `reset_skt_ocean` are rejected for ACE2 by `load_config`.
+  - **Bug found and fixed 2026-10-21: NaN gradient (not value) through the
+    derived t/u/v interpolation.** `ps_native` only ever reads NATIVE-level
+    fields (`t_lowest`/`q_lowest`/`p_lowest`/`sp`), so nothing exercised the
+    DERIVED `t`/`u`/`v` pressure-level interpolation through a gradient
+    until raobs/amv were admitted for ACE2 (see `integrate_prepbufr_obs.md`
+    "raobs admitted for `model_backend: ace2`") -- `get_raobs`/`get_amv`
+    both read `decoded['t']`/`decoded['u']`/`decoded['v']` directly. A real
+    `ps+raobs+amv` run (`run_ace2_ps_raobs_amv.sh`,
+    `logs/lw4dvar_ace2_ps_raobs_amv_24270091.out`) got through epoch 1's
+    forward pass and loss computation fine (finite `Jtot`), then hit the
+    solver's own `non-finite gradient in increment` guard
+    (`compute_optimal`, `long_window_4dvar_utils.py`) immediately after
+    `loss.backward()`. A CPU-only probe (no GPU needed -- `decode_state`
+    never touches the SFNO network) isolated it to `_to_pressure_levels`'s
+    `need` block (shared by t/u/v, not z): `w = torch.where(hi > lo, (lnp_t
+    - x_lo) / (x_hi - x_lo), zeros)` -- whenever a target pressure level
+    clamps `lo == hi` (at/beyond the native layer-midpoint range), the
+    division's own local gradient is `0/0`-shaped, and even though
+    `torch.where` correctly zeroes the FORWARD value, `0 * inf = NaN` still
+    contaminates the gradient -- the exact same finite-forward/non-finite-
+    local-gradient pattern already documented for `gpsro_operator.py`'s
+    masked-column substitution (see integrate_gpsro.md "NaN-gradient-
+    contamination fix"). Confirmed directly: on a real IC
+    (2014-12-30T00, CPU), `decode_state(only=['t','u','v','z'])`'s forward
+    values were ALL finite (sane physical ranges) but `grad(PRESsfc)` was
+    non-finite at all 64800 grid points before the fix, 0 after; isolated
+    further to `t`/`u`/`v` specifically (`z` alone was always clean, since
+    its own branch -- `phi_below`/`phi_above` -- doesn't share this
+    division). **Fixed** by guarding the denominator before dividing
+    (`safe_denom = torch.where(hi > lo, x_hi - x_lo, ones)`, then divide by
+    `safe_denom`), same pattern as the gpsro fix -- forward values bit-
+    identical before/after (confirmed), gradient fully finite after. This
+    bug would equally have affected any other observation type reading
+    ACE2's derived t/u/v (gpsro, if/when extended to ACE2) and any future
+    use of `decode_state`'s derived fields in a differentiable context --
+    not raobs/amv-specific, just first exposed by them.
 - **ICs from the PUBLIC ARCO-ERA5 bucket** (`backends/ace2/ace2_ic.py`,
   `gs://gcp-public-data-arco-era5`, anonymous -- no billing project; Ai2's
   own processed zarr is requester-pays and HF only has ICs for
@@ -1274,6 +1310,32 @@ Branch `ace2`, commit db5f613. `allenai/ACE2-ERA5` via Ai2's `fme` package
   overlay numpy/pandas/xarray/shapely onto the pip-installed stack plus an
   MPI HDF5 -- kept separate instead. Specs: `ace2-spec.txt`,
   `ace2-requirements.txt`, `ace2ic-spec.txt`.
+- **A second, user-owned env, `lwace2`, was built 2026-10-21** (built as
+  `ace2` first, then renamed the same day to match the `lwaifs2` naming
+  convention -- `conda rename -n ace2 lwace2`, preserves the full pip stack,
+  `pip check` still clean after: `/scratch4/BMC/gsienkf/Bo.Huang/extApps/
+  miniconda3/envs/lwace2`, not the shared
+  `/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2` above). Exact
+  same recipe from this repo's own `ace2-spec.txt`/`ace2-requirements.txt`
+  (one line filtered out -- `ace2-requirements.txt`'s `packaging @
+  file:///home/conda/...` entry is a `pip freeze` artifact of a
+  conda-installed package on the ORIGINAL build machine, not
+  pip-installable here; `packaging` is already satisfied via
+  `ace2-spec.txt`'s conda install, so this is a no-op, not a real
+  deviation): `conda create --name ace2 --file ace2-spec.txt`, then `pip
+  install torch==2.7.1+cu128 torchvision==0.22.1+cu128 --index-url
+  https://download.pytorch.org/whl/cu128`, then `pip install
+  torch_harmonics==0.8.0 --no-build-isolation --no-deps` (built cleanly
+  under `module load cuda/12.8.1`, no GPU needed at install time), then
+  `pip install -r ace2-requirements.txt -c <constraints pinning
+  torch/torchvision/triton/torch_harmonics>`. `pip check` clean; `import
+  ace2_model` confirmed working end-to-end. Built because the shared env was
+  found missing `requests` (a real gap -- see CLAUDE.md) and, independent of
+  that, is actively used for someone else's ACE2 training work (not
+  account-writable, could change without warning) -- same rationale as the
+  `aifs2-1.0deg-v1.0` -> `lwaifs2` precedent. `run_ace2*.sh` now activate
+  this env (`source .../miniconda3/bin/activate lwace2`, matching
+  `run_aifs2-1.0deg-v1.0*.sh`'s pattern for `lwaifs2`), not the shared one.
 - **Submodule is POINTER-ONLY** (`backends/ace2/ACE2-ERA5` @ f25123c): the
   HF repo is ~75 GB of LFS (45 GB of yearly forcings + training samples).
   Fresh clone: `GIT_LFS_SKIP_SMUDGE=1 git submodule update --init

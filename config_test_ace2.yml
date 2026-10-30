@@ -6,11 +6,156 @@ exp:
   rpath: './output/test_ace2_6h_5d_50it/'
   observations:
     psobs:
-      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/longWin4DVar/prepbufr_to_parquet/data/prepbufr_parquet'
+      # Fixed 2026-10-22: the old path pointed at this repo's pre-rename
+      # location (longWin4DVar -> lw4dvar-torch-dev) and no longer exists on
+      # disk -- this config would have failed at get_psobs if run as-is
+      # (see integrate_prepbufr_obs.md's "raobs admitted for model_backend:
+      # ace2" section).
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
       nobs_max: 15000
       use_source_error: True  # oberrstart: -1 below -- matches the legacy .txt column-7 per-ob error
     raobs:
       enabled: False
+      # Excludes 'specific_humidity' once enabled: ACE2's 'q' is its native
+      # specific_total_water channel (vapor + condensate), not a pure
+      # water-vapor specific humidity the way AIFS/Aurora's 'q' is --
+      # quantified against real ERA5 2026-10-22 and found non-negligible
+      # (15-70% of ERA5's own spatial std, 850-250 hPa), with no way to
+      # separate vapor from condensate in ACE2's own output (see
+      # integrate_prepbufr_obs.md "raobs admitted for model_backend:
+      # ace2"). t/u/v are unaffected. The value below is the plain code
+      # default (all four variables); every other config_test_ace2_*.yml
+      # that enables raobs drops 'specific_humidity' from this list instead.
+      variables: [temperature, u_component_of_wind, v_component_of_wind, specific_humidity]
+      # Every other key below is the code-level default, spelled out
+      # explicitly (see config.yml.template for what each controls).
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [ADPUPA]
+      time_tolerance_hours: 3.0  # dt_obs/2
+      quality_mark_max: 3
+      pressure_match_tolerance_hpa: 0.05
+      height_min_m: -1000.
+      height_max_m: 60000.
+      below_station_tolerance_m: 100.
+      error_std: {t: 1.0, u: 2.0, v: 2.0}
+      # q_error_g_kg/q_error_fraction/q_error_floor_kg_kg/q_bg_check/
+      # humidity_min_pressure_hpa only matter when 'specific_humidity' is in
+      # variables -- spelled out anyway since they're still part of this
+      # block's schema.
+      q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      q_error_fraction: 0.2
+      q_error_floor_kg_kg: 1.e-5
+      q_bg_check: 4.0
+      humidity_min_pressure_hpa: 300.
+      # station_capacity intentionally omitted -- auto-sized to the
+      # largest slot actually read (no fixed default value to spell out).
+    aircraft:
+      enabled: False
+      # Every key below is the code-level default, spelled out explicitly
+      # (see config.yml.template and integrate_aircraft_obs.md), EXCEPT
+      # vertical_bin_mode: set to 'nearest_level' (not the 'pmesh' default),
+      # same reasoning as amv's override -- ACE2 has only 8 native vertical
+      # layers, and aircraft's own pressure distribution is bimodal/cruise-
+      # heavy (33% clustered at 150-250 hPa), a tighter density-vs-
+      # resolution mismatch than amv has, so the case for anchoring bins to
+      # real model levels is at least as strong here. Not sensitivity-
+      # tested for aircraft the way amv's choice was (see
+      # integrate_aircraft_obs.md's GSI-comparison section) -- applied as
+      # the better-justified default anyway, same posture as amv.
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [AIRCAR, AIRCFT]
+      time_tolerance_hours: 1.0
+      report_types: null
+      quality_mark_max: 3
+      pressure_range_hpa: [1000., 50.]
+      use_source_error: True
+      fallback_error_std_t_k: 1.5
+      fallback_error_std_ms: 3.5
+      separate_report_types: True
+      rmesh_km: 120.0
+      pmesh_hpa: 50.0
+      vertical_bin_mode: nearest_level
+      error_floor_t_k: 0.5
+      error_floor_ms: 2.0
+      background_check_stddev: 4.0
+      error_min_t_k: null
+      error_max_t_k: null
+      error_min_ms: null
+      error_max_ms: null
+      # capacity intentionally omitted -- auto-sized to the largest slot
+      # actually read (no fixed default value to spell out).
+    amv:
+      enabled: False
+      # u/v only -- amv never carries humidity, no q caveat here.
+      # ACE2 has only 8 native vertical layers -- GSI's fixed-width
+      # pmesh_hpa mesh (the 'pmesh' default) doesn't know that and can keep
+      # an observation arbitrarily far from any real model level. Bin by
+      # the nearest model pressure level instead -- see
+      # integrate_amv_satwnd.md "Vertical thinning tied to model levels"
+      # and config.yml.template's amv.vertical_bin_mode doc. Confirmed
+      # (2026-10-22) this choice doesn't actually matter for z500 skill --
+      # kept at nearest_level anyway since it's the scientifically
+      # better-justified of the two, and applied here regardless of
+      # amv.enabled -- an ACE2 config should never show an AIFS-tuned
+      # default for a key this backend-specific.
+      # Every other key below is the code-level default, spelled out
+      # explicitly (see config.yml.template).
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [SATWND]
+      report_types: null
+      quality_mark_max: 3
+      time_tolerance_hours: 1.0
+      pressure_range_hpa: [1000., 50.]
+      use_source_error: True
+      fallback_error_std_ms: 7.0
+      exclude_satellite_ids: []
+      separate_report_types: True
+      separate_satellite_ids: True
+      rmesh_km: 120.0
+      pmesh_hpa: 50.0
+      vertical_bin_mode: nearest_level
+      error_floor_ms: 4.0
+      background_check_stddev: 4.0
+      error_min_ms: null
+      error_max_ms: null
+      # capacity intentionally omitted -- auto-sized to the largest slot
+      # actually read (no fixed default value to spell out).
+    gpsro:
+      enabled: False  # ace2 added to GPSRO_SUPPORTED_BACKENDS 2026-10-22 (see
+      # integrate_gpsro.md's "Plan: extend GPSRO to the ACE2 backend") --
+      # see config_test_ace2_ps_raobs_aircraft_amv_gpsro.yml for a working
+      # enabled: True example.
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/gpsro_parquet'
+      # impact_height_range_km narrowed from AIFS's [6.,40.] default: ACE2's
+      # model top (DEFAULT_PLEVS's 50 hPa) decodes to ~20.4 km mean geometric
+      # height (confirmed directly, 2026-10-22), not AIFS-single-2.0's
+      # ~31 km. Keeping the validated top_extrapolation_km: 10.0 unchanged
+      # (rather than doubling it to an unvalidated ~20 km to still reach
+      # 40 km) means the supported ceiling is ~top+10 =~ 30 km -- confirmed
+      # directly: a real-column validity probe accepted impact heights up
+      # to 25 km and rejected 35/50 km at this top_extrapolation_km. Applied
+      # here regardless of gpsro.enabled -- an ACE2 config should never show
+      # an AIFS-tuned default for a key this backend-specific. Every other
+      # key below is the code-level default, spelled out explicitly (see
+      # config.yml.template).
+      time_tolerance_hours: 1.5
+      impact_height_range_km: [6., 30.]
+      impact_height_spacing_m: 1000.
+      maximum_bending_angle_rad: 0.1
+      quality_flags_disqualifying_mask: 0
+      minimum_percent_confidence: null
+      error_model: {name: ecmwf_seed_v1, fractional_at_0_km: 0.20, fractional_at_10_km: 0.01, absolute_floor_rad: 3.e-6}
+      maximum_simulated_bending_angle_rad: 0.05
+      background_check_stddev: 4.0
+      error_min_rad: null
+      error_max_rad: null
+      top_extrapolation_km: 10.0
+      critical_gradient_n_per_km: 157.0
+      sr_detection_fraction: 0.75
+      sr_screen_height_km: 5.0
+      # profile_capacity/level_capacity intentionally omitted -- auto-sized
+      # to the largest slot actually read (no fixed default value to spell
+      # out).
   ic_suffix: '120h_50it'
   sdate: '2015-01-01T00'
   n_init: 240
@@ -23,13 +168,16 @@ exp:
   model_name: 'ace2_era5_ckpt.tar'
   device: 'cuda'
   path_output: './output/'
-  ic_cache: './ic_cache_ace2/'
+  # Fixed 2026-10-22: './ic_cache_ace2/' doesn't exist on disk -- same stale-
+  # path bug class as the psobs.path fix above. Matches every other
+  # config_test_ace2_*.yml.
+  ic_cache: '/scratch4/BMC/gsienkf/whitaker/ace2_training/inference_ours/ic_cache/'
   print_every: 10
   oberrstart: -1
   oberrdeltaperday: 0
   # ps_operator defaults to 'ps_native' for ACE2
-  checkpoint_stride: 2 # checkpoint_stride: 0 runs out of memory on H100
-  control_variables: [air_temperature, specific_total_water, eastward_wind, northward_wind, PRESsfc, surface_temperature, TMP2m, Q2m, UGRD10m, VGRD10m] # this is the full list, nothing excluded (the default)
+  checkpoint_stride: 2  # checkpoint_stride: 0 runs out of memory on H100
+  control_variables: [air_temperature, specific_total_water, eastward_wind, northward_wind, PRESsfc, surface_temperature, TMP2m, Q2m, UGRD10m, VGRD10m]  # this is the full list, nothing excluded (the default)
   jc_ps_weight: 32
 
 windows:
@@ -39,7 +187,7 @@ windows:
     dt_obs: 6
     learn_rate: 1.0e-3
     weight_decay: 1.0e-3
-    max_epoch: 50
+    max_epoch: 100
     warmup_steps: 10
     start_factor: 0.1
     end_factor: 1

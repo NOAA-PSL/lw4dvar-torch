@@ -219,15 +219,24 @@ for k in range(exp_config['n_init']):
         # exp.raobs_enabled is True, in which case every call below just
         # assimilates surface pressure, unchanged (see get_raobs).
         raobs_traj = utils.get_raobs(exp_config, model, logger, grid_interp, psobs_traj)
+        # satellite-derived winds (SATWND superobs) -- None unless
+        # exp.amv_enabled is True (see get_amv, integrate_amv_satwnd.md).
+        amv_traj = utils.get_amv(exp_config, model, logger, grid_interp, psobs_traj)
+        # aircraft (AIRCAR/AIRCFT temperature/wind) -- None unless
+        # exp.aircraft_enabled is True (see get_aircraft, integrate_aircraft_obs.md).
+        aircraft_traj = utils.get_aircraft(exp_config, model, logger, grid_interp, psobs_traj)
+        # GPS radio-occultation bending angle -- None unless
+        # exp.gpsro_enabled is True (see get_gpsro, integrate_gpsro.md).
+        gpsro_traj = utils.get_gpsro(exp_config, model, logger, grid_interp, psobs_traj)
 
         # call the optimization routine
         analysis_state, lsave = utils.compute_optimal(
-            exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj,
+            exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj, amv_traj, aircraft_traj, gpsro_traj,
         )
         # save initial and final trajectory in model and observation space.
         utils.save_trajectory_diagnostics(
             exp_config, model, input_encoded, analysis_state, verif_ic, psobs_traj,
-            exp_config['save_levs'], grid_interp, logger, raobs_traj,
+            exp_config['save_levs'], grid_interp, logger, raobs_traj, amv_traj, aircraft_traj, gpsro_traj,
         )
         # print z500 error before and after optimization. The latent
         # analysis_state is always valid at window_start + dt_verif, not

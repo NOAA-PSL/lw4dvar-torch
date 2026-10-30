@@ -2,28 +2,42 @@ exp:
   model_backend: aifs
   nhrs_back: 48
   restart: False
-  rpath: './output/smoke_test_aifs2-1.0deg-v1.0-pretraining-ps-raobs-parquet/'
+  rpath: './output/aifs2-1.0deg-v1.0-pretraining-ps-raobs/'
   observations:
     psobs:
       path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
       nobs_max: 15000
       use_source_error: True  # oberrstart: -1 below -- matches the legacy .txt column-7 per-ob error
-    # Step 2 of integrate_prepbufr_obs.md: add radiosonde (ADPUPA) profiles
-    # on top of the already-validated parquet psobs path (see
-    # config_test_aifs2-1.0deg-v1.0.yml-1st / integrate_prepbufr_obs.md
-    # "Verification"). variables left at the (now humidity-inclusive)
-    # default -- temperature + u + v + specific_humidity. All other
-    # raobs.* keys left at their documented defaults (path falls back to
-    # psobs.path, ADPUPA class, 3h time tolerance, etc).
     raobs:
       enabled: True
+      # Every key below is the code-level default, spelled out explicitly
+      # (see config.yml.template). variables includes specific_humidity --
+      # AIFS's 'q' is a pure water-vapor specific humidity (unlike ACE2's
+      # native specific_total_water), the default/unexcluded case.
+      variables: [temperature, u_component_of_wind, v_component_of_wind, specific_humidity]
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      prepbufr_classes: [ADPUPA]
+      time_tolerance_hours: 3.0  # dt_obs/2
+      quality_mark_max: 3
+      pressure_match_tolerance_hpa: 0.05
+      height_min_m: -1000.
+      height_max_m: 60000.
+      below_station_tolerance_m: 100.
+      error_std: {t: 1.0, u: 2.0, v: 2.0}
+      q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      q_error_fraction: 0.2
+      q_error_floor_kg_kg: 1.e-5
+      q_bg_check: 4.0
+      humidity_min_pressure_hpa: 300.
+      # station_capacity intentionally omitted -- auto-sized to the
+      # largest slot actually read (no fixed default value to spell out).
   ic_suffix: '120h_100it'
   sdate: '2015-01-01T00'
-  n_init: 200
+  n_init: 100
   dt_init: 12
   save_levs: [1000,850,500,250,50]
   cycle: True
-  exp_name: 'smoke_test_aifs2-1.0deg-v1.0-pretraining-ps-raobs-parquet'
+  exp_name: 'aifs2-1.0deg-v1.0-pretraining-ps-raobs'
 
   model_name: 'aifs-single-mse-2.0-1.0deg-v1.0-pretraining.ckpt'
   path_model: './backends/aifs/aifs2-1.0deg-v1.0/'
