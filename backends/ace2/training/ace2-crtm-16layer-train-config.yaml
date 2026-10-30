@@ -1,0 +1,591 @@
+# ACE2 with 16 layers, CRTM layer variables and land surface (ace2-training.md,
+# "CRTM layer variables" and "Training: 16 layers, CRTM + land"): vapor
+# (specific_humidity), total condensate (specific_total_condensate) and ozone
+# (ozone_mass_mixing_ratio) replace specific_total_water as prognostics.
+# Everything else as ace2-era5-vars-train-config.yaml (generated from it):
+# same architecture, forcings, diagnostics, training settings and corrector.
+# - Total water for the dry-air and moisture-budget correctors is vapor +
+#   condensate, supplied by fme_train.py (fme only knows the
+#   specific_total_water_ prefix). Run through fme_train.py, not fme.ace.train.
+# - Layers nested in the 8-layer grid (L137 interfaces 0 24 48 58 67 73 79
+#   84 90 95 100 104 109 114 119 128 137): 8-layer layer k = 16-layer 2k,
+#   2k+1. Loss weights: fme applies them to the fields before the MSE, so a
+#   channel's loss share goes as w^2; each half gets ACE2-ERA5's 8-layer
+#   weight / sqrt(2) (default 1 -> 0.707), keeping every family's 8-layer
+#   share. Vapor and condensate (same weights): layers 0-3 (top-144 hPa,
+#   layer 3 mean ~117 hPa) 0.1 (w^2 1/50 of the layers below 252 hPa); 4-5
+#   0.354 (ACE2-ERA5's 0.5 for that total-water layer);
+#   6-15 0.707. Ozone (stratosphere-dominated): layers 0-5 (top-252 hPa)
+#   0.707, 6-7 (252-401 hPa, transition) 0.354, 8-15 (below ~401 hPa,
+#   troposphere) 0.1 (w^2 1/50 of the layers above).
+# - Normalization: ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-
+#   floor-land (condensate std floored at 1e-6 kg/kg in layers 0-2, plus the
+#   capped snow's stats; see ace2-training.md).
+# - Train 1979-2014 + 2016-2025; 2015 held out (validation, inline inference).
+# - 112 input / 118 output channels (108 / 114 without land); by the memory
+#   probe, fits 1 sample/GPU on 4 Polaris nodes without checkpointing, at the
+#   same speed as 8 layers.
+#   Inline inference: forward_steps_in_memory 20 (40 ran out of memory in
+#   fme's total-energy diagnostic, smoke test 2026-10-28).
+# Land surface, for satellite surface emissivity: four more prognostics,
+# soil_moisture_0 (ERA5 swvl1, 0-7 cm, m3/m3), soil_temperature_0 (stl1,
+# 0-7 cm, K), surface_snow_amount_capped (snow water equivalent, kg/m2,
+# capped at 1000) and surface_snow_area_fraction.
+# - Snow is capped because ERA5 pins it at 1e4 kg/m2 on the ice sheets and
+#   has thousands in partly glaciated cells, which set the normalization
+#   (std ~1700 vs a 41 kg/m2 median of snowy cells); emissivity doesn't see
+#   past ~1 m water equivalent. The capped field lives in a sidecar dataset
+#   (ace2_dataset.py capped_snow -> ace2_era5_1deg_16layer/snow-capped-1000),
+#   merged with the main files in every loader; the training files are
+#   untouched.
+# - Over ocean soil moisture and snow are 0 and soil temperature is ~SST.
+#   Soil moisture and both snow fields are force_positive; snow fraction is
+#   not capped at 1 by fme (clip downstream).
+# - Loss weights: surface_snow_amount_capped 0.1, the other three 1. Snow
+#   amount barely changes in 6 h (residual std 0.36 vs full-field 326 kg/m2,
+#   ratio 899; next largest 38), so at weight 1 a field-sized error cost ~1e6
+#   (smoke test: valid loss 317 vs 20 without land); at 0.1, (w*ratio)^2 ~8000
+#   (h500 19000, TMP850 2500, PRESsfc 1400), tendency weight w^2 0.01.
+# - Deep soil layers left out (only the top layer matters for emissivity);
+#   the model must carry soil memory in its own state.
+experiment_dir: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-land-16layer-1979-2025-no2015
+save_checkpoint: true
+validate_using_ema: true
+max_epochs: 120
+seed: 0
+ema:
+  decay: 0.999
+inference:
+  n_forward_steps: 1440
+  forward_steps_in_memory: 20
+  loader:
+    start_indices:
+      times:
+      - '2015-01-01T00:00:00'
+      - '2015-01-01T06:00:00'
+      - '2015-01-01T12:00:00'
+      - '2015-01-01T18:00:00'
+      - '2015-01-02T00:00:00'
+      - '2015-01-02T06:00:00'
+      - '2015-01-02T12:00:00'
+      - '2015-01-02T18:00:00'
+      - '2015-01-03T00:00:00'
+      - '2015-01-03T06:00:00'
+      - '2015-01-03T12:00:00'
+      - '2015-01-03T18:00:00'
+      - '2015-01-04T00:00:00'
+      - '2015-01-04T06:00:00'
+      - '2015-01-04T12:00:00'
+      - '2015-01-04T18:00:00'
+    dataset:
+      merge:
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+    num_data_workers: 8
+  aggregator:
+    log_histograms: true
+    time_mean_reference_data: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/time-mean.nc
+logging:
+  log_to_screen: true
+  log_to_wandb: false
+  log_to_file: true
+  project: ace
+  entity: ai2cm
+train_loader:
+  batch_size: 16
+  # 16 workers x prefetch 2 (was 8 x 4: same 32 samples buffered per rank,
+  # twice the reads in flight): 16-layer loading is latency-bound on small
+  # per-variable chunk reads (Ursa: 1.4-2.0 -> 0.71-0.78 s/batch).
+  num_data_workers: 16
+  prefetch_factor: 2
+  dataset:
+    merge:
+    - concat:
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '1979-01-01T00:00:00'
+          stop_time: '2014-12-31T06:00:00'
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '2016-01-01T00:00:00'
+          stop_time: '2025-12-31T06:00:00'
+    - concat:
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '1979-01-01T00:00:00'
+          stop_time: '2014-12-31T06:00:00'
+      - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+        file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+        subset:
+          start_time: '2016-01-01T00:00:00'
+          stop_time: '2025-12-31T06:00:00'
+validation_loader:
+  batch_size: 128
+  num_data_workers: 8
+  prefetch_factor: 4
+  dataset:
+    merge:
+    - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer
+      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      subset:
+        start_time: '2015-01-01T00:00:00'
+        stop_time: '2015-12-31T06:00:00'
+        step: 3
+    - data_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/snow-capped-1000
+      file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
+      subset:
+        start_time: '2015-01-01T00:00:00'
+        stop_time: '2015-12-31T06:00:00'
+        step: 3
+optimization:
+  use_gradient_accumulation: true
+  enable_automatic_mixed_precision: false
+  lr: 0.0001
+  optimizer_type: AdamW
+  kwargs:
+    fused: true
+    weight_decay: 0.01
+stepper_training:
+  n_forward_steps: 2
+  loss:
+    type: MSE
+    weights:
+      DLWRFsfc: 2
+      DSWRFsfc: 2
+      PRATEsfc: 0.5
+      Q2m: 0.5
+      TMP850: 5
+      ULWRFsfc: 5
+      USWRFsfc: 2
+      USWRFtoa: 2
+      air_temperature_0: 0.354
+      air_temperature_1: 0.354
+      air_temperature_10: 0.707
+      air_temperature_11: 0.707
+      air_temperature_12: 0.707
+      air_temperature_13: 0.707
+      air_temperature_14: 0.707
+      air_temperature_15: 0.707
+      air_temperature_2: 0.354
+      air_temperature_3: 0.354
+      air_temperature_4: 0.707
+      air_temperature_5: 0.707
+      air_temperature_6: 0.707
+      air_temperature_7: 0.707
+      air_temperature_8: 0.707
+      air_temperature_9: 0.707
+      eastward_wind_0: 0.354
+      eastward_wind_1: 0.354
+      eastward_wind_10: 0.707
+      eastward_wind_11: 0.707
+      eastward_wind_12: 0.707
+      eastward_wind_13: 0.707
+      eastward_wind_14: 0.707
+      eastward_wind_15: 0.707
+      eastward_wind_2: 0.707
+      eastward_wind_3: 0.707
+      eastward_wind_4: 0.707
+      eastward_wind_5: 0.707
+      eastward_wind_6: 0.707
+      eastward_wind_7: 0.707
+      eastward_wind_8: 0.707
+      eastward_wind_9: 0.707
+      h500: 10
+      northward_wind_0: 0.354
+      northward_wind_1: 0.354
+      northward_wind_10: 0.707
+      northward_wind_11: 0.707
+      northward_wind_12: 0.707
+      northward_wind_13: 0.707
+      northward_wind_14: 0.707
+      northward_wind_15: 0.707
+      northward_wind_2: 0.707
+      northward_wind_3: 0.707
+      northward_wind_4: 0.707
+      northward_wind_5: 0.707
+      northward_wind_6: 0.707
+      northward_wind_7: 0.707
+      northward_wind_8: 0.707
+      northward_wind_9: 0.707
+      ozone_mass_mixing_ratio_0: 0.707
+      ozone_mass_mixing_ratio_1: 0.707
+      ozone_mass_mixing_ratio_10: 0.1
+      ozone_mass_mixing_ratio_11: 0.1
+      ozone_mass_mixing_ratio_12: 0.1
+      ozone_mass_mixing_ratio_13: 0.1
+      ozone_mass_mixing_ratio_14: 0.1
+      ozone_mass_mixing_ratio_15: 0.1
+      ozone_mass_mixing_ratio_2: 0.707
+      ozone_mass_mixing_ratio_3: 0.707
+      ozone_mass_mixing_ratio_4: 0.707
+      ozone_mass_mixing_ratio_5: 0.707
+      ozone_mass_mixing_ratio_6: 0.354
+      ozone_mass_mixing_ratio_7: 0.354
+      ozone_mass_mixing_ratio_8: 0.1
+      ozone_mass_mixing_ratio_9: 0.1
+      specific_humidity_0: 0.1
+      specific_humidity_1: 0.1
+      specific_humidity_10: 0.707
+      specific_humidity_11: 0.707
+      specific_humidity_12: 0.707
+      specific_humidity_13: 0.707
+      specific_humidity_14: 0.707
+      specific_humidity_15: 0.707
+      specific_humidity_2: 0.1
+      specific_humidity_3: 0.1
+      specific_humidity_4: 0.354
+      specific_humidity_5: 0.354
+      specific_humidity_6: 0.707
+      specific_humidity_7: 0.707
+      specific_humidity_8: 0.707
+      specific_humidity_9: 0.707
+      specific_total_condensate_0: 0.1
+      specific_total_condensate_1: 0.1
+      specific_total_condensate_10: 0.707
+      specific_total_condensate_11: 0.707
+      specific_total_condensate_12: 0.707
+      specific_total_condensate_13: 0.707
+      specific_total_condensate_14: 0.707
+      specific_total_condensate_15: 0.707
+      specific_total_condensate_2: 0.1
+      specific_total_condensate_3: 0.1
+      specific_total_condensate_4: 0.354
+      specific_total_condensate_5: 0.354
+      specific_total_condensate_6: 0.707
+      specific_total_condensate_7: 0.707
+      specific_total_condensate_8: 0.707
+      specific_total_condensate_9: 0.707
+      surface_snow_amount_capped: 0.1
+      tendency_of_total_water_path_due_to_advection: 0.5
+stepper:
+  step:
+    type: single_module
+    config:
+      builder:
+        type: SphericalFourierNeuralOperatorNet
+        config:
+          embed_dim: 384
+          filter_type: linear
+          hard_thresholding_fraction: 1.0
+          normalization_layer: instance_norm
+          num_layers: 8
+          operator_type: dhconv
+          pos_embed: true
+          scale_factor: 1
+          separable: false
+          spectral_layers: 3
+          spectral_transform: sht
+          use_mlp: true
+          checkpointing: 0
+      normalization:
+        network:
+          global_means_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/centering.nc
+          global_stds_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/scaling-full-field.nc
+        residual:
+          global_means_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/centering.nc
+          global_stds_path: /lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_era5_1deg_16layer/stats-1990-01-2019-12-condensate-floor-land/scaling-residual.nc
+      ocean:
+        surface_temperature_name: surface_temperature
+        ocean_fraction_name: ocean_fraction
+      corrector:
+        conserve_dry_air: true
+        moisture_budget_correction: advection_and_precipitation
+        force_positive_names:
+        - specific_humidity_0
+        - specific_humidity_1
+        - specific_humidity_2
+        - specific_humidity_3
+        - specific_humidity_4
+        - specific_humidity_5
+        - specific_humidity_6
+        - specific_humidity_7
+        - specific_humidity_8
+        - specific_humidity_9
+        - specific_humidity_10
+        - specific_humidity_11
+        - specific_humidity_12
+        - specific_humidity_13
+        - specific_humidity_14
+        - specific_humidity_15
+        - specific_total_condensate_0
+        - specific_total_condensate_1
+        - specific_total_condensate_2
+        - specific_total_condensate_3
+        - specific_total_condensate_4
+        - specific_total_condensate_5
+        - specific_total_condensate_6
+        - specific_total_condensate_7
+        - specific_total_condensate_8
+        - specific_total_condensate_9
+        - specific_total_condensate_10
+        - specific_total_condensate_11
+        - specific_total_condensate_12
+        - specific_total_condensate_13
+        - specific_total_condensate_14
+        - specific_total_condensate_15
+        - ozone_mass_mixing_ratio_0
+        - ozone_mass_mixing_ratio_1
+        - ozone_mass_mixing_ratio_2
+        - ozone_mass_mixing_ratio_3
+        - ozone_mass_mixing_ratio_4
+        - ozone_mass_mixing_ratio_5
+        - ozone_mass_mixing_ratio_6
+        - ozone_mass_mixing_ratio_7
+        - ozone_mass_mixing_ratio_8
+        - ozone_mass_mixing_ratio_9
+        - ozone_mass_mixing_ratio_10
+        - ozone_mass_mixing_ratio_11
+        - ozone_mass_mixing_ratio_12
+        - ozone_mass_mixing_ratio_13
+        - ozone_mass_mixing_ratio_14
+        - ozone_mass_mixing_ratio_15
+        - soil_moisture_0
+        - surface_snow_amount_capped
+        - surface_snow_area_fraction
+        - Q2m
+        - PRATEsfc
+        - ULWRFsfc
+        - ULWRFtoa
+        - DLWRFsfc
+        - DSWRFsfc
+        - USWRFsfc
+        - USWRFtoa
+      next_step_forcing_names:
+      - DSWRFtoa
+      in_names:
+      - land_fraction
+      - ocean_fraction
+      - sea_ice_fraction
+      - DSWRFtoa
+      - HGTsfc
+      - global_mean_co2
+      - PRESsfc
+      - surface_temperature
+      - TMP2m
+      - Q2m
+      - UGRD10m
+      - VGRD10m
+      - soil_moisture_0
+      - soil_temperature_0
+      - surface_snow_amount_capped
+      - surface_snow_area_fraction
+      - air_temperature_0
+      - air_temperature_1
+      - air_temperature_2
+      - air_temperature_3
+      - air_temperature_4
+      - air_temperature_5
+      - air_temperature_6
+      - air_temperature_7
+      - air_temperature_8
+      - air_temperature_9
+      - air_temperature_10
+      - air_temperature_11
+      - air_temperature_12
+      - air_temperature_13
+      - air_temperature_14
+      - air_temperature_15
+      - specific_humidity_0
+      - specific_humidity_1
+      - specific_humidity_2
+      - specific_humidity_3
+      - specific_humidity_4
+      - specific_humidity_5
+      - specific_humidity_6
+      - specific_humidity_7
+      - specific_humidity_8
+      - specific_humidity_9
+      - specific_humidity_10
+      - specific_humidity_11
+      - specific_humidity_12
+      - specific_humidity_13
+      - specific_humidity_14
+      - specific_humidity_15
+      - specific_total_condensate_0
+      - specific_total_condensate_1
+      - specific_total_condensate_2
+      - specific_total_condensate_3
+      - specific_total_condensate_4
+      - specific_total_condensate_5
+      - specific_total_condensate_6
+      - specific_total_condensate_7
+      - specific_total_condensate_8
+      - specific_total_condensate_9
+      - specific_total_condensate_10
+      - specific_total_condensate_11
+      - specific_total_condensate_12
+      - specific_total_condensate_13
+      - specific_total_condensate_14
+      - specific_total_condensate_15
+      - ozone_mass_mixing_ratio_0
+      - ozone_mass_mixing_ratio_1
+      - ozone_mass_mixing_ratio_2
+      - ozone_mass_mixing_ratio_3
+      - ozone_mass_mixing_ratio_4
+      - ozone_mass_mixing_ratio_5
+      - ozone_mass_mixing_ratio_6
+      - ozone_mass_mixing_ratio_7
+      - ozone_mass_mixing_ratio_8
+      - ozone_mass_mixing_ratio_9
+      - ozone_mass_mixing_ratio_10
+      - ozone_mass_mixing_ratio_11
+      - ozone_mass_mixing_ratio_12
+      - ozone_mass_mixing_ratio_13
+      - ozone_mass_mixing_ratio_14
+      - ozone_mass_mixing_ratio_15
+      - eastward_wind_0
+      - eastward_wind_1
+      - eastward_wind_2
+      - eastward_wind_3
+      - eastward_wind_4
+      - eastward_wind_5
+      - eastward_wind_6
+      - eastward_wind_7
+      - eastward_wind_8
+      - eastward_wind_9
+      - eastward_wind_10
+      - eastward_wind_11
+      - eastward_wind_12
+      - eastward_wind_13
+      - eastward_wind_14
+      - eastward_wind_15
+      - northward_wind_0
+      - northward_wind_1
+      - northward_wind_2
+      - northward_wind_3
+      - northward_wind_4
+      - northward_wind_5
+      - northward_wind_6
+      - northward_wind_7
+      - northward_wind_8
+      - northward_wind_9
+      - northward_wind_10
+      - northward_wind_11
+      - northward_wind_12
+      - northward_wind_13
+      - northward_wind_14
+      - northward_wind_15
+      out_names:
+      - PRESsfc
+      - surface_temperature
+      - air_temperature_0
+      - air_temperature_1
+      - air_temperature_2
+      - air_temperature_3
+      - air_temperature_4
+      - air_temperature_5
+      - air_temperature_6
+      - air_temperature_7
+      - air_temperature_8
+      - air_temperature_9
+      - air_temperature_10
+      - air_temperature_11
+      - air_temperature_12
+      - air_temperature_13
+      - air_temperature_14
+      - air_temperature_15
+      - specific_humidity_0
+      - specific_humidity_1
+      - specific_humidity_2
+      - specific_humidity_3
+      - specific_humidity_4
+      - specific_humidity_5
+      - specific_humidity_6
+      - specific_humidity_7
+      - specific_humidity_8
+      - specific_humidity_9
+      - specific_humidity_10
+      - specific_humidity_11
+      - specific_humidity_12
+      - specific_humidity_13
+      - specific_humidity_14
+      - specific_humidity_15
+      - specific_total_condensate_0
+      - specific_total_condensate_1
+      - specific_total_condensate_2
+      - specific_total_condensate_3
+      - specific_total_condensate_4
+      - specific_total_condensate_5
+      - specific_total_condensate_6
+      - specific_total_condensate_7
+      - specific_total_condensate_8
+      - specific_total_condensate_9
+      - specific_total_condensate_10
+      - specific_total_condensate_11
+      - specific_total_condensate_12
+      - specific_total_condensate_13
+      - specific_total_condensate_14
+      - specific_total_condensate_15
+      - ozone_mass_mixing_ratio_0
+      - ozone_mass_mixing_ratio_1
+      - ozone_mass_mixing_ratio_2
+      - ozone_mass_mixing_ratio_3
+      - ozone_mass_mixing_ratio_4
+      - ozone_mass_mixing_ratio_5
+      - ozone_mass_mixing_ratio_6
+      - ozone_mass_mixing_ratio_7
+      - ozone_mass_mixing_ratio_8
+      - ozone_mass_mixing_ratio_9
+      - ozone_mass_mixing_ratio_10
+      - ozone_mass_mixing_ratio_11
+      - ozone_mass_mixing_ratio_12
+      - ozone_mass_mixing_ratio_13
+      - ozone_mass_mixing_ratio_14
+      - ozone_mass_mixing_ratio_15
+      - eastward_wind_0
+      - eastward_wind_1
+      - eastward_wind_2
+      - eastward_wind_3
+      - eastward_wind_4
+      - eastward_wind_5
+      - eastward_wind_6
+      - eastward_wind_7
+      - eastward_wind_8
+      - eastward_wind_9
+      - eastward_wind_10
+      - eastward_wind_11
+      - eastward_wind_12
+      - eastward_wind_13
+      - eastward_wind_14
+      - eastward_wind_15
+      - northward_wind_0
+      - northward_wind_1
+      - northward_wind_2
+      - northward_wind_3
+      - northward_wind_4
+      - northward_wind_5
+      - northward_wind_6
+      - northward_wind_7
+      - northward_wind_8
+      - northward_wind_9
+      - northward_wind_10
+      - northward_wind_11
+      - northward_wind_12
+      - northward_wind_13
+      - northward_wind_14
+      - northward_wind_15
+      - LHTFLsfc
+      - SHTFLsfc
+      - PRATEsfc
+      - ULWRFsfc
+      - ULWRFtoa
+      - DLWRFsfc
+      - DSWRFsfc
+      - USWRFsfc
+      - USWRFtoa
+      - tendency_of_total_water_path_due_to_advection
+      - TMP850
+      - h500
+      - TMP2m
+      - Q2m
+      - UGRD10m
+      - VGRD10m
+      - soil_moisture_0
+      - soil_temperature_0
+      - surface_snow_amount_capped
+      - surface_snow_area_fraction

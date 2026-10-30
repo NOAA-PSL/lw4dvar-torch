@@ -22,6 +22,15 @@
 # before the reduction to HGTsfc (2026-10-10); use its own log files:
 #   sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
 #       --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_hercules.sh
+# MODE=add_layer_families adds the --layer_families set's missing families
+# (default crtm: specific_humidity, specific_total_condensate, ozone) to the
+# months of OUTDIR in place; use its own log files:
+#   sbatch -o add.out -e add.err --export=ALL,MODE=add_layer_families,START=1979-01,END=1984-12,OUTDIR=... run_ace2_dataset_hercules.sh
+# MODE=stats computes the normalization statistics (default 1990-01..2019-12
+# into OUTDIR/stats-START-END, or STATSDIR); reads only OUTDIR. ~8.5 GB per
+# worker at 16 layers with the crtm families, ~60 s/month/worker:
+#   sbatch -t 03:00:00 -c 16 --mem=100g -o stats.out -e stats.err \
+#       --export=ALL,MODE=stats,WORKERS=8,OUTDIR=... run_ace2_dataset_hercules.sh
 # The CO2 series must exist first (login node, ace2ic env here has h5netcdf):
 #   python backends/ace2/ace2_dataset.py co2 $OUTDIR/co2.nc 1940 2022
 
@@ -39,9 +48,16 @@ PY=${ENV}/bin/python
 # Without `conda activate`, ESMPy would use whatever ESMFMKFILE the submitting
 # shell exported (e.g. base miniconda's ESMF 8.9.0 -> VersionMismatch).
 export ESMFMKFILE=${ENV}/lib/esmf.mk
-if [ "${MODE:-build}" = "fix_presfc" ]; then
+if [ "${MODE:-build}" = "stats" ]; then
+    ${PY} -u backends/ace2/ace2_dataset.py stats ${OUTDIR} \
+        ${STATSDIR:-${OUTDIR}/stats-${START:-1990-01}-${END:-2019-12}} \
+        ${START:-1990-01} ${END:-2019-12} --workers ${WORKERS}
+elif [ "${MODE:-build}" = "fix_presfc" ]; then
     ${PY} -u backends/ace2/ace2_dataset.py fix_presfc \
         ${OUTDIR} ${START:?set START=YYYY-MM} ${END:?set END=YYYY-MM} --workers ${WORKERS}
+elif [ "${MODE}" = "add_layer_families" ]; then
+    ${PY} -u backends/ace2/ace2_dataset.py add_layer_families \
+        ${OUTDIR} ${START:?set START=YYYY-MM} ${END:?set END=YYYY-MM} --workers ${WORKERS} ${EXTRA}
 else
     ${PY} -u backends/ace2/ace2_dataset.py build \
         ${OUTDIR} ${START:?set START=YYYY-MM} ${END:?set END=YYYY-MM} \

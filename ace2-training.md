@@ -49,18 +49,30 @@ vendored helpers.
   `hours since 1940-01-01T12:00:00` (as Ai2's), static fields and
   `ak_N`/`bk_N` in every file. Written to `.tmp` and renamed; existing months
   are skipped, so jobs over disjoint month ranges can share one OUTDIR.
-- `--layer_indices` (any increasing L137 interface list from 0 to 137) and
-  `--extra_layer_vars` (`specific_humidity`, the four condensates,
-  `ozone_mass_mixing_ratio`, `fraction_of_cloud_cover`, `vertical_velocity`)
-  for the radiance work.
+- `--layer_indices` (any increasing L137 interface list from 0 to 137),
+  `--layer_families` (`ace2`, the default, or `crtm`; see "CRTM layer
+  variables" below) and `--extra_layer_vars` (`specific_humidity`, the four
+  condensates, `ozone_mass_mixing_ratio`, `fraction_of_cloud_cover`,
+  `vertical_velocity`) for the radiance work.
 - Shared per-OUTDIR files: `regrid_weights_0p25deg_to_F90.nc` (xESMF weights,
   ~3 min to compute once), `invariant.nc`, `co2.nc`.
 - **CO2**: `ace2_dataset.py co2 OUT.nc 1940 2022` pulls ACE2-ERA5's own
   6-hourly `global_mean_co2` out of the public HF `forcing_YYYY.nc` files via
   HTTP range reads (~3 s/year, no full download). Verified bit-identical to
-  the local `forcing_2020.nc`. HF has 1940-2022 only; later years need
-  another source (not done). Runs in the `ace2` env (`ace2ic` lacks
+  the local `forcing_2020.nc`. HF has 1940-2022 only. Runs in the `ace2` env (`ace2ic` lacks
   `h5netcdf`).
+- **CO2 after 2022** (2026-10-18): ACE2-ERA5's series is, from ~2017 on,
+  NOAA GML global annual means (`co2_annmean_gl.txt`) linearly interpolated
+  between knots at July 1 00Z (Jul-1 values within 0.01 ppm of NOAA's; slope
+  breaks exactly at Jul 1 00Z; 1979-2016 annual means differ by up to
+  0.45 ppm, an older NOAA vintage). `ace2_dataset.py co2_noaa IN.nc OUT.nc
+  2025` appends the same construction (input kept bit-identical; the 2022
+  knot taken from the input; past the last NOAA year the last slope is
+  extrapolated). With NOAA's 2023-2025 (419.35, 422.79, 425.62) there is a
+  0.02 ppm step at 2023-01-01 (vs ~0.0016 per 6 h), from NOAA's revision of
+  2023 since Ai2's series was made. H2 2025 is extrapolated until NOAA
+  publishes 2026. Installed as `co2.nc` (1940-2025) in both the 8- and
+  32-layer dirs; the original is kept as `co2_1940-2022.nc`.
 - Memory: a family summing several ERA5 fields (total water) is built as the
   sum of each field's coarsened layers (the layer mean is linear, so this
   equals coarsening the sum), and dp is built one coarse layer at a time:
@@ -125,6 +137,22 @@ HGTsfc, not the HF forcing files.
   for any Python started with cwd `/tmp`: don't run Python from `/tmp`.
 - Python `-I` drops the script's directory from `sys.path`, which breaks
   `import ace2_ic` -- the launcher runs without it.
+- **aws-ofi-nccl plugin segfaults on 1-node jobs since 2026-10** (driver
+  580.65.06 / CUDA 13.0, libfabric 2.3.1; found 2026-10-27): every rank dies
+  in the first collective (fme's `dist.barrier` in `prepare_directory`)
+  after `NET/OFI Couldn't open a fabric access domain. RC: -38` -- with the
+  v1.9.1-aws and the libfabric-1.22 builds alike. Without the plugin, 1-node
+  NVLink works. On 2 nodes the plugin works (job 7789746: 0.46 GB
+  all-reduce 0.022 s vs 0.23 s with `NCCL_NET=Socket`). So
+  `run_ace2_train_polaris.sh` sets the NCCL/plugin env only when NNODES > 1.
+  Diagnostics: untracked `nccl_diag/`.
+- **DataLoader workers hang with `OSError: AF_UNIX path too long`**
+  (2026-10-28, 16-layer smoke job 7789826, stuck 35 min after the
+  inference dataset loaded): torch shares tensors between processes over
+  AF_UNIX sockets under TMPDIR (limit 108 chars); the PBS job TMPDIR is
+  `/var/tmp/pbs.<jobid>.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov` (63
+  chars). `run_ace2_train_polaris.sh` now prints it and sets `TMPDIR=/tmp`;
+  the next run went through.
 
 ## Environment
 
@@ -413,6 +441,290 @@ field to rms <= 5e-4 K / 6.5e-4 m/s / 1.8e-7 kg/kg -- not exact because
 coarsening uses 0.25 deg ERA5 surface pressure before regridding, and
 PRESsfc is reduced to HGTsfc.
 
+## Total water and its components (2026-10-14)
+
+`specific_total_water_<i>` is vapor plus all four ERA5 condensates:
+`specific_humidity` + `specific_cloud_liquid_water_content` +
+`specific_cloud_ice_water_content` + `specific_rain_water_content` +
+`specific_snow_water_content` (`WATER_VARS` in `ace2_ic.py`, imported by
+`ace2_dataset.py` through `LAYER_VARS`), each coarsened to layers and then
+summed (as Ai2's). Both the 8- and 32-layer builds store **only the total**
+(checked 32-layer `1979010100.nc`: no `specific_humidity_<i>` or condensate
+fields).
+
+For radiances this matters: vapor, cloud liquid and cloud ice have different
+radiative properties. Vapor dominates clear-sky absorption, liquid emits in
+microwave window channels, and ice (and snow/rain) scatter at high microwave
+frequencies and in the IR. Clear-sky operators (CRTM/RTTOV) need q; all-sky
+operators also need the hydrometeor profiles. Options:
+
+- **Prognostic split**: rebuild with `--extra_layer_vars specific_humidity
+  specific_cloud_liquid_water_content specific_cloud_ice_water_content`
+  (+ rain/snow if all-sky MW) and train on the components instead of, or
+  besides, the total. Costs more channels; the condensates are intermittent
+  and skewed, so they probably need a transformed normalization.
+- **Diagnostic secondary decoder** (like ACE2.1-ERA5's pressure-level
+  decoder): reconstruct q / liquid / ice from total water and temperature
+  (plus layer pressure, and possibly the rest of the column), keeping total
+  water as the conserved prognostic. The training data still needs the
+  components, as output-only fields. A physical baseline to beat:
+  saturation adjustment (q = min(qt, qsat(T, p)), the excess split into
+  liquid and ice by a temperature ramp). This will underestimate cloud at
+  1-deg layer means, where clouds exist below grid-mean saturation.
+
+Either way the dataset has to be rebuilt (or extended) with the component
+fields.
+
+## CRTM layer variables (2026-10-26)
+
+Decided: for CRTM radiances the model carries vapor and ozone as
+prognostics, and total water is replaced by the total condensate.
+`build --layer_families crtm` writes six layer families:
+`air_temperature`, `specific_humidity`, `specific_total_condensate` (cloud
+liquid + cloud ice + rain + snow, each coarsened and then summed, like total
+water), `ozone_mass_mixing_ratio`, `eastward_wind`, `northward_wind` -- no
+`specific_total_water_<i>` (it is `specific_humidity_<i>` +
+`specific_total_condensate_<i>`). The default `--layer_families ace2` is
+unchanged, so the existing 8/16/32-layer datasets rebuild identically. Files
+carry the `layer_families` attribute. One more ERA5 model-level field read
+per time (ozone: 9 vs 8). Can be combined with `--extra_layer_vars` (e.g.
+the individual condensates for all-sky work); repeating a family there is an
+error.
+
+- Validated (Hercules login node, 2023-01-01T00, 8 layers, one
+  `process_time`, ~80 s): vs the 8-layer `2023010100.nc`, vapor + condensate
+  = total water to float32 rounding (relative max error <= 1e-7, layer 0
+  exactly); the other 147 fields bit-identical; condensate >= 0 (max 3 g/kg,
+  layer 4; 0 in layer 0); ozone layer-mean 7.8e-6 kg/kg in layer 0 down to
+  6e-8 in layer 7.
+- **`add_layer_families` mode** adds a set's missing families to existing
+  months instead of rebuilding (`ace2_dataset.py add_layer_families OUTDIR
+  START END [--layer_families crtm]`; Hercules launcher `MODE=add_layer_families`).
+  Why not rebuild: per time step at 16 layers a full `build` takes ~80-110 s
+  per worker, while each ERA5 model-level field reads in 0.5-2 s and coarsens
+  in <1 s -- most of a build is the other streams and the regridding. The
+  patch reads only vapor, ozone, the four condensates and surface pressure
+  (the condensates are read, not taken as total water - vapor, so empty
+  cells stay exactly 0 and the result equals a fresh `crtm` build). It uses
+  the files' own layer indices and model top, keeps total water (so the
+  files serve both sets; fme ignores unused variables), refuses a month
+  unless vapor + condensate matches its total water within 1e-7 kg/kg, and
+  writes a .tmp copy renamed over the original; done months carry
+  `layer_families = "ace2 crtm"` and are skipped. Validated on a 3-time copy
+  of the 16-layer 2020-01: the 48 added fields bit-identical (values and
+  attributes) to `process_time` with `crtm`, existing fields and attributes
+  unchanged, same (1, 180, 360) chunking, total water check 2.2e-9 kg/kg.
+  +48 fields at 16 layers = +1.5 GB/month (~0.9 TB for 1979-2025).
+- For training (not done): the ACE2-ERA5 stepper config's corrector
+  (`conserve_dry_air`, `moisture_budget_correction`) and `force_positive_names`
+  refer to `specific_total_water_<i>`, which these files lack: check how fme
+  2026.5's `ClimateData` finds total water before reusing it, and add the new
+  families to `force_positive_names`. The condensate is intermittent and
+  skewed (zero in most cells), so its normalization may need a transform.
+
+## Training: 16 layers, CRTM variables (2026-10-27)
+
+Config `backends/ace2/training/ace2-crtm-16layer-train-config.yaml`
+(generated from the 8-layer ACE2-ERA5-vars config; same architecture,
+forcings, diagnostics, training settings, corrector), data
+`ace2_era5_1deg_16layer` on Eagle (564 months 1979-01..2025-12, crtm
+families added). Prognostic layer families: `air_temperature`,
+`specific_humidity`, `specific_total_condensate`, `ozone_mass_mixing_ratio`,
+`eastward_wind`, `northward_wind` x 16 layers -- 108 input / 114 output
+channels (44/50 at 8 layers). Train 1979-2014 + 2016-2025, 2015 held out.
+Experiment dir `ace2_training/ace2-crtm-16layer-1979-2025-no2015` (never
+run: before job 7794813 started the config gained the land variables, next
+section).
+
+- **Total water for the corrector.** fme 2026.5 finds total water only by
+  the `specific_total_water_` prefix (`ATMOSPHERE_FIELD_NAME_PREFIXES` in
+  `fme/core/atmosphere_data.py`). `fme_train.py` now also replaces
+  `AtmosphereData.specific_total_water` with one that falls back to
+  `specific_humidity_<k>` + `specific_total_condensate_<k>` when the total is
+  absent (data with the total are unaffected). The correctors
+  (`conserve_dry_air`, `moisture_budget_correction:
+  advection_and_precipitation`) and the derived total water path only read
+  total water, so that is all they need: dry air is conserved by adjusting
+  PRESsfc with total water = q + c, and the column budget closes on the
+  TWP of q + c. Checked on CPU with synthetic 16-layer data: total water
+  equals q + c exactly; dry-air global-mean imbalance 178 Pa -> 0.001 Pa;
+  column budget residual 7e-12; no water fields at all still raises
+  KeyError. `force_positive_names` covers all three water/ozone families.
+  **Inference (lw4dvar's `ace2_model.py`) will need the same patch** to run
+  a CRTM checkpoint's corrector.
+- **Condensate normalization floor.** In the 16-layer stats
+  (`stats-1990-01-2019-12`, 1990-2019) condensate std is 8.6e-12 kg/kg in
+  layer 0 (0.01-5.6 hPa), 3.6e-9 in layer 1 (5.6-51 hPa), 2.6e-7 in layer 2
+  (51-91 hPa), then 4.7e-6 and up. Layer 0/1 condensate is ERA5
+  stratospheric noise: zero in all but ~1e-5 / 1e-2 of cells, with rare
+  values 130-580 sigma (layer 2-3 tropopause cirrus is heavy-tailed too, up
+  to ~400 sigma, but physical). Training uses
+  `stats-1990-01-2019-12-condensate-floor`: a copy with the full-field and
+  residual std of `specific_total_condensate_<k>` floored at 1e-6 kg/kg
+  (layers 0-2 changed; recorded in the files' `history`). Plain linear
+  normalization otherwise (fme has no transform; a log/sqrt transform would
+  break q + c = total water); watch the condensate channels.
+- **Loss weights:** fme multiplies prediction and target by the weight
+  before the MSE (`VariableWeightingLoss`), so a channel's share of the loss
+  goes as w^2. To keep each family's 8-layer share when a layer splits into
+  n sub-layers, each gets w8 / sqrt(n) (fixed 2026-10-28; the first version
+  copied w8 to both halves, doubling the 3-D share, and the 32-layer Ursa
+  config's w8 / 4 cut it to a quarter). 16 layers (8-layer k = 2k, 2k+1):
+  air_temperature_0-3, winds 0-1: 0.354, rest 0.707. Vapor and condensate
+  share one set (user's choice, 2026-10-28): layers 0-3 (top-144 hPa;
+  global-mean layer pressures 2.8, 28, 71, 117 hPa) 0.1 (first 0.01, like
+  the 32-layer config's stratospheric total water; raised to 0.1 before the
+  run started) -- not ACE2-ERA5's non-monotonic 0.5/0.25 for its top two
+  total-water layers; 4-5 (144-252 hPa) 0.354;
+  6-15 0.707. Ozone (stratosphere-dominated; user's choice, 2026-10-28):
+  layers 0-5 (top-252 hPa) 0.707, 6-7 (252-401 hPa) 0.354, 8-15 (below
+  ~401 hPa) 0.1 (untuned). Loss shares: 2-D fields ~83%, each 3-D family 2-4%
+  (8-layer: 87%, 3-4%).
+- Memory: like the 8-layer model (probe: 4L = 96 layer channels changes
+  peak memory by <0.3 GB at 1 sample/GPU) -- 4 nodes, no checkpointing.
+
+## Training: 16 layers, CRTM + land (2026-10-28)
+
+For satellite surface emissivity, `ace2-crtm-16layer-train-config.yaml` (and
+the untracked `smoke-crtm16.yaml`) were extended, while job 7794813 was still
+queued, with four prognostics: `soil_moisture_0` (ERA5 swvl1, 0-7 cm), `soil_temperature_0`
+(stl1), `surface_snow_amount_capped` and `surface_snow_area_fraction` --
+112 input / 118 output channels. Experiment dir
+`ace2_training/ace2-crtm-land-16layer-1979-2025-no2015`. CRTM's emissivity models also want 10 m
+wind, skin temperature and the surface-type fractions, which the model
+already has; what it lacked was snow and land state (sea ice is a forcing).
+Only the top soil layer (the user's choice: it's the one emissivity sees).
+
+- **Data, 16-layer files (2015-01/07, stats 1990-2019):** no NaNs. Over
+  ocean soil moisture and snow are 0, soil temperature ~SST. Residual/full
+  std: soil_moisture_0 0.029, soil_temperature_0 0.11, snow fraction 0.026,
+  snow amount 0.0002 (deeper soil layers 0.001-0.02). soil_temperature_3's
+  residual std (0.40 K) is larger than layer 2's (0.09) -- unexplained, not
+  used.
+- **Snow amount capped at 1000 kg/m2 (1 m water equivalent):** ERA5 pins
+  snow at 1e4 kg/m2 on the ice sheets (6717 cells, 2.75% of the globe, every
+  month of 2015) and partly glaciated cells hold thousands (snowy non-cap
+  cells: median 41, 90th percentile 3990 kg/m2), so the std is 1720 (562
+  without cap cells) and seasonal snow gets a tiny normalized range.
+  Capped at 1000: mean ~40, std ~190 (area-weighted, 2015). Emissivity
+  doesn't see deeper snow. The 1990-2019 normalization stats (unweighted
+  over grid cells, like every other variable, so polar ice counts more):
+  uncapped mean 1139 / std 3123 / residual std 0.62; capped mean 127 / std
+  326 / residual std 0.36 kg/m2.
+- **Sidecar dataset:** `ace2_dataset.py capped_snow OUTDIR SIDECAR START END
+  [--cap 1000]` writes `ace2_era5_1deg_16layer/snow-capped-1000/YYYYMM0100.nc`
+  (just `surface_snow_amount_capped`, OUTDIR's time/lat/lon/attributes,
+  ~5 s/month on the login node), merged with the main files by fme
+  (`merge:` in every loader; inference uses MergeNoConcatDatasetConfig). The
+  training files are untouched, so the queued CRTM run is unaffected.
+- **Normalization:** `stats-1990-01-2019-12-condensate-floor-land` = the
+  condensate-floor stats + the sidecar's own (`stats` mode on the sidecar).
+- **Corrector:** soil moisture and both snow fields force_positive; snow
+  fraction can exceed 1 (fme has no upper bound), clip downstream. Soil and
+  snow water are outside fme's moisture budget (atmosphere only).
+- **Loss weights:** `surface_snow_amount_capped` 0.1, the other three 1.
+  Smoke test at weight 1 (job 7795087, `smoke-crtm-land16.yaml`, 2 epochs):
+  valid loss 317 -> 142 and inference error 0.72 -> 0.71, vs 20 -> 12 and
+  0.61 -> 0.48 without land. The loss normalizes by the residual std, the
+  network predicts full fields, so a field-sized error costs
+  (w * full/residual std)^2: snow amount's ratio is 899 (326 / 0.36 kg/m2;
+  the residual std is a global mean dominated by cells where snow never
+  changes), next largest snow fraction 38, PRESsfc 38, soil moisture 34,
+  h500 14 (weight 10). No single weight balances both regimes: 0.04 puts
+  field-sized errors at PRESsfc's level (~1300) but tendency-sized errors at
+  w^2 = 0.0016; 0.1 (chosen) gives ~8000 (between TMP850 2500 and h500
+  19000) and w^2 = 0.01. Judge it by snow in a free run. Smoke test at 0.1
+  (job 7795267, `smoke-crtm16.yaml`): valid loss 47.7 -> 21.6, inference
+  error 0.69 -> 0.55, no NaN, 13 min like the others; still above the
+  no-land run (the new channels start with large errors) but falling faster.
+- **Risk:** ACE2 predicts the full field each step (`residual_prediction:
+  false`, all channels), and soil memory is slow (top soil moisture changes
+  ~3% of its std per 6 h); check snow cover and soil moisture drift in a
+  30-60 day free run, not just the 6-h loss.
+
+## Training on Ursa MI300X (2026-10-28)
+
+Ursa's `u1-mi300x` partition: 5 nodes (e01g[01-02], e02g[01-03]), each 8 x
+192 GB AMD MI300X, 96 CPUs, 2 TB RAM, one mlx5 InfiniBand HCA, 1 TB tmpfs
+`/tmp`, ROCm 7.2.4 / amdgpu 6.16 driver, no internet. Account `gpu-ai4wp`,
+QOS `gpuwf`, the only one allowed there: at most 8 MI300X per user (so
+**one node**; multi-node is refused), 11520 GPU-min running per account (=
+one node for **24 h**), and **one submitted job per user** (no
+`--dependency` chains, no test jobs while a run is queued).
+
+- **Env `ace2-rocm`** (`/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2-rocm`,
+  `ace2-rocm-requirements.txt`): the `ace2` env rebuilt on a login node with
+  only torch swapped for the same version's ROCm wheel --
+  `conda create --prefix $P --file ace2-spec.txt`, then
+  `pip install torch==2.7.1+rocm6.3 torchvision==0.22.1+rocm6.3 --index-url
+  https://download.pytorch.org/whl/rocm6.3`, then the `ace2` lock minus
+  torch/torchvision/triton/nvidia-*. The wheel bundles its own ROCm and RCCL
+  (no `module load rocm`); torch-harmonics is pure Python. fme needs no
+  changes: `torch.cuda` and `backend="nccl"` map to HIP and RCCL.
+  `~/.local` site-packages leak into conda envs (pip took `requests` from
+  there), so the launcher sets `PYTHONNOUSERSITE=1`.
+- **Launcher `run_ace2_train_mi300x.sh`**: one `torchrun --nproc_per_node 8`
+  per node; default 1 node = 2 samples/GPU at batch 16, no checkpointing
+  needed. `expandable_segments` is unsupported in this torch build (dropped).
+- **Per-rank MIOpen caches (`backends/ace2/training/rocm_rank_env.sh`,
+  started by torchrun with `--no-python`, then runs `fme_train.py`).** fme
+  sets `torch.backends.cudnn.benchmark = True`, which on ROCm is MIOpen's
+  exhaustive convolution search; with all 8 ranks sharing one MIOpen user DB
+  (sqlite) in `/tmp`, rank 3 segfaulted 4 min in, still tuning (job
+  24889236). With a DB per rank both the exhaustive and the
+  `MIOPEN_FIND_MODE=FAST` runs work, with identical losses (to ~1e-8) and
+  speed, so the default is kept.
+- **Smoke test** (`ace2-smoke-mi300x.yaml`, untracked = `ace2-smoke-ursa.yaml`
+  with its own experiment dir; jobs 24889407/8): valid loss 22.04 -> 12.61,
+  inference error 0.569 -> 0.452 (H100: 22.92 -> 12.96, 0.577 -> 0.456).
+- **Throughput** (`ace2-rate-mi300x.yaml`, untracked = the Ursa rate test;
+  2 epochs on 2016-2017, jobs 24890813/4), steady (epoch 2): 183 batches in
+  142 s = **0.78 s/batch on 1 node vs 0.97 on 4 u1-h100 nodes**; whole epoch
+  incl. validation and 80-step inference 259 s (4 H100 nodes 272 s). Inline
+  inference ~0.33 s/step. Every job first spends ~5-6 min warming up before
+  step 1 at the same rate in both MIOpen modes (so not conv tuning; cause not
+  found) -- not seen when the 16-layer run resumed (job 25001695). Estimate for a full run (~3930
+  batches/epoch): ~51 min training + ~3 min validation + ~8 min 1440-step
+  inference, ~1 h/epoch, **~5 days for 120 epochs** on one node, if 16 layers
+  run like 8 (the memory probe says they do).
+- **16-layer CRTM + land on Ursa:** `ace2-crtm-16layer-train-config-ursa.yaml`
+  = `ace2-crtm-16layer-train-config.yaml` with Eagle paths -> `/scratch4/BMC/gsienkf/whitaker`
+  and **seed 1** (Polaris: 0), a second realization (different init and
+  shuffling); regenerate it from the Polaris config, don't edit it. Data
+  `ace2_era5_1deg_16layer` (+ `snow-capped-1000/`,
+  `stats-1990-01-2019-12-condensate-floor-land/`) copied from Polaris,
+  staged via `/scratch3/data_untrusted`.
+- **Resubmission (`resubmit_ace2_mi300x.sh`, cron on a login node every 15
+  min):** since jobs can't be chained, it submits the next 24-h job when none
+  is queued or running and the last one ended in TIMEOUT/NODE_FAIL/PREEMPTED;
+  any other end state writes `ace2_crtm_land16_mi300x.STOP` and it stops
+  (fix, delete STOP). It also stops at "Time taken for epoch 120" (then
+  remove the crontab line). It passes the loader settings below as an fme
+  `--override` (since 2026-10-30 also in the Polaris config, so redundant
+  once the Ursa config is regenerated from it).
+- **16-layer data loading was the bottleneck, fixed with 16 loader workers
+  per rank (`train_loader.num_data_workers=16 prefetch_factor=2`).** With 8
+  workers (prefetch 4, then the Polaris setting) the first job (24908976) went
+  from 1.2 s/batch (epoch 1) to 1.4-2.0 (epochs 2-10), slower at busy
+  daytime hours, with some GPUs ~20-30% busy while others were ~85%; epochs
+  took 107-164 min. fme reads each variable separately and the files have
+  one chunk per variable per time (180x360 float32, ~260 KB), so a sample (3
+  times x 123 variables, ~93 MB) is 369 small reads, 1.5-8 s from one
+  process on a login node: latency-bound, not bandwidth-bound. Twice the
+  reads in flight (same 32 batches buffered per rank): **0.71-0.78 s/batch**
+  from the start of job 25001695 (overnight), all GPUs 88-99% busy. If it
+  holds, ~70 min/epoch with validation (~5 min) and inline inference (~9.5
+  min). Next steps if not: rewrite with ~8-time chunks; run inline
+  inference every Nth epoch (`inference.epochs`, only affects
+  `best_inference_ckpt`).
+- **Polaris uses the same loader settings** (2026-10-30, before job 7794813
+  started): `train_loader` 16 workers, prefetch 2 in
+  `ace2-crtm-16layer-train-config.yaml` itself, since a queued PBS job reads
+  the config at launch but keeps the launcher script it was submitted with.
+  Same 32 samples (~3 GB) buffered per rank; 64 loader processes per node on
+  32 cores and 512 GB (they mostly wait on Lustre). Untested on Polaris:
+  check s/batch and GPU utilization early in the run.
+
 ## Cost estimates
 
 ARCO model-level chunks are (1 h, 18 levels, full grid); the 8 fields are
@@ -438,6 +750,8 @@ qsub run_ace2_train_polaris.sh     # 4 nodes, <= 168 h
 # Ursa: normalization stats (u1-service), then training (u1-h100, <= 7 days)
 sbatch -t 02:00:00 -c 64 --mem=240g -o ace2_stats.out -e ace2_stats.err --export=ALL,MODE=stats,WORKERS=12 run_ace2_dataset_ursa.sh
 sbatch run_ace2_train_ursa.sh      # 4 nodes; -N 2..8
+# Ursa: training on u1-mi300x (1 node = 8 MI300X, <= 7 days)
+sbatch --export=ALL,CONFIG=backends/ace2/training/ace2-crtm-16layer-train-config-ursa.yaml run_ace2_train_mi300x.sh
 # Ursa: patch PRESsfc in months built before 2026-10-10 (own log files)
 sbatch -o ace2_fix_presfc.out -e ace2_fix_presfc.err \
     --export=ALL,MODE=fix_presfc,START=1979-01,END=1988-12 run_ace2_dataset_ursa.sh
@@ -467,7 +781,11 @@ weights.
   input and the ps operator uses it. Our 2014-12-30T00 IC differs from the
   ace2_ic.py (HF-HGTsfc) one by 413 Pa rms in PRESsfc, identical elsewhere.
   ERA5 h500/TMP850 verification is linked, so z500 scores compare directly.
-  Files for 2014-2015: `/scratch4/BMC/gsienkf/whitaker/ace2_training/inference_ours/`.
+  Files for 2014-2015: `/scratch4/BMC/gsienkf/whitaker/ace2_training/inference_ours/`;
+  on Polaris `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/inference_ours/`
+  (built 2026-10-28 on a debug node, ~1 min; the login node's 8 GB cap is too
+  tight). Without `exp.forcing_dir` lw4dvar looks in `path_model/forcing_data/`
+  and stops with "no fetched forcing_*.nc".
 - **Free rollout 2015-01-01..07-13** (`free_rollout: True`, 390 x 12 h,
   same setup as the official-checkpoint and AIFS rollouts of issue #12):
   48-h z500 rms 7.6 m vs 8.9 m for the official checkpoint. Bias change from
@@ -530,4 +848,77 @@ weights.
       probe done (see "Memory probe" above): up to 48 layers fit at embed
       384 on the current setup; embed 512 fits on 4 nodes; 768 needs
       ZeRO/FSDP or AMP.
-- [ ] CO2 after 2022.
+- [ ] Split total water into vapor / liquid / ice for radiances: decided
+      2026-10-26 to make vapor, total condensate and ozone prognostic
+      (`--layer_families crtm`; see "CRTM layer variables"). Builder done
+      and validated on one time; dataset build, stats and training config
+      not yet.
+- [x] CO2 after 2022 (NOAA GML; see "CO2 after 2022" above).
+- [ ] 2023-01..2025-12 for both datasets (2026-10-18, Hercules `service`):
+      32-layer one job per year (10159808-10, chains `ace2ds_new_chain1-3`)
+      into `ace2_era5_1deg_32layer`; 8-layer 2023/2024/2025 chained
+      (10159811-13, `ace2ds_new_chain4`) into a recreated
+      `/work2/noaa/gsienkf/whitaker/ace2_era5_1deg_8layer` holding only
+      2023-2025 (its 1979-2022 files were deleted on Hercules after backup).
+      Logs `logs_ace2ds_2023-2025/{8L,32L}_YYYY.{out,err}`.
+- [ ] 16-layer build, 1979-01..2025-12 (2026-10-20, Hercules `service`):
+      nested, every other 32-layer interface (each 8-layer layer split in
+      two, so it contains all 9 original interfaces and is itself contained
+      in the 32-layer grid):
+      `--layer_indices 0 24 48 58 67 73 79 84 90 95 100 104 109 114 119 128 137`.
+      47 one-year jobs (10180627-73) in 4 `--dependency=singleton` chains
+      (`-J ace2ds16_chain<N>`, years round-robin), logs
+      `logs_ace2ds16/YYYY.{out,err}`, into
+      `/work2/noaa/gsienkf/whitaker/ace2_era5_1deg_16layer` (`co2.nc`
+      1940-2025, `co2_1940-2022.nc`, `invariant.nc` and regrid weights
+      copied from the 32-layer dir). Then: check vs 8/32-layer, stats.
+- [ ] CRTM families added to the 16-layer dataset (2026-10-26, Hercules
+      `service`, `MODE=add_layer_families`): 8 jobs of ~6 years
+      (10278388-95: 1979-84, 85-90, 91-96, 97-02, 03-08, 09-14, 15-20,
+      21-25) in 4 `--dependency=singleton` chains (`-J ace2crtm16_chain<N>`),
+      logs `logs_ace2ds16_crtm/YYYY-YYYY.{out,err}`. Then: stats with the new
+      fields, copy to Ursa/Polaris.
+      First months: 4.3-4.4 min/month (16 workers), total water check
+      ~2.4e-9 kg/kg; ~5.3 h per 6-year job.
+- [ ] CRTM families added to the 32-layer dataset (2026-10-26, same mode):
+      16 jobs of 3 years (10278432-47: 1979-81, ..., 2021-23, 2024-25) in 4
+      singleton chains (`-J ace2crtm32_chain<N>`), each also `afterok` on
+      all eight 16-layer jobs; logs `logs_ace2ds32_crtm/YYYY-YYYY.{out,err}`.
+      +96 fields = +3 GB/month (~1.7 TB). If a 16-layer job fails these stay
+      pending (DependencyNeverSatisfied): fix, rerun it, resubmit them.
+- [ ] 16-layer normalization stats incl. the crtm families (2026-10-26):
+      job 10280347 (`MODE=stats` in `run_ace2_dataset_hercules.sh`, 8
+      workers, 100 GB -- fits beside a 32-layer job on a DTN node),
+      `afterok` on the 16-layer jobs covering 1985-2020, into
+      `ace2_era5_1deg_16layer/stats-1990-01-2019-12/`; log
+      `logs_ace2ds16_crtm/stats.{out,err}`. Fixed first: `_month_stats` kept
+      each variable's whole month array alive through the `first`/`last`
+      views (23 GB per worker at 16 layers, 236 vars; now 8.4 GB, results
+      identical) -- likely also the cause of the ~14 GB/worker OOMs on Ursa.
+- [ ] 16-layer CRTM training on Polaris (see "Training: 16 layers, CRTM
+      variables"): config `ace2-crtm-16layer-train-config.yaml`, total-water
+      patch in `fme_train.py`, condensate-floor stats, loss weights (see
+      that section). 1-node smoke test passed 2026-10-28 (job 7790856,
+      `smoke-crtm16.yaml`, untracked; 2 epochs, 1.19 samples/s/GPU like 8
+      layers, inference error 0.61 -> 0.48, no NaN), after fixing three
+      launch problems: the NCCL plugin (above), TMPDIR (below), and inline
+      inference OOM at forward_steps_in_memory 40 (now 20). Full 120-epoch
+      run on 4 nodes submitted 2026-10-28 (job 7794813, capacity queue,
+      seed 0, logs `ace2_crtm16.{out,err}`); the config gained the land
+      variables before it started ("Training: 16 layers, CRTM + land"),
+      experiment dir
+      `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-land-16layer-1979-2025-no2015`.
+- [ ] 16-layer CRTM + land training on Ursa MI300X (see "Training on Ursa
+      MI300X"): env, launcher, 8-layer smoke and throughput tests done
+      2026-10-28; `ace2-crtm-16layer-train-config-ursa.yaml` (seed 1)
+      running since 2026-10-29 (job 24908976, then 25001695 with 16 loader
+      workers), resubmitted every 24 h by cron (`resubmit_ace2_mi300x.sh`,
+      logs `ace2_crtm_land16_mi300x_<job>.{out,err}`); 11 epochs done by
+      2026-10-30, valid loss 0.564 -> 0.199.
+- [ ] 32-layer CRTM + land, embed 512 (2026-10-30):
+      `ace2-crtm-32layer-e512-train-config-ursa.yaml`, generated from the
+      16-layer CRTM+land config (each layer j -> 2j, 2j+1, layer loss weights
+      w16 / sqrt(2), embed_dim 512, 2015 held out; header lists the details).
+      Not runnable yet: needs the 32-layer CRTM families on Ursa and
+      `ace2_era5_1deg_32layer/stats-1990-01-2019-12-condensate-floor-land`;
+      reuses the 16-layer capped-snow sidecar. Smoke test before a full run.
