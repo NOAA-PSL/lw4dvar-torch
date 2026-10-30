@@ -11,7 +11,7 @@
 #SBATCH --cpus-per-task=96
 #SBATCH --exclusive
 #SBATCH --mem=0
-#SBATCH -t 7-00:00:00
+#SBATCH -t 1-00:00:00  # QOS gpuwf: <= 24 h for a full node
 
 # Train an ACE2 checkpoint with fme on Ursa u1-mi300x nodes (8 x 192 GB AMD
 # MI300X each, one rank per GPU, DDP over RCCL; one mlx5 IB HCA per node);
@@ -26,7 +26,8 @@
 # s/batch steady vs 0.97 on 4 u1-h100 nodes (2026-10-28), plus ~5-6 min of
 # first-epoch warm-up per job. Inline-inference ICs must be a multiple of 8 x
 # nodes.
-# fme resumes from experiment_dir/training_checkpoints, so resubmit/chain.
+# fme resumes from experiment_dir/training_checkpoints; gpuwf allows one
+# submitted job per user, so resubmit from cron (resubmit_ace2_mi300x.sh).
 
 module load rdhpcs-conda
 conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/ace2-rocm

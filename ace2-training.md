@@ -647,7 +647,10 @@ Only the top soil layer (the user's choice: it's the one emissivity sees).
 Ursa's `u1-mi300x` partition: 5 nodes (e01g[01-02], e02g[01-03]), each 8 x
 192 GB AMD MI300X, 96 CPUs, 2 TB RAM, one mlx5 InfiniBand HCA, 1 TB tmpfs
 `/tmp`, ROCm 7.2.4 / amdgpu 6.16 driver, no internet. Account `gpu-ai4wp`,
-QOS `gpuwf` (<= 7 days).
+QOS `gpuwf`, the only one allowed there: at most 8 MI300X per user (so
+**one node**; multi-node is refused), 11520 GPU-min running per account (=
+one node for **24 h**), and **one submitted job per user** (no
+`--dependency` chains, no test jobs while a run is queued).
 
 - **Env `ace2-rocm`** (`/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2-rocm`,
   `ace2-rocm-requirements.txt`): the `ace2` env rebuilt on a login node with
@@ -680,7 +683,7 @@ QOS `gpuwf` (<= 7 days).
   incl. validation and 80-step inference 259 s (4 H100 nodes 272 s). Inline
   inference ~0.33 s/step. Every job first spends ~5-6 min warming up before
   step 1 at the same rate in both MIOpen modes (so not conv tuning; cause not
-  found) -- negligible in a 7-day job. Estimate for a full run (~3930
+  found) -- not seen when the 16-layer run resumed (job 25001695). Estimate for a full run (~3930
   batches/epoch): ~51 min training + ~3 min validation + ~8 min 1440-step
   inference, ~1 h/epoch, **~5 days for 120 epochs** on one node, if 16 layers
   run like 8 (the memory probe says they do).
@@ -691,6 +694,28 @@ QOS `gpuwf` (<= 7 days).
   `ace2_era5_1deg_16layer` (+ `snow-capped-1000/`,
   `stats-1990-01-2019-12-condensate-floor-land/`) copied from Polaris,
   staged via `/scratch3/data_untrusted`.
+- **Resubmission (`resubmit_ace2_mi300x.sh`, cron on a login node every 15
+  min):** since jobs can't be chained, it submits the next 24-h job when none
+  is queued or running and the last one ended in TIMEOUT/NODE_FAIL/PREEMPTED;
+  any other end state writes `ace2_crtm_land16_mi300x.STOP` and it stops
+  (fix, delete STOP). It also stops at "Time taken for epoch 120" (then
+  remove the crontab line). It passes the loader settings below as an fme
+  `--override`, keeping the config identical to Polaris's.
+- **16-layer data loading was the bottleneck, fixed with 16 loader workers
+  per rank (`train_loader.num_data_workers=16 prefetch_factor=2`).** With 8
+  workers (prefetch 4, the Polaris setting) the first job (24908976) went
+  from 1.2 s/batch (epoch 1) to 1.4-2.0 (epochs 2-10), slower at busy
+  daytime hours, with some GPUs ~20-30% busy while others were ~85%; epochs
+  took 107-164 min. fme reads each variable separately and the files have
+  one chunk per variable per time (180x360 float32, ~260 KB), so a sample (3
+  times x 123 variables, ~93 MB) is 369 small reads, 1.5-8 s from one
+  process on a login node: latency-bound, not bandwidth-bound. Twice the
+  reads in flight (same 32 batches buffered per rank): **0.71-0.78 s/batch**
+  from the start of job 25001695 (overnight), all GPUs 88-99% busy. If it
+  holds, ~70 min/epoch with validation (~5 min) and inline inference (~9.5
+  min). Next steps if not: rewrite with ~8-time chunks; run inline
+  inference every Nth epoch (`inference.epochs`, only affects
+  `best_inference_ckpt`).
 
 ## Cost estimates
 
@@ -877,5 +902,8 @@ weights.
       `/lus/eagle/projects/moonshot-reanalysis/jwhitaker/ace2_training/ace2-crtm-land-16layer-1979-2025-no2015`.
 - [ ] 16-layer CRTM + land training on Ursa MI300X (see "Training on Ursa
       MI300X"): env, launcher, 8-layer smoke and throughput tests done
-      2026-10-28; `ace2-crtm-16layer-train-config-ursa.yaml` (seed 1) to be
-      submitted once the 16-layer dataset is on `/scratch4`.
+      2026-10-28; `ace2-crtm-16layer-train-config-ursa.yaml` (seed 1)
+      running since 2026-10-29 (job 24908976, then 25001695 with 16 loader
+      workers), resubmitted every 24 h by cron (`resubmit_ace2_mi300x.sh`,
+      logs `ace2_crtm_land16_mi300x_<job>.{out,err}`); 11 epochs done by
+      2026-10-30, valid loss 0.564 -> 0.199.
