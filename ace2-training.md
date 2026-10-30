@@ -915,3 +915,10 @@ weights.
       workers), resubmitted every 24 h by cron (`resubmit_ace2_mi300x.sh`,
       logs `ace2_crtm_land16_mi300x_<job>.{out,err}`); 11 epochs done by
       2026-10-30, valid loss 0.564 -> 0.199.
+- [ ] 32-layer CRTM + land, embed 512 (2026-10-30):
+      `ace2-crtm-32layer-e512-train-config-ursa.yaml`, generated from the
+      16-layer CRTM+land config (each layer j -> 2j, 2j+1, layer loss weights
+      w16 / sqrt(2), embed_dim 512, 2015 held out; header lists the details).
+      Not runnable yet: needs the 32-layer CRTM families on Ursa and
+      `ace2_era5_1deg_32layer/stats-1990-01-2019-12-condensate-floor-land`;
+      reuses the 16-layer capped-snow sidecar. Smoke test before a full run.
