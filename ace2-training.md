@@ -700,10 +700,11 @@ one node for **24 h**), and **one submitted job per user** (no
   any other end state writes `ace2_crtm_land16_mi300x.STOP` and it stops
   (fix, delete STOP). It also stops at "Time taken for epoch 120" (then
   remove the crontab line). It passes the loader settings below as an fme
-  `--override`, keeping the config identical to Polaris's.
+  `--override` (since 2026-10-30 also in the Polaris config, so redundant
+  once the Ursa config is regenerated from it).
 - **16-layer data loading was the bottleneck, fixed with 16 loader workers
   per rank (`train_loader.num_data_workers=16 prefetch_factor=2`).** With 8
-  workers (prefetch 4, the Polaris setting) the first job (24908976) went
+  workers (prefetch 4, then the Polaris setting) the first job (24908976) went
   from 1.2 s/batch (epoch 1) to 1.4-2.0 (epochs 2-10), slower at busy
   daytime hours, with some GPUs ~20-30% busy while others were ~85%; epochs
   took 107-164 min. fme reads each variable separately and the files have
@@ -716,6 +717,13 @@ one node for **24 h**), and **one submitted job per user** (no
   min). Next steps if not: rewrite with ~8-time chunks; run inline
   inference every Nth epoch (`inference.epochs`, only affects
   `best_inference_ckpt`).
+- **Polaris uses the same loader settings** (2026-10-30, before job 7794813
+  started): `train_loader` 16 workers, prefetch 2 in
+  `ace2-crtm-16layer-train-config.yaml` itself, since a queued PBS job reads
+  the config at launch but keeps the launcher script it was submitted with.
+  Same 32 samples (~3 GB) buffered per rank; 64 loader processes per node on
+  32 cores and 512 GB (they mostly wait on Lustre). Untested on Polaris:
+  check s/batch and GPU utilization early in the run.
 
 ## Cost estimates
 

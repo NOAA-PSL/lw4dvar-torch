@@ -95,8 +95,11 @@ logging:
   entity: ai2cm
 train_loader:
   batch_size: 16
-  num_data_workers: 8
-  prefetch_factor: 4
+  # 16 workers x prefetch 2 (was 8 x 4: same 32 samples buffered per rank,
+  # twice the reads in flight): 16-layer loading is latency-bound on small
+  # per-variable chunk reads (Ursa: 1.4-2.0 -> 0.71-0.78 s/batch).
+  num_data_workers: 16
+  prefetch_factor: 2
   dataset:
     merge:
     - concat:
