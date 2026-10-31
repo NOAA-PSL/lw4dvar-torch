@@ -642,6 +642,35 @@ Only the top soil layer (the user's choice: it's the one emissivity sees).
   ~3% of its std per 6 h); check snow cover and soil moisture drift in a
   30-60 day free run, not just the 6-h loss.
 
+## Training on Ursa GH200 (2026-10-31)
+
+Ursa's `u1-gh` partition: 8 nodes (e01a[01-04], e02a[01-04]), each one
+NVIDIA GH200 (96 GB HBM), 72 Grace aarch64 cores, 213 GB RAM, IB mlx5_0,
+driver 590 (CUDA 13.1), no internet, no `rdhpcs-conda` module. QOS
+`gpuwf` (account `gpu-ai4wp`): <= 8 GH200 per job, 11520 GH200-min running
+per account (8 nodes x 24 h); a u1-gh job was accepted while the MI300X run
+held its gpuwf job.
+
+- **Env `ace2-gh`** (`/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2-gh`,
+  `ace2-gh-requirements.txt`), built from an x86 login node:
+  `conda create --platform linux-aarch64 -p $P -c conda-forge python=3.12.14
+  pip`; `pip download --no-deps --only-binary=:all: --platform
+  manylinux_2_28_aarch64 ...` of torch 2.7.1+cu128, torchvision and triton
+  3.3.1 (download.pytorch.org/whl/cu128; triton 3.3.1 has no aarch64 wheel
+  on PyPI) plus the `ace2` lock minus torch/nvidia-* (antlr4 and
+  torch_harmonics as sdists); then on a GH node `pip install --no-index
+  --find-links wheels --no-build-isolation ...` (markers must be evaluated
+  on aarch64). The aarch64 torch wheel bundles its CUDA/cuDNN/NCCL libs, so
+  no nvidia-* packages. Same versions as `ace2` otherwise.
+- **Launcher `run_ace2_train_gh.sh`**: one rank per node, env activated by
+  PATH (no conda module on the nodes); default 8 nodes = 2 samples/GPU.
+- **32-layer CRTM+land e512 smoke** (job 25131752, untracked
+  `smoke-crtm-land32-e512-gh4n.yaml`, 4 nodes = 4 samples/GPU, no
+  checkpointing, no OOM): losses identical to the 4-node H100 smoke (valid
+  3.670 -> 2.080, inference 0.4875 -> 0.4706); 2.4 s/batch steady (91
+  batches in 218 s) vs 2.3 s on 8 H100s, i.e. ~1.9x an H100 per GPU;
+  validation + 80-step inference 250 s vs ~320 s.
+
 ## Training on Ursa MI300X (2026-10-28)
 
 Ursa's `u1-mi300x` partition: 5 nodes (e01g[01-02], e02g[01-03]), each 8 x
@@ -919,6 +948,14 @@ weights.
       `ace2-crtm-32layer-e512-train-config-ursa.yaml`, generated from the
       16-layer CRTM+land config (each layer j -> 2j, 2j+1, layer loss weights
       w16 / sqrt(2), embed_dim 512, 2015 held out; header lists the details).
-      Not runnable yet: needs the 32-layer CRTM families on Ursa and
-      `ace2_era5_1deg_32layer/stats-1990-01-2019-12-condensate-floor-land`;
-      reuses the 16-layer capped-snow sidecar. Smoke test before a full run.
+      Reuses the 16-layer capped-snow sidecar. Data on Ursa 2026-10-31
+      (564 months 1979-2025, all config variables, no NaNs except SST over
+      land, which isn't used). `stats-1990-01-2019-12-condensate-floor-land`
+      built from the 32-layer stats: condensate std floored at 1e-6 kg/kg in
+      layers 0-5 (layer 0 std is exactly 0; layer 5 4.6e-7), plus the
+      sidecar's snow stats. Smoke test passed 2026-10-31: job 25097744 (4
+      u1-h100 nodes, untracked `smoke-crtm-land32-e512-4n-ursa.yaml`, 2
+      epochs on 2024, validation batch 16 -- 128 leaves Jan-Feb empty):
+      valid loss 3.67 -> 2.08, inference error 0.488 -> 0.471, no NaN;
+      ~2.3 s/batch (91 batches in ~210 s), so ~2.7 h of training per full
+      epoch on 4 H100 nodes.
