@@ -17,23 +17,20 @@
 #   inference from 16 ICs, forward_steps_in_memory 20) as at 16 layers --
 #   not the e512 run's 2026 validation: the CRTM families were only built
 #   for 1979-2025.
-# - 208 input / 214 output channels (e512 total-water run: 140 / 146);
-#   untested -- run a smoke test first (memory: the probe found channels
-#   cost little; e512 fit on 4 u1-h100 nodes without checkpointing).
-# - Train loader 16 workers x prefetch 2 (as at 16 layers); 32-layer
-#   samples are about twice as many per-variable reads, so loading may
-#   limit speed even more.
-# Prerequisites on Ursa (not there yet, 2026-10-30):
-# - CRTM families (specific_humidity_, specific_total_condensate_,
-#   ozone_mass_mixing_ratio_ 0-31) in ace2_era5_1deg_32layer 1979-2025
-#   (Hercules add_layer_families jobs, ace2crtm32_chain*), copied over.
-# - ace2_era5_1deg_32layer/stats-1990-01-2019-12-condensate-floor-land: the
-#   32-layer stats with those families, condensate std floored at 1e-6
-#   kg/kg, plus surface_snow_amount_capped's stats (same field as at 16
-#   layers: copy them from the 16-layer -land stats).
+# - 208 input / 214 output channels (e512 total-water run: 140 / 146).
+# - Train loader 16 workers x prefetch 2 (as at 16 layers). Data are read
+#   from ace2_era5_1deg_32layer-t4: the 216 variables this config uses,
+#   time chunk 4 (originals: chunk 1), ~1.6x faster cold reads in the
+#   2026-10-31 benchmark; stats stay in ace2_era5_1deg_32layer.
+# - Smoke tests passed 2026-10-31 (4 u1-h100 nodes and 4 u1-gh nodes,
+#   identical losses; 2.3 / 2.4 s/batch). Intended for 8 u1-gh nodes
+#   (run_ace2_train_gh.sh, 2 samples/GPU).
 # - The capped-snow sidecar is the 16-layer one
 #   (ace2_era5_1deg_16layer/snow-capped-1000): a 2-D field with the same
 #   times and grid as the 32-layer files (checked 1979-01, 2015-07, 2025-12).
+# - ace2_era5_1deg_32layer/stats-1990-01-2019-12-condensate-floor-land: the
+#   32-layer stats, condensate std floored at 1e-6 kg/kg (layers 0-5), plus
+#   the sidecar's surface_snow_amount_capped stats.
 experiment_dir: /scratch4/BMC/gsienkf/whitaker/ace2_training/ace2-crtm-land-32layer-e512-1979-2025-no2015
 save_checkpoint: true
 validate_using_ema: true
@@ -65,7 +62,7 @@ inference:
       - '2015-01-04T18:00:00'
     dataset:
       merge:
-      - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer
+      - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer-t4
         file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
       - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_16layer/snow-capped-1000
         file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
@@ -89,12 +86,12 @@ train_loader:
   dataset:
     merge:
     - concat:
-      - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer
+      - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer-t4
         file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
         subset:
           start_time: '1979-01-01T00:00:00'
           stop_time: '2014-12-31T06:00:00'
-      - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer
+      - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer-t4
         file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
         subset:
           start_time: '2016-01-01T00:00:00'
@@ -116,7 +113,7 @@ validation_loader:
   prefetch_factor: 4
   dataset:
     merge:
-    - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer
+    - data_path: /scratch4/BMC/gsienkf/whitaker/ace2_era5_1deg_32layer-t4
       file_pattern: '[12][0-9][0-9][0-9][01][0-9]0100.nc'
       subset:
         start_time: '2015-01-01T00:00:00'

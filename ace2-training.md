@@ -958,4 +958,12 @@ weights.
       epochs on 2024, validation batch 16 -- 128 leaves Jan-Feb empty):
       valid loss 3.67 -> 2.08, inference error 0.488 -> 0.471, no NaN;
       ~2.3 s/batch (91 batches in ~210 s), so ~2.7 h of training per full
-      epoch on 4 H100 nodes.
+      epoch on 4 H100 nodes. Same on 4 u1-gh nodes (see "Training on Ursa
+      GH200"). Training data rechunked 2026-10-31 for the 8-node GH200 run:
+      `ace2_era5_1deg_32layer-t4` = the 216 variables the config uses (of
+      347), time chunk 4 (benchmark: ~1.6x faster cold reads than chunk 1),
+      3.5 TB, 8 u1-compute nodes in 2 min (job 25132480, scripts in
+      `tmp/rechunk32`, untracked); all 564 files checked (variables, times,
+      chunking), 7 compared value by value (identical). The config reads it;
+      stats stay in `ace2_era5_1deg_32layer`. Full run waits for the
+      16-layer MI300X run to finish.
