@@ -669,7 +669,23 @@ held its gpuwf job.
   checkpointing, no OOM): losses identical to the 4-node H100 smoke (valid
   3.670 -> 2.080, inference 0.4875 -> 0.4706); 2.4 s/batch steady (91
   batches in 218 s) vs 2.3 s on 8 H100s, i.e. ~1.9x an H100 per GPU;
-  validation + 80-step inference 250 s vs ~320 s.
+  validation + 80-step inference 250 s vs ~320 s. Rerun on the chunk-4
+  copy (job 25134917): bit-identical losses, 2.3 s/batch (211 s) -- no
+  faster, so 4 nodes are compute-bound; chunk 4 is headroom for 8 nodes.
+- **Full 32-layer run** (2026-10-31, exp dir
+  `ace2-crtm-land-32layer-e512-1979-2025-no2015`): the first job (25138848)
+  was OOM-killed on the host during setup (213 GB RAM): fme's inline-
+  inference loader fetches its first batch at startup with 8 fork workers,
+  each copying parts of a ~20 GB parent. With 8 train workers it ran at
+  4.25 s/batch, GPUs idle waiting for data. Working settings (job
+  25142018, 4 nodes until 2026-11-02 12:08, before another user's 8-node
+  slot): config's 16 train workers x prefetch 2, plus `--override
+  validation_loader.num_data_workers=4 validation_loader.prefetch_factor=1
+  inference.loader.num_data_workers=2`: 2.0 s/batch, MaxRSS 112 GB/node.
+- **Resubmission:** a second ufe01 crontab line runs `resubmit_ace2_mi300x.sh`
+  with `JOB=ace2_train_gh SCRIPT=run_ace2_train_gh.sh
+  LOGS=ace2_crtm_land32_gh` and that OVERRIDE; later jobs are 8 nodes x
+  24 h (the launcher default). Logs `ace2_crtm_land32_gh_<job>.{out,err}`.
 
 ## Training on Ursa MI300X (2026-10-28)
 
