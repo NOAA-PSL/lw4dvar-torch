@@ -276,9 +276,9 @@ def load_config(config_path='config.yml'):
     exp['path_output'] = exp['path_output'] + exp['exp_name'] + '/'
 
     backend = exp.get('model_backend')
-    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno'):
+    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm'):
         raise ValueError(
-            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno', got {backend!r} -- "
+            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm', got {backend!r} -- "
             "this key is required (see config.yml.template)"
         )
     # reset_skt_ocean: AIFS and Aurora both have 'skt'/'lsm' packed-state
@@ -323,6 +323,15 @@ def load_config(config_path='config.yml'):
             )
         if exp['ps_operator'] == 'ps':
             raise ValueError("ps_operator='ps' is not supported for ACE2 -- use 'ps_native' (the default)")
+    # NGCM (JAX, via backends/jax_bridge.py): 32 hybrid layers, so the same
+    # 'ps_native' default as ACE2.
+    if backend == 'ngcm':
+        exp.setdefault('ps_operator', 'ps_native')
+        if exp['ps_operator'] == 'ps':
+            raise ValueError("ps_operator='ps' is not supported for NGCM -- use 'ps_native' (the default)")
+        for key in ('ngcm_exp', 'ngcm_step', 'ngcm_data'):
+            if key not in exp:
+                raise ValueError(f"model_backend 'ngcm' needs exp.{key} (see config.yml.template)")
     # jc_ps_sigma (the original, un-normalized penalty) was removed -- fail
     # loudly rather than silently run without the penalty.
     if 'jc_ps_sigma' in exp:
@@ -380,10 +389,11 @@ def load_config(config_path='config.yml'):
             raise ValueError(f"autocast_dtype for {backend!r} must be one of {sorted(allowed)}, got {exp['autocast_dtype']!r}")
         exp['autocast_dtype'] = name
     # ps_native needs decode_state's lowest-native-level keys
-    # (t_lowest/q_lowest/p_lowest), which only the ACE2 backend provides.
-    if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend != 'ace2':
+    # (t_lowest/q_lowest/p_lowest), which only the hybrid-layer backends
+    # (ACE2, NGCM) provide.
+    if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend not in ('ace2', 'ngcm'):
         raise ValueError(
-            f"ps_operator='ps_native' is only supported for model_backend 'ace2', got {backend!r} "
+            f"ps_operator='ps_native' is only supported for model_backends 'ace2' and 'ngcm', got {backend!r} "
             "(it needs decode_state's lowest-native-level t_lowest/q_lowest/p_lowest fields)."
         )
     return exp, windows
@@ -545,7 +555,22 @@ def get_model(exp):
             forcing_dir=exp.get('forcing_dir', exp['path_model'] + 'forcing_data/'),
             device=exp.get('device', 'cuda'),
         )
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+    elif backend == 'ngcm':
+        # JAX model (ngcm-train's NeuralGCM-style TL63 model) behind the
+        # torch interface via backends/jax_bridge.py; ngcm-torch env
+        # (run_ngcm.sh).
+        _ensure_backend_on_path('ngcm')
+        import ngcm_model
+        return ngcm_model.NGCMModel(
+            exp_dir=exp['ngcm_exp'],
+            step=int(exp['ngcm_step']),
+            data_dir=exp['ngcm_data'],
+            ngcm_train_path=exp.get('ngcm_train_path', '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'),
+            device=exp.get('device', 'cuda'),
+            use_ema=exp.get('ngcm_use_ema', True),
+            state_scales=exp.get('ngcm_state_scales'),
+        )
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
 
 
 def get_grid_interpolator(model, exp):
@@ -590,8 +615,8 @@ def get_grid_interpolator(model, exp):
         if kind == 'kdtree':
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    elif backend == 'ace2':
-        # F90 Gaussian grid: unevenly spaced latitudes, so fcn3_grid's
+    elif backend in ('ace2', 'ngcm'):
+        # F90 (ACE2) / TL63 (NGCM) Gaussian grids: unevenly spaced latitudes, so fcn3_grid's
         # uniform-latitude BilinearGridInterpolator doesn't apply --
         # ace2_grid's rectilinear version is the same scheme on the real
         # latitudes. 'kdtree' falls back to fcn3_grid.GridInterpolator.
@@ -605,7 +630,7 @@ def get_grid_interpolator(model, exp):
             import fcn3_grid
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
 
 
 # ---------------------------------------------------------------------------
@@ -663,8 +688,12 @@ def get_input(exp, model, logger):
             _ensure_backend_on_path('ace2')
             import ace2_ic
             input_state = ace2_ic.build_input_state(back_dt, cache_dir)
+        elif backend == 'ngcm':
+            # read straight from the training store's local zarr (ngcm_data)
+            # -- no login-node prefetch needed.
+            input_state = model.read_inputs(back_dt)
         else:
-            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
         input_encoded = model.prepare_initial_state(input_state, back_dt)
         dt_hours = exp['nhrs_back']
         logger.info('generating input state from a forecast...')
@@ -789,8 +818,14 @@ def get_verif(exp, model, logger, date_override=None):
         truth = ace2_ic.load_verif(date_dt, cache_dir)
         verif_ic['z500'] = GRAV * torch.as_tensor(truth['h500'], dtype=torch.float32, device=model.device).reshape(-1)
         verif_ic['TMP850'] = torch.as_tensor(truth['TMP850'], dtype=torch.float32, device=model.device).reshape(-1)
+    elif backend == 'ngcm':
+        # Orography: the model's own T63 orography (what its ps is consistent
+        # with). Truth for the z500 diagnostic: ERA5 z500 on the model grid
+        # from the store's pressure.zarr.
+        verif_ic['geopotential_at_surface'] = model.surface_geopotential
+        verif_ic['z500'] = model.read_z500(date_dt)
     else:
-        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
 
     if "z" in verif_ic:
         verif_ic["geopotential"] = verif_ic["z"]

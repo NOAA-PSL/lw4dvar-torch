@@ -2,18 +2,19 @@ exp:
   # model_backend selects which forecast model backs the 4D-Var solver:
   # 'aifs' (ECMWF AIFS-single-2.0, backends/aifs/), 'fcn3' (NVIDIA
   # FourCastNet3, backends/fcn3/), 'aurora' (Microsoft Aurora v1.5,
-  # backends/aurora/), or 'ace2' (Ai2 ACE2-ERA5, backends/ace2/). Required --
+  # backends/aurora/), 'ace2' (Ai2 ACE2-ERA5, backends/ace2/), 'sfno', or
+  # 'ngcm' (JAX NeuralGCM-style model, backends/ngcm/). Required --
   # load_config() raises if this is missing or not one of these values.
   # This one key also picks which conda env the job must run under (aifs2 /
-  # fcstnet3 / aurora / ace2 -- see run_aifs.sh / run_fcn3.sh /
-  # run_aurora.sh / run_ace2.sh). Exception: AIFS checkpoints trained with
+  # fcstnet3 / aurora / ace2 / ngcm-torch -- see run_aifs.sh / run_fcn3.sh /
+  # run_aurora.sh / run_ace2.sh / run_ngcm.sh). Exception: AIFS checkpoints trained with
   # the multi-dataset anemoi API (anemoi-models >= 0.19, e.g. the 1-degree
   # aifs2-1deg-ic1) keep model_backend: aifs but run in the aifs3 env
   # (run_aifs3.sh), where get_model() picks aifs3_model.AIFS3Model -- see
   # config_test_aifs3.yml. The envs are NOT
   # co-installed (see integrate_multiple_backends.md), so backends not selected here don't need
   # to be importable at all in the env you actually run with.
-  model_backend: fcn3  # or: aifs, aurora, ace2, sfno
+  model_backend: fcn3  # or: aifs, aurora, ace2, sfno, ngcm
 
   # get_input() always builds the very first initial condition from an
   # ERA5 forecast `nhrs_back` hours before `sdate`, fetched via CDS -- see
@@ -41,6 +42,19 @@ exp:
   exp_name: 'test_v1' # data is saved in this subdirectory
 
   # --- path_model / model_backend-specific checkpoint keys ---
+  # NGCM (JAX, run_ngcm.sh; integrate_jax_backend.md): no path_model. An
+  # ngcm-train run dir and checkpoint step, its data store (ICs, forcings
+  # and z500 truth are read from it directly), and the ngcm-train checkout:
+  #   ngcm_exp: '/scratch4/BMC/gsienkf/whitaker/ngcm_runs/r72_top150'
+  #   ngcm_step: 51660
+  #   ngcm_data: '/scratch4/BMC/gsienkf/whitaker/ngcm_data/era5_ace2l32_tl63'
+  #   ngcm_train_path: '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'
+  #   ngcm_use_ema: True
+  # ngcm_state_scales ({family: factor}; the optimizer works on factor *
+  # state): default {vorticity: 6857, divergence: 6857,
+  # hybrid_specific_humidity: 1e5, specific_total_condensate: 1e5}, i.e.
+  # the original NeuralGCM runs' {specific_humidity: 1e5} in NeuralGCM's
+  # nondimensional units.
   # AIFS: path_model is the DIRECTORY containing the checkpoint; the
   # checkpoint's own filename is given separately via model_name.
   #   path_model: './backends/aifs/aifs-single-2.0/'
