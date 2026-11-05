@@ -19,7 +19,9 @@ network access, in a few seconds. `make check` runs:
 
 - `tests/unit/`: pure functions of the solver core. These are
   `area_weights_from_lats`, the surface-pressure operators
-  (`get_surface_pressure`, `preduce`), the obs-density Jo weights, the
+  (`get_surface_pressure`, `preduce`), the horizontal interpolators
+  (`backends/{fcn3,ace2,aifs}/*_grid.py`, and `get_grid_interpolator`'s
+  choice among them), the obs-density Jo weights, the
   control-variable mask, config validation (every tracked `config_test_*.yml`
   and `config.yml.template` must load) and the date helpers. Each test checks
   against an independent reference (exact spherical areas, an isothermal
