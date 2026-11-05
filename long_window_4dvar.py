@@ -74,7 +74,11 @@ os.makedirs(exp_dir, exist_ok=True)
 shutil.copy(config_path, exp_dir + 'config.yml.' + datetime.now().strftime("%Y%m%d_%H%M%S"))
 
 logger.info('model_backend: ' + str(exp_config['model_backend']))
-logger.info('reading model checkpoint ' + str(exp_config['path_model']))
+# path_model is optional for some backends (sfno has a default; ngcm uses
+# ngcm_exp/ngcm_step instead).
+checkpoint = exp_config.get('path_model') or (
+    f"{exp_config.get('ngcm_exp')} step {exp_config.get('ngcm_step')}" if exp_config['model_backend'] == 'ngcm' else None)
+logger.info('reading model checkpoint ' + str(checkpoint))
 model = utils.get_model(exp_config)
 logger.info('model time step = ' + str(model.timestep))
 grid_interp = utils.get_grid_interpolator(model, exp_config)

@@ -118,3 +118,62 @@ terrax's `InferenceModel` (assimilate / advance / observe).
   (dt_verif 6, dt_obs 3: the model step is 6 h), lr 1e-4 constant, weight
   decay 1e-3, 50 epochs, 100 cycles from 2015-01-01. Its `lam: 20`
   geopotential-tendency penalty has no counterpart (off).
+
+## The official NeuralGCM backend (`backends/neuralgcm/`, `model_backend: neuralgcm`, 2026-11-05)
+
+`neuralgcm.PressureLevelModel` checkpoints (e.g. `deterministic_2_8_deg.pkl`)
+through the same bridge, to reproduce the original JAX ps-obs experiments
+(long-window-4dvar-psobs) with this solver. Keys: `neuralgcm_checkpoint`,
+`neuralgcm_input_dir` (the original runs' per-time ERA5 netCDFs,
+YYYY-MM-DDTHH.nc, 6-hourly, which also give ICs, forcings and the z500 /
+orography verification), `neuralgcm_state_scales`, `ngcm_train_path` (for
+`ngcm_train.precision.use_highest_precision()`: dinosaur's default GPU
+float32 dot is miscompiled with jax <= 0.11.1).
+
+- 1 h step, so 3-hourly obs fall on model steps (dt_verif 3).
+- Packed state (1, 390, 128, 65): every float leaf of the ModelState --
+  `state` (193 channels: vorticity, divergence, temperature_variation,
+  ln ps, cloud ice, cloud liquid, humidity; modal (127, 65)), `memory` (the
+  previous state, same structure), diagnostics, and the two sim_time
+  scalars in a last channel. The control (latent) is the 193 `state`
+  channels; everything else is a `diagnostic_column`, so the control mask
+  never resets the memory.
+- `decode` and `advance` take SINGLE-TIME forcings (`data_from_xarray`;
+  advance prepends its own time axis): passing a time series fails inside
+  `jnp.interp`. The backend uses the 6-hourly file nearest each step, as
+  `unroll` does (round half to even).
+- No surface pressure from `decode`: `ps_operator: logpinterp` (the
+  original's); `decode_state` adds 'sp' from the state's ln ps
+  (`model_coords.horizontal.to_nodal`) for `jc_ps_weight`.
+- `state_scales` default {tracer_specific_humidity: 1e5} (the original's,
+  in its own units). Tracers not named there are FROZEN (increment scale
+  0), like the original's `mask_gradient`.
+
+Pitfalls found getting the original setup to descend:
+
+- **`control_variables` does not freeze excluded variables.** It resets
+  them to the background only AFTER the first model step, so their
+  increments still get gradients through that step and AdamW moves them by
+  ~lr per element. With cloud ice / liquid (rms ~2e-7) excluded that way,
+  the 1e-5 first step was ~50x the cloud field and the cost ROSE (529k ->
+  935k at epoch 2, non-finite gradient at epoch 3). Freezing them in the
+  backend (as the original did) fixed it. Any backend whose latent is the
+  state itself should freeze, not mask, variables it must not change.
+- The original's optimizer is `optax.adamw` with
+  `warmup_constant_schedule(lr/10 -> lr over 10 epochs)`: in this solver
+  `warmup_steps: 10, start_factor: 0.1, end_factor: 1.0`.
+
+Result (`config_neuralgcm_4d_2015.yml` with `n_init: 4`): first background
+z500 rms 9.75 / 3.18 / 7.95 / 7.49 m (NH / tropics / SH / global) against the
+original's 9.75 / 3.16 / 7.95 / 7.48; first-cycle cost 528716 -> 205575
+(original 534874 -> 199026); ~5 min per cycle on an H100 (as the original).
+Analyses are 3-7 m worse than the original's (global 16.9, 13.1, 12.5, 11.9
+vs ~10.2, 9.0, 9.1, 9.1 m), narrowing each cycle. Known differences: the
+original's `lam: 20` penalty on the first-step (1 h) geopotential tendency
+at all levels (normalized per level by its spatial std, times N_obs) has no
+counterpart here; and this solver reports the analysis at window start +
+dt_verif (+3 h), the original at the window start. Next: whether
+`jc_ps_weight` (sp-based) can do the job of `lam`.
+
+Open: the `ngcm` backend still excludes condensate via `control_variables`
+(its default 1e5 factor keeps condensate steps tiny, but it is not frozen).

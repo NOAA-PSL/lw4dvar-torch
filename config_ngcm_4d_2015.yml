@@ -51,9 +51,10 @@ windows:
     learn_rate: 1.0e-4
     weight_decay: 1.0e-3
     max_epoch: 50
-    # constant learning rate, as in the original
-    warmup_steps: 1
-    start_factor: 1.0
+    # as in the original: linear warmup from lr/10 over 10 epochs, then
+    # constant (optax warmup_constant_schedule)
+    warmup_steps: 10
+    start_factor: 0.1
     end_factor: 1.0
     bg_check: 4.
     zthresh: 500.

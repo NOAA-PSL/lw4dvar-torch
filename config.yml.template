@@ -3,7 +3,8 @@ exp:
   # 'aifs' (ECMWF AIFS-single-2.0, backends/aifs/), 'fcn3' (NVIDIA
   # FourCastNet3, backends/fcn3/), 'aurora' (Microsoft Aurora v1.5,
   # backends/aurora/), 'ace2' (Ai2 ACE2-ERA5, backends/ace2/), 'sfno', or
-  # 'ngcm' (JAX NeuralGCM-style model, backends/ngcm/). Required --
+  # 'ngcm' (JAX NeuralGCM-style model, backends/ngcm/), or 'neuralgcm'
+  # (the official NeuralGCM checkpoints, backends/neuralgcm/). Required --
   # load_config() raises if this is missing or not one of these values.
   # This one key also picks which conda env the job must run under (aifs2 /
   # fcstnet3 / aurora / ace2 / ngcm-torch -- see run_aifs.sh / run_fcn3.sh /
@@ -55,6 +56,13 @@ exp:
   # hybrid_specific_humidity: 1e5, specific_total_condensate: 1e5}, i.e.
   # the original NeuralGCM runs' {specific_humidity: 1e5} in NeuralGCM's
   # nondimensional units.
+  # Official NeuralGCM (JAX, run_ngcm.sh, model_backend: neuralgcm;
+  # integrate_jax_backend.md): a PressureLevelModel pickle and the per-time
+  # ERA5 input netCDFs (ICs, forcings, verification); ps_operator must be
+  # 'logpinterp'. neuralgcm_state_scales default
+  # {tracer_specific_humidity: 1e5}; tracers not named there are frozen.
+  #   neuralgcm_checkpoint: '.../models/deterministic_2_8_deg.pkl'
+  #   neuralgcm_input_dir: '.../input/2015'
   # AIFS: path_model is the DIRECTORY containing the checkpoint; the
   # checkpoint's own filename is given separately via model_name.
   #   path_model: './backends/aifs/aifs-single-2.0/'

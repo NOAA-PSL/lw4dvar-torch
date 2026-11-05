@@ -12,8 +12,9 @@ pressure observations, with a latent-space control variable, running on
 interchangeable ML forecast-model backends selected by `exp.model_backend`
 in the config: `aifs` (AIFS-single 2.0 / 1.1), `fcn3` (FourCastNet3),
 `aurora` (Aurora v1.5), `ace2` (ACE2-ERA5), `sfno` (SFNO-73ch-small),
-`ngcm` (ngcm-train's JAX NeuralGCM-style model, via the torch/JAX bridge
-`backends/jax_bridge.py`). Shared driver/solver:
+`ngcm` (ngcm-train's JAX NeuralGCM-style model) and `neuralgcm` (official
+NeuralGCM checkpoints), both via the torch/JAX bridge
+`backends/jax_bridge.py`. Shared driver/solver:
 `long_window_4dvar.py`, `long_window_4dvar_utils.py`; backend interface:
 `forecast_model.py`; backends: `backends/<name>/`; all config keys are
 documented in `config.yml.template`.
@@ -62,7 +63,7 @@ documented in `config.yml.template`.
 | `ace2-training.md` | training our own ACE2 checkpoint: building the training dataset from public ARCO-ERA5 (`backends/ace2/ace2_dataset.py`, `run_ace2_dataset_polaris.sh`), CO2, normalization stats, training configs and `run_ace2_train_polaris.sh` (fme, the checkpointing workaround `fme_train.py`), adding vertical layers for radiances |
 | `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics, the AIFS dry-air mass fixer (`dry_mass_fixer`)|
 
-| `integrate_jax_backend.md` | the torch/JAX bridge (`backends/jax_bridge.py`), the `ngcm` backend, the `ngcm-torch` env, `backends/hybrid_levels.py` |
+| `integrate_jax_backend.md` | the torch/JAX bridge (`backends/jax_bridge.py`), the `ngcm` and `neuralgcm` backends, the `ngcm-torch` env, `backends/hybrid_levels.py` |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.

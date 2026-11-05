@@ -276,9 +276,9 @@ def load_config(config_path='config.yml'):
     exp['path_output'] = exp['path_output'] + exp['exp_name'] + '/'
 
     backend = exp.get('model_backend')
-    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm'):
+    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', 'neuralgcm'):
         raise ValueError(
-            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm', got {backend!r} -- "
+            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', or 'neuralgcm', got {backend!r} -- "
             "this key is required (see config.yml.template)"
         )
     # reset_skt_ocean: AIFS and Aurora both have 'skt'/'lsm' packed-state
@@ -332,6 +332,14 @@ def load_config(config_path='config.yml'):
         for key in ('ngcm_exp', 'ngcm_step', 'ngcm_data'):
             if key not in exp:
                 raise ValueError(f"model_backend 'ngcm' needs exp.{key} (see config.yml.template)")
+    # official NeuralGCM (JAX, via the bridge): pressure-level outputs only,
+    # no surface pressure -- 'logpinterp', as in the original experiments.
+    if backend == 'neuralgcm':
+        if exp.get('ps_operator', 'logpinterp') != 'logpinterp':
+            raise ValueError("model_backend 'neuralgcm' has no surface-pressure output -- use ps_operator 'logpinterp'")
+        for key in ('neuralgcm_checkpoint', 'neuralgcm_input_dir'):
+            if key not in exp:
+                raise ValueError(f"model_backend 'neuralgcm' needs exp.{key} (see config.yml.template)")
     # jc_ps_sigma (the original, un-normalized penalty) was removed -- fail
     # loudly rather than silently run without the penalty.
     if 'jc_ps_sigma' in exp:
@@ -570,7 +578,18 @@ def get_model(exp):
             use_ema=exp.get('ngcm_use_ema', True),
             state_scales=exp.get('ngcm_state_scales'),
         )
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
+    elif backend == 'neuralgcm':
+        # the official NeuralGCM checkpoint (ngcm-torch env, run_ngcm.sh)
+        _ensure_backend_on_path('neuralgcm')
+        import neuralgcm_model
+        return neuralgcm_model.NeuralGCMModel(
+            checkpoint_path=exp['neuralgcm_checkpoint'],
+            input_dir=exp['neuralgcm_input_dir'],
+            device=exp.get('device', 'cuda'),
+            state_scales=exp.get('neuralgcm_state_scales'),
+            ngcm_train_path=exp.get('ngcm_train_path', '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'),
+        )
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', or 'neuralgcm')")
 
 
 def get_grid_interpolator(model, exp):
@@ -615,7 +634,7 @@ def get_grid_interpolator(model, exp):
         if kind == 'kdtree':
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    elif backend in ('ace2', 'ngcm'):
+    elif backend in ('ace2', 'ngcm', 'neuralgcm'):
         # F90 (ACE2) / TL63 (NGCM) Gaussian grids: unevenly spaced latitudes, so fcn3_grid's
         # uniform-latitude BilinearGridInterpolator doesn't apply --
         # ace2_grid's rectilinear version is the same scheme on the real
@@ -630,7 +649,7 @@ def get_grid_interpolator(model, exp):
             import fcn3_grid
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', or 'neuralgcm')")
 
 
 # ---------------------------------------------------------------------------
@@ -688,12 +707,12 @@ def get_input(exp, model, logger):
             _ensure_backend_on_path('ace2')
             import ace2_ic
             input_state = ace2_ic.build_input_state(back_dt, cache_dir)
-        elif backend == 'ngcm':
-            # read straight from the training store's local zarr (ngcm_data)
-            # -- no login-node prefetch needed.
+        elif backend in ('ngcm', 'neuralgcm'):
+            # read straight from local files (ngcm_data zarr / neuralgcm
+            # per-time netCDFs) -- no login-node prefetch needed.
             input_state = model.read_inputs(back_dt)
         else:
-            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
+            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', or 'neuralgcm')")
         input_encoded = model.prepare_initial_state(input_state, back_dt)
         dt_hours = exp['nhrs_back']
         logger.info('generating input state from a forecast...')
@@ -824,8 +843,11 @@ def get_verif(exp, model, logger, date_override=None):
         # from the store's pressure.zarr.
         verif_ic['geopotential_at_surface'] = model.surface_geopotential
         verif_ic['z500'] = model.read_z500(date_dt)
+    elif backend == 'neuralgcm':
+        # ERA5 z500 and surface geopotential from the per-time input file.
+        verif_ic.update(model.read_verif(date_dt))
     else:
-        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', or 'ngcm')")
+        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', or 'neuralgcm')")
 
     if "z" in verif_ic:
         verif_ic["geopotential"] = verif_ic["z"]
