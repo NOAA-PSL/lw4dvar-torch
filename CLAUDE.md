@@ -50,6 +50,9 @@ documented in `config.yml.template`.
   wrong on AIFS's reduced grid.
 - One-off diagnostic/probe scripts and configs are left untracked by
   convention; commit only maintained code and tools.
+- **`make check` must pass before a PR** (CPU only, a few seconds; CI runs
+  the same target). Setup and scope are in `tests/README.md`. Never skip or
+  loosen a test to get it green.
 
 ## Task documents
 
