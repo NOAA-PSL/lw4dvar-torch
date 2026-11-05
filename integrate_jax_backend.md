@@ -172,8 +172,24 @@ vs ~10.2, 9.0, 9.1, 9.1 m), narrowing each cycle. Known differences: the
 original's `lam: 20` penalty on the first-step (1 h) geopotential tendency
 at all levels (normalized per level by its spatial std, times N_obs) has no
 counterpart here; and this solver reports the analysis at window start +
-dt_verif (+3 h), the original at the window start. Next: whether
-`jc_ps_weight` (sp-based) can do the job of `lam`.
+dt_verif (+3 h), the original at the window start.
+
+`jc_ps_weight` sweep (2026-11-05, 4 cycles, `logs/neuralgcm_jc{30,300,3000}_*.out`).
+Global z500 analysis rms, cycles 1-4:
+
+- kappa 30: 9.43, 8.61, 8.28, 8.77 m. The first cycle's cost fell
+  529k -> 216k, but cycles 3-4 ended above their epoch-1 cost, and
+  cycle 3 kept the background.
+- kappa 300 and 3000: the cost ROSE (to 1.9-2.6M at kappa 3000), and
+  most cycles kept the zero increment (analysis = background).
+  Backgrounds degraded each cycle (10.6 m by cycle 4 at kappa 3000).
+
+The first-step sp change stayed at 0.03-0.05 hPa rms at every kappa.
+The first AdamW step (about lr per element) creates that imbalance, and
+at a constant lr the optimizer cannot remove it, so a stiffer penalty
+only adds cost. Kappa 30 roughly reaches the original's `lam: 20`
+analyses (~10.2, 9.0, 9.1, 9.1, verified at t0). Its optimization is
+still poor, though.
 
 Open: the `ngcm` backend still excludes condensate via `control_variables`
 (its default 1e5 factor keeps condensate steps tiny, but it is not frozen).
