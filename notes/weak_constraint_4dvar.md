@@ -234,3 +234,5 @@ percent of the misfit cost a much larger δ. One date (2015-01-07), B / Q24:
 - [ ] 2. convergence check
 - [ ] 3a/3b/3c
 - [ ] 4, 5
+
+_Run outputs of the superseded experiments (3mo_ps_atms, early 1mo ATMS variants, wcsweep/wc*_a, wc24_q025, win4d-10d, prior/cprior, early 10-cycle raob tests, aborted 6mo non-tsens runs) were deleted on 2026-10-21; their scores remain in this note, figures/ and output/forecast_skill/._

@@ -24,15 +24,25 @@ sys.path.insert(0, os.path.join(os.getcwd(), "scripts"))
 from obs_atms_operator import BUNDLE_VERSION, AtmsOperator  # noqa: E402
 from twohead import load_run  # noqa: E402
 
-T_LEVELS = [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000]
-Q_LEVELS = T_LEVELS[1:]
+# the decoder's tmp-k / spfh-k index k counts these levels (hPa), chosen by the number of tmp- inputs:
+# Bo's 14-level checkpoint, or all 37 ERA5 levels (the aifs37 A0/A1/A2 decoders, radianced era5_pre37)
+LEVEL_SETS = {14: [10, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 850, 925, 1000],
+              37: [1, 2, 3, 5, 7, 10, 20, 30, 50, 70, 100, 125, 150, 175, 200, 225, 250, 300, 350, 400, 450,
+                   500, 550, 600, 650, 700, 750, 775, 800, 825, 850, 875, 900, 925, 950, 975, 1000]}
 # radianced docs/handoff_lw4dvar_sensors.md, "Channel use" (1-based channels)
 CHANNEL_SETS = {
     "amsua": {"assimilate": [4, 5, 6, 7, 8], "emissivity": [1, 2, 3, 15], "monitor": [9, 10],
               "exclude": [11, 12, 13], "off": [14]},
+    # as Bo's ATMS bundle, but 10-15 monitored: the 1 hPa-top decoders see the whole stratosphere
+    "atms": {"assimilate": [5, 6, 7, 8, 9], "emissivity": [1, 2, 3, 4, 16, 17], "monitor": [10, 11, 12, 13, 14, 15],
+             "exclude": [], "humidity": [18, 19, 20, 21, 22]},
+    # IASI: the channel list is the experiment's (DFS selection, atms docs/plan_better_jacobians.md); here only the
+    # ozone band (980-1100 cm-1; no ozone in the decoder inputs) is excluded. Positions k = 1..175.
+    "iasi": {"assimilate": [], "monitor": [], "exclude": []},
 }
 SURFACE = {"skt": "skt", "2t": "t2m", "2d": "d2m", "sp": "sp", "msl": "msl", "10u": "u10", "10v": "v10",
-           "tcw": "tcw", "lsm": "lsm", "z": "zsfc", "sdor": "sdor", "slor": "slor"}
+           "tcw": "tcw", "lsm": "lsm", "z": "zsfc", "sdor": "sdor", "slor": "slor",
+           **{k: k for k in ("sd", "siconc", "swvl1", "stl1", "cvh", "cvl", "lai_hv", "lai_lv", "slt", "fsr")}}
 OBS = ("land_frac", "water_frac", "ice_frac", "snow_frac", "Sat_Zenith_Angle", "Scan_Angle", "Sat_Azimuth_Angle",
        "Obs_Time", "sat_id")
 
@@ -48,13 +58,18 @@ def main():
     model, meta, ms = load_run(a.run_dir, "cpu")
     nch = int(meta.get("nch", 22))
     fin = meta["input_features"]
+    t_idx = sorted(int(f[4:]) for f in fin if f.startswith("tmp-"))
+    q_idx = sorted(int(f[5:]) for f in fin if f.startswith("spfh-"))
+    # k indexes Bo's 14 levels, or all 37 for the aifs37 pairs (A1 uses all 37, A2 only k 5-36)
+    levels = LEVEL_SETS[14 if len(t_idx) == 14 and t_idx[-1] == 13 else 37]
+    t_levels, q_levels = [levels[k] for k in t_idx], [levels[k] for k in q_idx]
     ycol = [f"ObsBC-{c}" for c in range(nch)]
     hidden = [m.out_features for m in model.P.layers if isinstance(m, torch.nn.Linear)][:-1]
     git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], capture_output=True, text=True).stdout.strip()
     bundle = {
         "version": BUNDLE_VERSION, "sensor": a.sensor, "nch": nch,
         "source": f"radianced {git} {a.run_dir}",
-        "input_features": fin, "t_levels_hpa": T_LEVELS, "q_levels_hpa": Q_LEVELS, "hidden": hidden, "K": model.K,
+        "input_features": fin, "t_levels_hpa": t_levels, "q_levels_hpa": q_levels, "hidden": hidden, "K": model.K,
         "P": model.P.state_dict(), "D": model.D.state_dict(),
         "x_mean": torch.tensor(ms.loc[fin, "mean"].to_numpy(np.float32)),
         "x_std": torch.tensor(ms.loc[fin, "stdev"].to_numpy(np.float32)),
@@ -70,9 +85,9 @@ def main():
     op = AtmsOperator.load(a.out)
     d = pd.read_parquet(a.check)
     col = lambda c: torch.tensor(d[c].to_numpy(np.float32))  # noqa: E731
-    fields = {"t": torch.stack([col(f"tmp-{k}") for k in range(len(T_LEVELS))]),
-              "q": torch.stack([col(f"spfh-{k}") for k in range(1, len(T_LEVELS))])}
-    fields.update({k: col(c) for k, c in SURFACE.items()})
+    fields = {"t": torch.stack([col(f"tmp-{k}") for k in t_idx]),
+              "q": torch.stack([col(f"spfh-{k}") for k in q_idx])}
+    fields.update({k: col(c) for k, c in SURFACE.items() if c in fin})
     x = op.assemble(fields, {c: col(c) for c in OBS})
     raw = torch.tensor(d[fin].to_numpy(np.float32))
     print(f"{a.check}: {len(d)} obs; assemble vs file inputs max |diff| {float((x - raw).abs().max()):.3g}")

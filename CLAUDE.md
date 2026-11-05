@@ -58,6 +58,9 @@ documented in `config.yml.template`.
 | `notes/weak_constraint_4dvar.md` | weak-constraint 4D-Var (`exp.weak_constraint`, model-error jumps), the explicit Gaussian prior on the controls (`exp.control_prior`), sizing/estimating B and Q (ERA5 inversion, likelihood plan), the cascade re-solve proxy |
 | `notes/obs_error_tuning.md` | tuning observation errors: `obs_error_diag.py`, why Desroziers fails with overlapping windows (ob reuse), fresh-innovation bounds, the sigma sweeps |
 | `notes/integrate_atms_obs.md` | ATMS radiance assimilation with the radianced two-head decoder: plan and status, the copied operator file and its bundle, `observations.atms`, the emissivity control `z` |
+| `notes/merge_plan.md` | merging to main of NOAA-PSL/lw4dvar-torch: agent rules (one `make check` gate, small PRs, agents open / humans merge, provenance, predictions before GPU jobs, candidate config and CAPABILITIES.md), the experiments repo layout, the 5-layer test strategy and fixtures, and the PR plan for carving feature/lwatms (exported from the Claude Doc; edit the doc and re-export) |
+| `notes/pr_strategy.md` | carving feature/lwatms into PRs to main: branch vs origin/main state, overlaps (raobs branch, latent Jb, aifs3), the ordered PR list with gates and owners, what stays off main |
+| `notes/integrate_aifs37_models.md` | the 37-level AIFS models A1 (top 1 hPa) and A2: their identity, the anemoi-dev env, ICs from the training zarr, the A1 ATMS decoder, and the experiment series (model alone, then stratospheric ATMS channels 8-14) |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.

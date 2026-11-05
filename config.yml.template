@@ -130,6 +130,9 @@ exp:
     #  sigma_o_scale: 1.0                   # multiplies the bundle's sigma_o
     #  sigma_o: {5: 0.37, 6: 0.21}         # optional per-channel sigma_o (K), replaces the bundle's before the scale
     #  bg_check: 4.0                        # reject |O-B| > bg_check * sigma_o, per channel
+    #  sat_alias: {1: 0}                    # sat_id FROM -> TO at read time, for a satellite the decoder never saw in
+    #                                       #   training (2015-16 decoders on 2022: ATMS NOAA-20 1:0, AMSU-A MetOp-C 5:4,
+    #                                       #   IASI MetOp-C 2:1); the original id is kept as sat_id_orig
     #  water_frac_min: 0.99                 # read-time scene screen: FOV water fraction,
     #  clw_max: 0.05                        #   cloud liquid water (kg/m2), and ice_frac == 0
     #  lsm_max: 0.01                        # all 4 interpolation neighbours must have lsm <= this
@@ -151,6 +154,8 @@ exp:
     #                                       #   atms_decoder_error.py (per-scene corr); obs used in all assimilated
     #                                       #   channels are whitened, the rest keep a diagonal R; null = diagonal
     #  corr_cond_max: 50.                   #   recondition each scene's corr to this condition number (ridge, unit diag)
+    #  corr_r_window: False                 #   also a separate correlated-R block for the emis_channels (from the same
+    #                                       #   json), applied only to window_state obs used in all of them
     #  detach_q_above_hpa: 250.             # no Jo gradient to q at p < this (decoder's
     #                                       #   stratospheric-q sensitivity is a learned proxy)
     #  time_tolerance_hours: (dt_obs / 2)   # slot j takes obs in [t_j - tol, t_j + tol)
@@ -418,6 +423,12 @@ exp:
   # flash-attn on H100, ~6x faster than 'block_sliding_window' on MI300X,
   # and light enough on memory for checkpoint_stride: 0.
   #aifs_attention: 'block_sliding_window'
+  # aifs37: AIFS only (default False). True loads the 37-level A1/A2
+  # checkpoints through backends/aifs/aifs37_model.py (anemoi-dev env,
+  # aifs_config: 'backends/aifs/aifs_inference_aifs37.yaml'), with ICs and
+  # ERA5 truth read from the training zarrs instead of ic_cache GRIB.
+  # See notes/integrate_aifs37_models.md.
+  #aifs37: True
 
   # grid_interp: FCN3 and Aurora only (default 'bilinear', meaningless for
   # AIFS -- AIFS's irregular N320 octahedral grid always uses the k-d-tree

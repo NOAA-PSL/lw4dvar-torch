@@ -1,0 +1,18 @@
+description: |
+  Static anemoi-inference (0.12, anemoi-dev env) config for the 37-level AIFS
+  checkpoints A1/A2 (aifs37_model.py; notes/integrate_aifs37_models.md).
+  Only checkpoint/device and the runner's metadata, processors and tensor
+  handlers are used; `input: empty` and the output/date/lead_time below are
+  placeholders (0.12 has no `opendata` input; ICs come from the training zarr).
+
+checkpoint: /scratch4/BMC/gsienkf/Sergey.Frolov/eagle/long-window/EAGLE/run/aifs37-a1/training/outputs/checkpoint/62f4c8edf78047f6bbbb3e81dd419ba9/inference-anemoi-by_epoch-epoch_020-step_082446.ckpt
+
+date: 2015-01-01T00
+lead_time: 6
+input: empty
+output:
+  grib:
+    path: /dev/null
+
+use_grib_paramid: false
+allow_nans: true

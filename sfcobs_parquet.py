@@ -25,6 +25,7 @@ caller's.
 import numpy as np
 
 import prepbufr_parquet_common as common
+from convobs_parquet import _absent_class as absent_class  # a class the cycle's PREPBUFR file lacks
 
 
 NETWORKS = {
@@ -64,6 +65,8 @@ def load_sfcobs_parquet(directory, verification_times, time_tolerance_hours=1., 
     for cycle in cycles:
         for name in networks:
             prepbufr_class, mass_types, wind_types = NETWORKS[name]
+            if absent_class(cycle, prepbufr_class):
+                continue
             reports = common.read_partition(common.class_file(cycle, 'reports', prepbufr_class), _REPORT_COLUMNS)
             levels = common.read_partition(common.class_file(cycle, 'levels', prepbufr_class), _LEVEL_COLUMNS)
             level_rid = common.column(levels, 'report_id', np.int64)

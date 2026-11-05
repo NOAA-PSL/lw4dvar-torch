@@ -41,6 +41,20 @@ _LEVEL_COLUMNS = ['report_id', 'level_index', 'category', 'pressure_mb', 'temper
                   'drift_longitude']
 
 
+def _absent_class(cycle, prepbufr_class):
+    """True when the cycle has no partition for the class because its PREPBUFR file has no such reports: the manifest
+    says the conversion was complete and lists none (e.g. PROFLR in about half the 2022 cycles). Any other missing
+    partition still raises in common.class_file."""
+    if (cycle / 'reports' / str(prepbufr_class) / 'part-00000.parquet').is_file():
+        return False
+    try:
+        import json
+        m = json.load(open(cycle / 'metadata' / 'manifest.json'))
+    except (OSError, ValueError):
+        return False
+    return bool(m.get('complete_source_conversion')) and prepbufr_class not in m.get('reports_by_class', {})
+
+
 def load_convobs_parquet(directory, verification_times, time_tolerance_hours=1.5, groups=tuple(GROUPS),
                          quality_mark_max=3, logger=None):
     """Upper-air conventional obs per slot.
@@ -58,6 +72,8 @@ def load_convobs_parquet(directory, verification_times, time_tolerance_hours=1.5
     for cycle in cycles:
         for name in groups:
             for prepbufr_class in GROUPS[name]:
+                if _absent_class(cycle, prepbufr_class):
+                    continue
                 reports = common.read_partition(common.class_file(cycle, 'reports', prepbufr_class), _REPORT_COLUMNS)
                 levels = common.read_partition(common.class_file(cycle, 'levels', prepbufr_class), _LEVEL_COLUMNS)
                 rid = common.column(reports, 'report_id', np.int64)

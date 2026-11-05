@@ -209,3 +209,143 @@ Results (`figures/sigsweep4_10cyc/`), global window-mean change vs the H100 cont
 
 Next: decsig_corr with ch 5-6 (and 7) back at their old sigma, to test whether ch 5-6 cause the
 tropical z500 cost.
+
+## Sweep 5: correlated R with ch 5-7 at the bundle sigma (`winoc_cld_decsig_corr_t0`, 2026-10-21)
+
+`figures/sigsweep5_10cyc/`. Change vs the H100 control, window means:
+
+| | decsig_corr | decsig_corr_t0 (ch 5-7 bundle sigma) |
+|---|---|---|
+| q850 Global | -3.1% | -3.4% |
+| z500 Global | +1.0% | +1.3% |
+| z500 Tropics / SH / NH | +5.6% / +1.6% / -0.6% | **-1.1%** / +3.9% / -0.4% |
+| ws250 Global | +0.2% | +0.7% |
+
+- Tight ch 5-6 cause the tropical z500 cost, as sweep 1 suggested, but they also help SH z500.
+  The two arms trade about 0.15-0.2 m in each region, within 10-cycle noise for regional z500.
+- The fresh SH raob cost (t850 +4.5-4.9%, v250 +3-4.5%, t250 +3%) is the same in both, so it comes
+  from the humidity or window channels, not ch 5-7. The likeliest suspect is the 531k ocean window
+  radiances per window on the state, still with a diagonal R and a sigma now about half the old one.
+
+Decision: the month run uses the full decoder sigma (decsig_corr, all sigma from one source) on
+WC24 q075 + all-sky window channels: `1mo_wc24_q075_corr` (24292278-81, chained).
+Next 10-cycle candidate: window channels back to their old sigma, or correlated R for them too.
+
+_Run outputs of the superseded experiments (3mo_ps_atms, early 1mo ATMS variants, wcsweep/wc*_a, wc24_q025, win4d-10d, prior/cprior, early 10-cycle raob tests, aborted 6mo non-tsens runs) were deleted on 2026-10-21; their scores remain in this note, figures/ and output/forecast_skill/._
+
+## Sweep 6: correlated R with the window channels at the bundle sigma (`winoc_cld_decsig_corr_w0`, 2026-10-22)
+
+`figures/sigsweep6_10cyc/`. Change vs the H100 control, window means vs ERA5:
+
+| | decsig_corr | corr_t0 (ch 5-7 old) | corr_w0 (window old) |
+|---|---|---|---|
+| q850 Global | -3.1% | -3.4% | -0.7% |
+| z500 Global | +1.0% | +1.3% | **-1.1%** |
+| z500 NH / SH / Tropics | -0.6 / +1.6 / +5.6% | -0.4 / +3.9 / -1.1% | **-2.5 / -2.7** / +9.8% |
+| ws250 Global | +0.2% | +0.7% | **-1.1%** (SH and tropics -1.5%) |
+
+- The window channels carry most of the q850-vs-ERA5 gain, and their halved sigma causes the
+  extratropical mass/wind cost. With the old window sigma, corr R is the first arm that improves
+  z500 and ws250 on the control.
+- Fresh raob O-B agrees: NH t, u, v improve 1-3%, SH v850 -1.3%, ps neutral. Fresh raob q850/q500
+  is neutral to better in w0 but worse in decsig_corr (SH q850 +1.7%, NH q500 +2.2%). So the window
+  channels' q850 gain vs ERA5 isn't confirmed by raobs, which are mostly over land.
+- Tight ch 5-6 still cost tropical z500 (+9.8%). SH raob t250 +3.6% and u250 +3.3% remain.
+
+Next: `winoc_cld_decsig_corr_w0t0` (24307365): ch 5-7 and the window channels at the bundle sigma,
+so only 18-22 use the decoder sigma with corr R. The month run `1mo_wc24_q075_corr` (full decoder
+sigma) had already started and was left running.
+
+## Sweep 7: decoder sigma for ch 18-22 only (`winoc_cld_decsig_corr_w0t0`, 2026-10-22) -- leading config
+
+ch 18-22 clear-ocean sigma base = decoder std (1.02, 1.12, 1.26, 1.42, 1.55 K); ch 1-7, 16, 17
+at the bundle sigma; per-scene correlated R for ch 5-7, 18-22 (cond 50); scene and cloud ratios
+from oberr_table_w.json. `figures/sigsweep7_10cyc/`. Change vs the H100 control, vs ERA5:
+
+| | corr_w0 | **corr_w0t0** |
+|---|---|---|
+| q850 Global / NH / SH / Tropics | -0.7 / -0.9 / -0.9 / -0.6% | -0.9 / -0.6 / -1.1 / -0.8% |
+| z500 Global / NH / SH / Tropics | -1.1 / -2.5 / -2.7 / +9.8% | -1.1 / -1.0 / -1.1 / **-1.3%** |
+| ws250 Global / NH / SH / Tropics | -1.1 / -0.1 / -1.5 / -1.5% | -1.4 / -0.6 / -1.4 / -2.0% |
+
+- The first arm that improves every variable in every region on the control.
+- Fresh raob O-B: none worse than +1.3%. The SH t250 / u250 cost of the earlier arms is gone
+  (-1.5% / +1.2%), NH u/v 1-2% better, raob q850 and SH/tropics q500 about 1% better, ps neutral.
+- ch 22 fresh O-B +2.4% (more weight on 18-21 through the correlated R).
+
+Month run: `1mo_wc24_q075_corrhum` (24313740-43, chained), WC24 q075 + all-sky window
+channels + this ATMS block. The full-decoder-sigma month run `1mo_wc24_q075_corr` was cancelled
+after chunk 1 (2015-01-01 .. 01-08 in `output/lwatms_1mo_wc24_q075_corr/`).
+
+### Month run `1mo_wc24_q075_corrhum` vs `1mo_wc24_q075_wincld` (2026-10-22)
+
+60 cycles, 2015-01-01 .. 01-30. Analyses vs ERA5 (window mean, `figures/corrhum_1mo/`): z500
+-2.2% (NH -1.9, SH -2.4, tropics -1.0), ws250 -1.1%, q850 -0.6%; at the window end z500 -1.9%.
+
+Forecast skill (30 daily 5-day forecasts, 01-06 .. 02-04, `figures/fcst_skill_corrhum/`), change vs wincld:
+
+| | 0 h | 24 h | 48 h | 72 h | 120 h |
+|---|---|---|---|---|---|
+| z500 Global | -1.9% | -0.1% | +0.4% | -0.1% | -3.1% |
+| z500 NH / SH | -2.4 / -1.9% | -1.7 / +0.8% | -1.2 / +1.5% | -2.6 / +1.8% | -5.1 / -1.4% |
+| q850 Global | -0.8% | -0.9% | -0.5% | -0.3% | -0.2% |
+| t850 Global | -1.4% | -1.0% | -0.5% | +0.3% | -1.3% |
+| raob t500 / uv250 speed | -0.6 / +0.1% | -0.3 / -0.9% | -0.9 / -1.1% | -1.7 / -1.7% | +0.1 / +1.3% |
+
+The analysis gain is clear and consistent; in the forecasts it is small, mostly neutral to
+1-2% better (NH z500 better at every lead, SH slightly worse at 1-3 days). 30 forecasts don't
+resolve differences of about 1%. Adopted as the new ATMS ob-error baseline.
+
+## Best experiment: `lwatms_1mo_wc24_q075_corrhum` (recorded 2026-10-22)
+
+The current best configuration of the whole system, superseding `1mo_wc24_q075_wincld`:
+weak constraint (jumps every 24 h, Q/B 0.75) + ps + raobs (fixed q error) + ATMS arm A with
+the window channels 1-4, 16, 17 acting on the state over clear and cloudy ocean, decoder
+sigma for ch 18-22 and per-scene correlated R for ch 5-7, 18-22 (cond 50). Configs:
+`config_lwatms_1mo_wc24_q075_corrhum{,_c2..c12}.yml`.
+
+Global forecast RMSE vs ERA5 (30 forecasts, 01-06 .. 02-04), 0 h / 24 h / 120 h:
+
+| run | z500 (m) | t850 (K) | q850 (g/kg) | ws250 (m/s) |
+|---|---|---|---|---|
+| WC clear-ocean (`wc24_q075`) | 8.14 / 11.54 / 46.32 | 0.86 / 0.97 / 2.36 | 1.13 / 1.24 / 1.86 | 2.82 / 3.59 / 8.48 |
+| WC wincld | 8.17 / 11.39 / 46.56 | 0.81 / 0.94 / 2.36 | 0.96 / 1.11 / 1.84 | 2.81 / 3.56 / 8.38 |
+| **WC wincld + corr R (best)** | **8.01 / 11.38 / 45.13** | **0.80 / 0.93 / 2.33** | **0.95 / 1.10 / 1.84** | **2.77 / 3.55 / 8.30** |
+| ERA5 IC | 0 / 3.57 / 27.44 | 0 / 0.55 / 1.64 | 0 / 0.73 / 1.57 | 0 / 2.03 / 6.23 |
+
+**3-month extension** (submitted 2026-10-22): chunks c5-c12 continue the same run directory
+from the 2015-01-30T12 analysis through 2015-03-31T12 (120 cycles, 15 per chunk, afterok
+chain), jobs 24367154-24367161. Score with `NCYC=180` and forecast skill over Jan 6 - Mar 27.
+
+## Sweep 8: correlated R for the window channels (`winoc_cld_decsig_corr_w0t0_wcorr`, 2026-10-22)
+
+New option `observations.atms.corr_r_window: True`: a separate per-scene correlated-R block for
+the emis_channels 1-4, 16, 17 (same json, same cond-50 reconditioning), applied only to
+window_state obs (clear and cloudy ocean, clw <= cloud_max) used in all six; z-only obs keep the
+diagonal R. No cross-block correlation, so ch 5-7, 18-22 are unchanged from w0t0.
+Matrices: `figures/obs_error/corr_r_matrices.png`. Over ocean, ch 1-4, 16 correlate 0.7-0.96 and
+the six window channels have ~1.9 effective dof (Jo of a uniform 1 sigma departure 1.9 clear /
+2.4 cloudy instead of 6), so this cuts their weight about 3x. Ch 17 is weakly tied to the rest.
+Raw cond (window block) is in the run log.
+
+Job 24368256 (10 cycles, H100). Compare against w0t0. Expected: the q850 gain from the window
+channels shrinks somewhat; z500 / ws250 neutral or better (less overfitting of correlated
+window departures).
+
+Result (2026-10-22, `figures/wcorr_10cyc/`). Change vs the H100 control (ERA5, window mean):
+
+| | w0t0 | **wcorr** | wcorr vs w0t0 |
+|---|---|---|---|
+| z500 Global / NH / SH / Tropics | -1.1 / -1.0 / -1.1 / -1.3% | -2.3 / -2.1 / -2.8 / -0.6% | -1.2 / -1.1 / -1.8 / +0.7% |
+| t500 Global / NH / SH / Tropics | -0.9 / -0.3 / -1.0 / -1.8% | -1.6 / -1.0 / -2.0 / -2.0% | -0.7 / -0.7 / -1.1 / -0.2% |
+| q850 Global / NH / SH / Tropics | -0.9 / -0.6 / -1.1 / -0.8% | -0.3 / -0.6 / -0.3 / -0.2% | +0.5 / 0.0 / +0.8 / +0.6% |
+| ws250 Global / NH / SH / Tropics | -1.4 / -0.6 / -1.4 / -2.0% | -1.4 / -0.6 / -1.9 / -1.7% | 0.0 / 0.0 / -0.5 / +0.4% |
+
+- As predicted: the q850 gain mostly goes (+0.5% vs w0t0), z500 / t500 improve 1-2% in the
+  extratropics, tropics z500 +0.7%.
+- Fresh O-B (last 12 h of the window, cycles 2-10) vs w0t0: raob winds 0.5-3.4% better
+  (NH v250 -3.4%, SH u/v 500 -1.4 to -1.7%), t 500 hPa -0.7 to -1.0%, ps -0.6 to -1.7%; worse
+  only SH t250 +0.8%, SH q500 +1.2%, tropics v850 / q850 / t250 +0.3-0.5%. ATMS ch 1-16 +0.1-0.3%,
+  ch 22 -0.6%.
+- Better than w0t0 on dynamics and on the independent obs; a small q850 cost vs ERA5 (raob q850
+  NH / SH still 0.5-0.6% better). Candidate for the next month run on top of corrhum.

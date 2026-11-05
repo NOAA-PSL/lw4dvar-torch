@@ -34,13 +34,16 @@ import torch  # noqa: E402
 
 from obs_atms_operator import AtmsOperator  # noqa: E402
 
-PRE = '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/data/era5_pre_2015'
-BUNDLE = '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/outputs/bo_twohead_s1/atms_twohead_bo_s1.pt'
+# PRE / BUNDLE / QFILL env as in atms_decoder_error.py (other pairs and decoder; QFILL='' for the q70 decoders)
+PRE = os.environ.get('PRE', '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/data/era5_pre_2015')
+BUNDLE = os.environ.get('BUNDLE', '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/outputs/bo_twohead_s1/atms_twohead_bo_s1.pt')
+QFILL = [n for n in os.environ.get('QFILL', 'spfh-1').split(',') if n]
 OUT = 'figures/atms_oberr'
 NCYC = int(sys.argv[1]) if len(sys.argv) > 1 else 60
 TABLE = sys.argv[2] if len(sys.argv) > 2 else 'oberr_table.json'
 WINDOW = [1, 2, 3, 4, 16, 17] if os.environ.get('WINDOW') == '1' else []
-CHANNELS = WINDOW + [5, 6, 7, 8, 9, 18, 19, 20, 21, 22]
+# STRAT=1: also ch 10-14 (A1/A2 Phase 2)
+CHANNELS = WINDOW + [5, 6, 7, 8, 9] + ([10, 11, 12, 13, 14] if os.environ.get('STRAT') == '1' else []) + [18, 19, 20, 21, 22]
 CLW_BINS = np.array([0, .02, .05, .1, .15, .2, .3, .4, .5, .7, 1., 1.5, 3.])
 SI_BINS = np.array([-80, -50, -40, -30, -20, -10, 0, 10, 20, 40, 80])
 os.makedirs(OUT, exist_ok=True)
@@ -55,13 +58,13 @@ def clw(tb1, tb2, zen):
 
 
 op = AtmsOperator.load(BUNDLE)
-files = sorted(glob.glob(f'{PRE}/2015*.parquet'))[::4][:NCYC]
-iq50, it0 = op.input_features.index('spfh-1'), op.input_features.index('Obs_Time')
+files = sorted(glob.glob(f"{PRE}/{os.environ.get('FILES', '2015*')}.parquet"))[::4][:NCYC]  # FILES env: e.g. 201609* (a held-out month)
+iqf, it0 = [op.input_features.index(n) for n in QFILL], op.input_features.index('Obs_Time')
 parts = []
 for f in files:
     pre = pd.read_parquet(f)
     x = torch.tensor(pre[op.input_features].to_numpy(np.float32))
-    x[:, iq50] = op.x_mean[iq50]
+    x[:, iqf] = op.x_mean[iqf]
     x[:, it0] = 0.0
     with torch.no_grad():
         hx = op(x)[0].numpy()

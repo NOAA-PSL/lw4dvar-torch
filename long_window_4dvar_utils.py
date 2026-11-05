@@ -231,6 +231,8 @@ ATMS_SUPPORTED_BACKENDS = ('aifs',)
 _ATMS_OPERATOR_FIELDS = {
     'sp': 'sp', 'msl': 'msl', 'skt': 'skt', '2t': '2t', '2d': '2d', '10u': '10u', '10v': '10v',
     'tcw': 'tcw', 'lsm': 'lsm', 'z': 'geopotential_at_surface', 'sdor': 'sdor', 'slor': 'slor',
+    # 37-level A1/A2 decoders only (a bundle takes the subset in op.surface_inputs)
+    **{k: k for k in ('sd', 'siconc', 'swvl1', 'stl1', 'cvh', 'cvl', 'lai_hv', 'lai_lv', 'slt', 'fsr')},
 }
 ATMS_MODEL_FIELDS = ('t', 'q') + tuple(_ATMS_OPERATOR_FIELDS.values())
 # obs-file columns the operator takes as inputs (Obs_Time is left at its
@@ -242,10 +244,16 @@ _ATMS_OBS_INPUTS = ('land_frac', 'water_frac', 'ice_frac', 'snow_frac', 'Sat_Zen
 # trajectory; default channel sets (1-based) from the radianced hand-offs.
 # AMSU-A 4-8 are the frequencies of ATMS 5-9; AMSU-A 1, 2 are ATMS 1, 2
 # (23.8 / 31.4 GHz), which the cloud retrieval `_atms_clw` uses.
-MW_SENSORS = ('atms', 'amsua')
+# IASI (175 replay channels, a two-head decoder like the MW ones) rides the same
+# path: clear-sky screening is per channel (y NaN where GSI's cloud QC dropped the
+# channel, so the bg check rejects it), clw_obs is 0, and it has no channel
+# defaults (set assimilate_channels; channel k = position k in radianced's
+# SENSORS['iasi']['channels']).
+MW_SENSORS = ('atms', 'amsua', 'iasi')
 _MW_DEFAULT_CHANNELS = {
     'atms': {'assimilate': [5, 6, 7], 'monitor': [8, 9, 10, 11], 'emis': [1, 2, 3, 4, 16, 17]},
     'amsua': {'assimilate': [4, 5, 6, 7, 8], 'monitor': [9, 10], 'emis': [1, 2, 3, 15]},
+    'iasi': {'assimilate': [], 'monitor': [], 'emis': []},
 }
 
 
@@ -340,10 +348,10 @@ _RAOBS_CONFIG_KEYS = {
 }
 # observations.<sensor> keys for every MW_SENSORS sensor, flattened to <sensor>_<key>
 _MW_CONFIG_KEYS = (
-    'path', 'bundle', 'assimilate_channels', 'monitor_channels', 'sigma_o_scale', 'sigma_o', 'bg_check',
+    'path', 'bundle', 'assimilate_channels', 'monitor_channels', 'sigma_o_scale', 'sigma_o', 'bg_check', 'sat_alias',
     'huber_c', 'water_frac_min', 'clw_max', 'lsm_max', 'detach_q_above_hpa', 'time_tolerance_hours',
     'capacity', 'scenes', 'emis_control', 'emis_channels', 'z_learn_rate', 'oberr_model', 'oberr_table',
-    'cloud_max', 'window_state_scenes', 'corr_r', 'corr_cond_max',
+    'cloud_max', 'window_state_scenes', 'corr_r', 'corr_cond_max', 'corr_r_window', 'corr_r_masked',
 )
 
 
@@ -629,8 +637,14 @@ def get_model(exp):
     backend = exp['model_backend']
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
-        import aifs_model
-        return aifs_model.AIFSModel(
+        if exp.get('aifs37', False):
+            # 37-level A1/A2 checkpoints (anemoi-dev env; notes/integrate_aifs37_models.md)
+            import aifs37_model as aifs_model
+            cls = aifs_model.AIFS37Model
+        else:
+            import aifs_model
+            cls = aifs_model.AIFSModel
+        return cls(
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
@@ -761,8 +775,11 @@ def get_input(exp, model, logger):
         back_dt = _to_utc_datetime(back_date, backend)
         if backend == 'aifs':
             _ensure_backend_on_path('aifs')
-            import aifs_ic
-            input_state = aifs_ic.build_input_state(model.runner, back_dt, cache_dir, lagged=True)
+            if hasattr(model, 'build_input_state'):  # aifs37: from the training zarr
+                input_state = model.build_input_state(back_dt)
+            else:
+                import aifs_ic
+                input_state = aifs_ic.build_input_state(model.runner, back_dt, cache_dir, lagged=True)
         elif backend == 'fcn3':
             _ensure_backend_on_path('fcn3')
             import fcn3_ic
@@ -822,8 +839,11 @@ def get_verif(exp, model, logger, date_override=None):
     verif_ic = {}
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
-        import aifs_ic
-        raw_fields = aifs_ic.read_single_date_fields(model.runner, date_dt, cache_dir)
+        if hasattr(model, 'read_single_date_fields'):  # aifs37: from the training zarr
+            raw_fields = model.read_single_date_fields(date_dt)
+        else:
+            import aifs_ic
+            raw_fields = aifs_ic.read_single_date_fields(model.runner, date_dt, cache_dir)
         # Single-date snapshot: pack directly rather than through
         # model.prepare_initial_state() (which expects a full
         # multi_step-length state), mirroring AIFSModel.decode_state()'s
@@ -1335,6 +1355,10 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
         if not parts:
             raise FileNotFoundError(f"no {sensor} obs file within 6h of {vdate} under {cfg('path')}")
         d = pd.concat(parts, ignore_index=True)
+        if cfg('sat_alias'):  # {from: to}: a satellite the decoder never saw in training -> its twin
+            d['sat_id_orig'] = d['sat_id'].copy()
+            for src, dst in cfg('sat_alias').items():
+                d.loc[d['sat_id_orig'] == float(src), 'sat_id'] = float(dst)
         d['scene'] = _atms_scene_codes(d, water_frac_min, clw_max)
         slots.append(d[d['scene'].isin(scene_codes)].reset_index(drop=True))
         vdate = add_hours(vdate, dt_obs)
@@ -1380,7 +1404,14 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
     # decoder's q sensitivity is a learned proxy, not physics
     t_levels = [float(p) for p in model.pressure_levels('t')]
     q_levels = [float(p) for p in model.pressure_levels('q')]
-    op_q_levels = op.q_levels_hpa if op.q_levels_hpa[0] in q_levels else op.q_levels_hpa[1:]
+    # the operator fills the levels above the model's top q level (Bo's 10 hPa;
+    # A1/A2's 1-50 hPa, diagnostic there) with its mean
+    op_q_levels = [p for p in op.q_levels_hpa if p in q_levels]
+    if op_q_levels != op.q_levels_hpa[len(op.q_levels_hpa) - len(op_q_levels):]:
+        raise ValueError(f"model q levels {q_levels} miss operator q levels below the top: {op.q_levels_hpa}")
+    missing = [k for k in op.surface_inputs.values() if _ATMS_OPERATOR_FIELDS[k] not in model._single_by_base]
+    if missing:
+        raise ValueError(f"{sensor} decoder needs model fields {missing} that this checkpoint doesn't have")
     atms_traj['t_order'] = [t_levels.index(p) for p in op.t_levels_hpa]
     atms_traj['q_order'] = [q_levels.index(p) for p in op_q_levels]
     detach_above = cfg('detach_q_above_hpa', 250.)
@@ -1428,7 +1459,10 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
     # targets, e.g. AMSU-A 14): only these enter the finite-H(x) screen
     atms_traj['tb_ok_idx'] = torch.isfinite(op.y_mean).nonzero().flatten().tolist()
     _setup_atms_oberr(exp, atms_traj, nch, device)
-    _setup_atms_corr_r(cfg('corr_r'), float(cfg('corr_cond_max', 50.)), atms_traj, logger, device)
+    if not assimilate:
+        raise ValueError(f"observations.{sensor}.assimilate_channels is empty")
+    _setup_atms_corr_r(cfg('corr_r'), float(cfg('corr_cond_max', 50.)), bool(cfg('corr_r_window', False)),
+                       atms_traj, logger, device, masked=bool(cfg('corr_r_masked', False)))
     atms_traj['lsm_max'] = float(cfg('lsm_max', 0.01))
 
     idx_list, wts_list = [], []
@@ -1686,8 +1720,8 @@ def _compute_atms_observation_diagnostics_at_time(model, decoded, atms_traj, gri
     q = grid_interp.interp(idx, wts, decoded['q'][atms_traj['q_order']])
     q = torch.where(atms_traj['q_detach'][:, None], q.detach(), q)
     fields = {'t': t.float(), 'q': q.float()}
-    for name, key in _ATMS_OPERATOR_FIELDS.items():
-        fields[name] = grid_interp.interp(idx, wts, decoded[key]).float()
+    for name in op.surface_inputs.values():
+        fields[name] = grid_interp.interp(idx, wts, decoded[_ATMS_OPERATOR_FIELDS[name]]).float()
     obs = {name: atms_traj['obs_'+name][oind] for name in _ATMS_OBS_INPUTS}
     x = op.assemble(fields, obs)
     model_equivalent, _, log_sig = op(x, z)
@@ -1760,36 +1794,62 @@ def _setup_atms_oberr(exp, atms_traj, nch, device):
     atms_traj['sigma_set'] = [False] * shape[0]
 
 
-def _setup_atms_corr_r(path, cond_max, atms_traj, logger, device):
+def _setup_atms_corr_r(path, cond_max, window, atms_traj, logger, device, masked=False):
     """Inter-channel correlated R for the assimilated channels
     (`observations.<sensor>.corr_r`): per scene, the correlation matrix C
     from `path` (atms_decoder_error.py's json: `channels`, `scenes.<scene>.corr`),
     reconditioned by C' = (C + d I) / (1 + d) with d set so cond(C') <=
     `corr_cond_max` (unit diagonal kept, so sigma is unchanged). Stores
     `corr_whiten` (n_scenes, na, na) = L^-1, C' = L L^T; identity for scenes
-    the file does not list. None = diagonal R."""
+    the file does not list. None = diagonal R. `window` (`corr_r_window`)
+    also builds `corr_whiten_e`, a separate block for the emis_channels
+    (no cross-correlation with the assimilated channels).
+
+    `masked` (`corr_r_masked`, for IASI, whose clear channels differ per ob):
+    keep C' itself (`corr_masked`, n_scenes x na x na) and whiten every ob
+    over the channels it uses, with the Cholesky factor of C' restricted to
+    them (exact r^T C_used^-1 r; cond of a principal submatrix <= cond(C'))
+    instead of whitening only obs that use all channels."""
     atms_traj['corr_whiten'] = None
+    atms_traj['corr_whiten_e'] = None
+    atms_traj['corr_masked'] = None
     if not path:
+        if window:
+            raise ValueError(f"{atms_traj['sensor']} corr_r_window needs corr_r")
         return
     import json
     with open(path) as fh:
         d = json.load(fh)
     chans = list(d['channels'])
-    assim = atms_traj['assimilate_channels']
-    if [c for c in assim if c not in chans]:
-        raise ValueError(f"corr_r {path} lacks assimilated channels {[c for c in assim if c not in chans]}")
-    ii = [chans.index(c) for c in assim]
-    na = len(assim)
-    W = torch.eye(na, dtype=torch.float64).repeat(len(ATMS_SCENES), 1, 1)
-    for sc, v in d['scenes'].items():
-        C = torch.tensor(v['corr'], dtype=torch.float64)[ii][:, ii]
-        lam = torch.linalg.eigvalsh(C)
-        dl = max(0.0, float((lam[-1] - cond_max * lam[0]) / (cond_max - 1)))
-        Cr = (C + dl * torch.eye(na, dtype=torch.float64)) / (1 + dl)
-        W[ATMS_SCENES.index(sc)] = torch.linalg.inv(torch.linalg.cholesky(Cr))
-        logger.info(f"{atms_traj['sensor']} corr_r {sc}: cond {float(lam[-1] / lam[0]):.0f} -> "
-                    f"{float(torch.linalg.cond(Cr)):.0f} (d {dl:.3f}), channels {assim}")
-    atms_traj['corr_whiten'] = W.to(device=device, dtype=torch.float32)
+
+    def whiten(sel, label, keep_corr=False):
+        if [c for c in sel if c not in chans]:
+            raise ValueError(f"corr_r {path} lacks {label} channels {[c for c in sel if c not in chans]}")
+        ii = [chans.index(c) for c in sel]
+        na = len(sel)
+        W = torch.eye(na, dtype=torch.float64).repeat(len(ATMS_SCENES), 1, 1)
+        for sc, v in d['scenes'].items():
+            C = torch.tensor(v['corr'], dtype=torch.float64)[ii][:, ii]
+            lam = torch.linalg.eigvalsh(C)
+            dl = max(0.0, float((lam[-1] - cond_max * lam[0]) / (cond_max - 1)))
+            Cr = (C + dl * torch.eye(na, dtype=torch.float64)) / (1 + dl)
+            W[ATMS_SCENES.index(sc)] = Cr if keep_corr else torch.linalg.inv(torch.linalg.cholesky(Cr))
+            chan_txt = sel if na <= 30 else f"{na} ({sel[0]}..{sel[-1]})"
+            logger.info(f"{atms_traj['sensor']} corr_r {sc}: cond {float(lam[-1] / lam[0]):.0f} -> "
+                        f"{float(torch.linalg.cond(Cr)):.0f} (d {dl:.3f}), {label} channels {chan_txt}"
+                        + (", masked per ob" if keep_corr else ""))
+        return W.to(device=device, dtype=torch.float32)
+
+    if masked:
+        if window:
+            raise ValueError(f"{atms_traj['sensor']} corr_r_masked does not support corr_r_window")
+        atms_traj['corr_masked'] = whiten(atms_traj['assimilate_channels'], 'assimilated', keep_corr=True)
+        return
+    atms_traj['corr_whiten'] = whiten(atms_traj['assimilate_channels'], 'assimilated')
+    if window:
+        if not atms_traj['emis_channels']:
+            raise ValueError(f"{atms_traj['sensor']} corr_r_window needs emis_control 'per_obs'")
+        atms_traj['corr_whiten_e'] = whiten(atms_traj['emis_channels'], 'window')
 
 
 def _atms_sigma(atms_traj, oind, model_equivalent=None):
@@ -1866,9 +1926,10 @@ def _resolve_loss_interp_specs(model, exp):
     # raobs observations share psobs's obs-slot grid (see get_raobs).
     if exp.get('raobs_enabled', False):
         names |= {RAOBS_VARIABLE_MODEL_BASE[v] for v in exp['raobs_variables']}
-    # microwave sensors read profiles, surface and static fields at the same slots
+    # microwave sensors read profiles, surface and static fields at the same slots;
+    # fields this model lacks are skipped (get_atmsobs raises if the operator needs one)
     if any(exp.get(f'{sensor}_enabled', False) for sensor in MW_SENSORS):
-        names |= set(ATMS_MODEL_FIELDS)
+        names |= {f for f in ATMS_MODEL_FIELDS if model.is_known_variable(f)}
     specs = []
     for base in sorted(names):
         if not model.is_known_variable(base):
@@ -2341,6 +2402,16 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             full = u.all(-1)
             w = torch.einsum('nij,nj->ni', W[atms_traj['scene'][j].long().clamp(min=0)], rn)
             rn = torch.where(full[:, None], w, rn)
+        Cm = atms_traj.get('corr_masked')
+        if Cm is not None:
+            # per-ob correlated R over the channels it uses: C restricted to
+            # them, identity on the rest (where rn = 0), so |L^-1 rn|^2 =
+            # rn_used^T C_used^-1 rn_used
+            m = u.to(rn.dtype)
+            C = Cm[atms_traj['scene'][j].long().clamp(min=0)] * (m[:, :, None] * m[:, None, :])
+            C = C + torch.diag_embed(1.0 - m)
+            L = torch.linalg.cholesky(C.detach())
+            rn = torch.linalg.solve_triangular(L, rn[:, :, None], upper=False)[:, :, 0]
         Jt = _rho(rn, huber_c).sum()
         if zeta is not None:
             e = atms_traj['emis_idx']
@@ -2357,16 +2428,30 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             innov_e = atms_traj['y'][j][:, e] - tb_e[:, e]
             sig_e = sigma[..., e]
             ok = screened[:, None] & act[:, None] & (innov_e.abs() <= atms_traj['bg_check'] * sig_e).detach()
-            Je = _rho(torch.where(ok, innov_e, torch.zeros_like(innov_e)) / sig_e, huber_c).sum()
+            rn_e = torch.where(ok, innov_e, torch.zeros_like(innov_e)) / sig_e
+            We = atms_traj.get('corr_whiten_e')
+            if We is not None:
+                # corr_r_window: whiten only the obs that act on the state
+                # and are used in every window channel; z-only obs keep the
+                # diagonal R
+                full_e = ws & ok.all(-1)
+                w_e = torch.einsum('nij,nj->ni', We[atms_traj['scene'][j].long().clamp(min=0)], rn_e)
+                rn_e = torch.where(full_e[:, None], w_e, rn_e)
+            Je = _rho(rn_e, huber_c).sum()
             Jt = Jt + Je
         if do_print:
+            used_txt = (dict(zip(atms_traj['assimilate_channels'], u.sum(0).tolist()))
+                        if len(a) <= 30 else f"{int(u.sum())} channel-obs over {len(a)} channels, {int(u.any(-1).sum())} obs")
             msg = (f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): {atms_traj['sensor']} J {Jt.item()}, "
-                   f"obs used {dict(zip(atms_traj['assimilate_channels'], u.sum(0).tolist()))} "
-                   f"of {int(screened.sum().item())} screened")
+                   f"obs used {used_txt} of {int(screened.sum().item())} screened")
+            if Cm is not None:
+                msg += "; corr_r masked per ob"
             if W is not None:
                 msg += f"; corr_r on {int(full.sum())} obs"
             if zeta is not None:
                 msg += f"; window-channel Jo {Je.item():.1f} over {int(ok.any(-1).sum())} obs"
+                if We is not None:
+                    msg += f" (corr_r on {int(full_e.sum())})"
             print(msg)
         return Jt
 

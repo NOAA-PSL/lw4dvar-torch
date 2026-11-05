@@ -51,7 +51,15 @@ _ERA5_KEEP = 64  # dates kept: a cycle's window plus the next cycles' overlap (0
 
 
 def truth(date, cache_dir):
+    """ERA5 at date from an ic_cache directory of GRIBs, or, with cache_dir = 'zarr:v8' / 'zarr:era5_37', from a
+    training zarr (physical_scorecard.TRUTHS). Score each model against its own training data: the ic_cache GRIBs
+    equal v8 (A0's); A1/A2 need 'zarr:era5_37' (the two differ by ~2.4 m in z500)."""
     key = (cache_dir, date)
+    if key not in _era5 and cache_dir.startswith('zarr:'):
+        import physical_scorecard as ps
+        want = {'z': {500}, 'q': {850}, 'u': {250}, 'v': {250}, 't': set()}
+        f = ps.read_era5(datetime.strptime(date, '%Y-%m-%dT%H'), want, cache_dir[5:])  # z in m, q in g/kg
+        _era5[key] = {'z500': f[('z', 500)], 'q850': f[('q', 850)], 'ws250': np.hypot(f[('u', 250)], f[('v', 250)])}
     if key not in _era5:
         e = aifs_ic.read_single_date_fields(None, datetime.strptime(date, '%Y-%m-%dT%H'), cache_dir)
         _era5[key] = {'z500': e['z_500'] / zw.GRAV, 'q850': e['q_850'] * 1e3,

@@ -32,13 +32,18 @@ import torch  # noqa: E402
 
 from obs_atms_operator import AtmsOperator  # noqa: E402
 
-PRE = '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/data/era5_pre_2015'
-BUNDLE = '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/outputs/bo_twohead_s1/atms_twohead_bo_s1.pt'
+# PRE / BUNDLE env: other pairs and decoder, e.g. the 37-level A1/A2 ones (notes/integrate_aifs37_models.md)
+PRE = os.environ.get('PRE', '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/data/era5_pre_2015')
+BUNDLE = os.environ.get('BUNDLE', '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/outputs/bo_twohead_s1/atms_twohead_bo_s1.pt')
+# decoder inputs the model lacks, set to the training mean as the 4D-Var does (Bo's model has no q 50 hPa);
+# QFILL='' for the q70 decoders
+QFILL = [n for n in os.environ.get('QFILL', 'spfh-1').split(',') if n]
 NCYC = int(sys.argv[1]) if len(sys.argv) > 1 else 120
 OUT = sys.argv[2] if len(sys.argv) > 2 else 'figures/obs_error/decoder_era5'
 WIN = [1, 2, 3, 4, 16, 17]
 ASSIM = [5, 6, 7, 18, 19, 20, 21, 22]
-ALL = WIN + ASSIM
+# STRAT=1: also the stratospheric channels 8-15 (A1/A2 Phase 2)
+ALL = WIN + ASSIM + (list(range(8, 16)) if os.environ.get('STRAT') == '1' else [])
 SCENES = ['ocean_clear', 'ocean_cloudy', 'land', 'snow', 'seaice']
 os.makedirs(os.path.dirname(OUT), exist_ok=True)
 
@@ -73,14 +78,14 @@ def fit_z(op, x, y, sig_w, iters=4):
 
 
 op = AtmsOperator.load(BUNDLE)
-files = sorted(glob.glob(f'{PRE}/2015*.parquet'))[::2][:NCYC]
-iq50, it0 = op.input_features.index('spfh-1'), op.input_features.index('Obs_Time')
+files = sorted(glob.glob(f"{PRE}/{os.environ.get('FILES', '2015*')}.parquet"))[::2][:NCYC]  # FILES env: e.g. 201609* (a held-out month)
+iqf, it0 = [op.input_features.index(n) for n in QFILL], op.input_features.index('Obs_Time')
 sig_w = op.sigma_o[[c - 1 for c in WIN]].clone()
 acc = {sc: {'d': [], 'g': []} for sc in SCENES}
 for f in files:
     pre = pd.read_parquet(f)
     x = torch.tensor(pre[op.input_features].to_numpy(np.float32))
-    x[:, iq50] = op.x_mean[iq50]
+    x[:, iqf] = op.x_mean[iqf]
     x[:, it0] = 0.0
     y = torch.tensor(pre[[f'ObsBC-{i}' for i in range(22)]].to_numpy(np.float32))
     wf, ice, snow = pre.water_frac.to_numpy(), pre.ice_frac.to_numpy(), pre.snow_frac.to_numpy()

@@ -86,6 +86,8 @@ def curve(lab, kind, spec):
     n = s2 = 0.
     for name in names:
         for ds in dss:
+            if f'obs_{name}_n' not in ds:  # no obs of this kind on that date (e.g. ASCAT missing from PREPBUFR)
+                continue
             a, b = ds[f'obs_{name}_n'], ds[f'obs_{name}_s2']
             if level is not None:
                 dim = [d for d in a.dims if d.startswith('level_')][0]

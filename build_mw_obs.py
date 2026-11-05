@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Obs files for a microwave sensor other than ATMS (AMSU-A; MHS later), one parquet per 6-h cycle,
+"""Obs files for a sensor other than ATMS (AMSU-A, IASI; MHS later), one parquet per 6-h cycle,
 in the layout `get_atmsobs` reads (radianced `scripts/build_lw4dvar_obs.py` does the same for ATMS).
 
 Reads radianced's ERA5 pairs `<pre>/<YYYYMMDDHH>.parquet` (build_era5_pre.py; every satellite of the
@@ -9,8 +9,10 @@ sensor together, `sat_id` = index in atmsdec.diag.SENSORS[sensor]["sats"]) and k
     Sat_Zenith_Angle, Scan_Angle, Sat_Azimuth_Angle (deg)
     land_frac, water_frac, ice_frac, snow_frac (FOV fractions, GSI diag), clw_obs (kg/m2)
     yobc_01..NN   y_o - BC (K), NaN where the channel is off in the replay for that satellite and date
-    qc_01..NN     GSI qc flag (information only)
+    qc_01..NN     GSI qc flag (information only; absent for IASI, whose pairs have none)
     withheld      True for a random 20% of obs (seed = cycle YYYYMMDDHH)
+
+IASI: --sensor iasi --nch 175 --pre .../atms/data/iasi_era5_pre37 (yobc NaN = channel not clear per GSI QC; clw_obs 0).
 
 Example (radianced data, 2015-01 .. 2015-07):
     python build_mw_obs.py --sensor amsua --nch 15 --pre /scratch4/BMC/gsienkf/Sergey.Frolov/atms/data/amsua_era5_pre \
@@ -23,6 +25,7 @@ import os
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 
 def main():
@@ -44,10 +47,12 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     files = [f for f in sorted(glob.glob(os.path.join(a.pre, "*.parquet")))
              if a.start <= os.path.basename(f)[:10] <= a.end]
+    avail = set(pq.read_schema(files[0]).names) if files else set()
     n_tot = n_wh = 0
     for f in files:
         cyc = os.path.basename(f)[:10]
-        d = pd.read_parquet(f, columns=list(keep)).rename(columns=keep).astype(np.float32)
+        cols = [c for c in keep if c in avail]  # IASI pairs have no qc-k columns
+        d = pd.read_parquet(f, columns=cols).rename(columns=keep).astype(np.float32)
         d["lon"] = d["lon"] % 360.0
         d["withheld"] = np.random.default_rng(int(cyc)).random(len(d)) < a.withheld_fraction
         d.to_parquet(os.path.join(a.out, f"{cyc}.parquet"), index=False)

@@ -46,7 +46,9 @@ LOGS_RANGE = (-12.0, 5.0)  # radianced scripts/twohead.py
 
 # decoder input name -> key in `fields` (model) or `obs`
 _MODEL_SURFACE = {"skt": "skt", "t2m": "2t", "d2m": "2d", "sp": "sp", "msl": "msl", "u10": "10u",
-                  "v10": "10v", "tcw": "tcw", "lsm": "lsm", "zsfc": "z", "sdor": "sdor", "slor": "slor"}
+                  "v10": "10v", "tcw": "tcw", "lsm": "lsm", "zsfc": "z", "sdor": "sdor", "slor": "slor",
+                  # the 37-level A1/A2 decoders also take these (same names in the model)
+                  **{k: k for k in ("sd", "siconc", "swvl1", "stl1", "cvh", "cvl", "lai_hv", "lai_lv", "slt", "fsr")}}
 _OBS = ("land_frac", "water_frac", "ice_frac", "snow_frac", "Sat_Zenith_Angle", "Scan_Angle",
         "Sat_Azimuth_Angle")
 _OBS_DEFAULT = {"Obs_Time": 0.0, "sat_id": 0.0}
@@ -81,7 +83,13 @@ class AtmsOperator(torch.nn.Module):
         self.n_sat = sum(f.startswith("sat-") for f in self.input_features)
         self.t_levels_hpa = [float(p) for p in bundle["t_levels_hpa"]]
         self.q_levels_hpa = [float(p) for p in bundle["q_levels_hpa"]]
+        # level k's feature suffix (tmp-<i>, above-<i>, spfh-<i>), top -> bottom: i = k for Bo's 14 levels and A1's
+        # 37, an index into the 37 ERA5 levels when a decoder takes only some of them (A2: i = 5..36)
+        self._t_ids = sorted(int(f[4:]) for f in self.input_features if f.startswith("tmp-"))
+        self._q_ids = sorted(int(f[5:]) for f in self.input_features if f.startswith("spfh-"))
         self.channel_sets = {k: list(v) for k, v in bundle["channel_sets"].items()}  # 1-based channels
+        # decoder surface input -> `fields` key, for the inputs this bundle takes
+        self.surface_inputs = {n: k for n, k in _MODEL_SURFACE.items() if n in self.input_features}
         self.K = int(bundle["K"])
         n_in = len(self.input_features)
         self.P = _MLP(n_in, self.nch + self.K, bundle["hidden"])
@@ -108,18 +116,21 @@ class AtmsOperator(torch.nn.Module):
         if t.shape[0] != len(self.t_levels_hpa):
             raise ValueError(f"t has {t.shape[0]} levels, expected {len(self.t_levels_hpa)} ({self.t_levels_hpa})")
         n_obs = sp.shape[0]
-        if q.shape[0] == len(self.q_levels_hpa) - 1:
-            top = self.x_mean[self.input_features.index("spfh-%d" % self._q_index(0))]
-            q = torch.cat([top.to(q.dtype).expand(1, n_obs), q], 0)
-        elif q.shape[0] != len(self.q_levels_hpa):
+        n_top = len(self.q_levels_hpa) - q.shape[0]
+        if 0 < n_top <= len(self.q_levels_hpa):
+            # levels the model doesn't carry (above its top q level) at the decoder's mean
+            top = torch.stack([self.x_mean[self.input_features.index("spfh-%d" % self._q_ids[k])]
+                               for k in range(n_top)])
+            q = torch.cat([top.to(q.dtype)[:, None].expand(n_top, n_obs), q], 0)
+        elif n_top != 0:
             raise ValueError(f"q has {q.shape[0]} levels, expected {len(self.q_levels_hpa)} ({self.q_levels_hpa})")
         cols = {}
         for k in range(len(self.t_levels_hpa)):
-            cols[f"tmp-{k}"] = t[k]
-            cols[f"above-{k}"] = (self.t_levels_hpa[k] < sp.detach() / 100.0).to(t.dtype)
+            cols[f"tmp-{self._t_ids[k]}"] = t[k]
+            cols[f"above-{self._t_ids[k]}"] = (self.t_levels_hpa[k] < sp.detach() / 100.0).to(t.dtype)
         for k in range(len(self.q_levels_hpa)):
-            cols[f"spfh-{self._q_index(k)}"] = q[k]
-        for name, key in _MODEL_SURFACE.items():
+            cols[f"spfh-{self._q_ids[k]}"] = q[k]
+        for name, key in self.surface_inputs.items():
             cols[name] = fields[key]
         for name in _OBS:
             cols[name] = torch.as_tensor(obs[name], dtype=t.dtype, device=t.device)
@@ -129,10 +140,6 @@ class AtmsOperator(torch.nn.Module):
         for k in range(self.n_sat):
             cols[f"sat-{k}"] = (cols["sat_id"] == k).to(t.dtype)
         return torch.stack([cols[f] for f in self.input_features], 1)
-
-    def _q_index(self, k):
-        # decoder names q levels by their index in t_levels_hpa (spfh-1 = 50 hPa)
-        return self.t_levels_hpa.index(self.q_levels_hpa[k])
 
     def forward(self, x, z=None):
         """x: (n_obs, n_in) physical units; z: (n_obs, K) or None (= 0).
