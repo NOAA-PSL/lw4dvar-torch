@@ -1,0 +1,21 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "slow: longer CPU tests (still run by make check)",
+    "gpu: needs a GPU and real checkpoints; never run in CI",
+    "ace2: needs fme and the mini-ACE2 checkpoint (make check-ace2; its own CI job)",
+]
+
+[tool.ruff]
+# The git submodules (model packages) are not ours to lint.
+extend-exclude = [
+    "backends/aifs/aifs-single-1.1",
+    "backends/aifs/aifs-single-2.0",
+    "backends/fcn3/fourcastnet3",
+    "backends/ace2/ACE2-ERA5",
+]
+
+[tool.ruff.lint]
+# Errors only, no style: syntax errors, undefined names, invalid comparisons.
+select = ["E9", "F63", "F7", "F82"]

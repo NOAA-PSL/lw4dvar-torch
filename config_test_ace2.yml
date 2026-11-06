@@ -11,7 +11,7 @@ exp:
   n_init: 240
   dt_init: 6
   save_levs: [1000, 850, 500, 250, 50]
-  cycle: False
+  cycle: True
   exp_name: 'test_ace2_6h_5d_50it'
 
   path_model: './backends/ace2/ACE2-ERA5/'
