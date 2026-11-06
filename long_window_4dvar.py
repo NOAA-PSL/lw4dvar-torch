@@ -23,8 +23,10 @@ structural differences between the three backends this merge is built
 around.
 
 Control is latent-only (see long_window_4dvar_utils.py's docstring): the
-increment lives in the model's latent space, and the analysis is always
-valid at `window_start + dt_verif`, not `window_start`. Observations may be
+increment lives in the model's latent space, and the analysis is valid
+at `window_start + dt_verif`, not `window_start` -- except for backends whose
+latent is the state itself (`model.increment_at_start`: ngcm, neuralgcm),
+whose analysis is valid at window start. Observations may be
 sampled finer than the 6h model step via a per-window `dt_obs` key (the
 decoded model state is linearly interpolated in time to each obs time).
 

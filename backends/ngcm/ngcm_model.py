@@ -159,6 +159,8 @@ class NGCMModel(forecast_model.LatentForecastModel):
             raise ValueError(f"expected tracers {TRACER_KEYS}, got {self._tracer_names}")
         self._timestep = datetime.timedelta(seconds=int(model.timestep / np.timedelta64(1, "s")))
         self._grid = model.model_ylm_map.lon_lat_grid
+        self._sht = model.model_ylm_map.dinosaur_grid   # array to_modal / to_nodal ((..., lon, lat))
+        self._ckpt_id = f"ngcm:{os.path.abspath(exp_dir)}@{int(step)}{':ema' if use_ema else ''}"
         self._dynamic_spec = model.dynamic_inputs_spec
         self._inference = api.InferenceModel.from_model_api(model)
         self._levels = levels
@@ -215,6 +217,27 @@ class NGCMModel(forecast_model.LatentForecastModel):
         self._decode_fn = None
         self._forcing_cache = {}
         self._assimilate = None
+        self._build_grid_maps()
+
+    def _build_grid_maps(self) -> None:
+        """Jitted latent <-> grid maps for the static-ensemble B: the modal
+        families (vorticity, divergence, temperature, ln ps: the leading
+        3 * nlay + 1 channels) through the model's own SHT, the nodal tracers
+        just unpadded; grid layout (C, lat north-to-south, lon)."""
+        sht, n_modal = self._sht, 3 * self._nlay + 1
+
+        def to_grid(latent):
+            nodal = jnp.concatenate([sht.to_nodal(latent[:n_modal]), latent[n_modal:, :, :-1]], 0)
+            return jnp.flip(nodal, axis=2).transpose(0, 2, 1)
+
+        def from_grid(constants, grid):
+            del constants
+            nodal = jnp.flip(grid.transpose(0, 2, 1), axis=2)          # (C, lon, lat south-to-north)
+            tracers = jnp.pad(nodal[n_modal:], ((0, 0), (0, 0), (0, 1)))
+            return jnp.concatenate([sht.to_modal(nodal[:n_modal]), tracers], 0)
+
+        self._to_grid_jit = jax.jit(to_grid)
+        self._from_grid_fn = jax_bridge.torch_function(from_grid)
 
     # ------------------------------------------------------------------
     # properties
@@ -265,6 +288,31 @@ class NGCMModel(forecast_model.LatentForecastModel):
 
     def wrap_state(self, state: torch.Tensor, date: datetime.datetime) -> NGCMState:
         return NGCMState(state, date)
+
+    # the latent is the packed state: the analysis is valid at window start
+    increment_at_start = True
+
+    def apply_increment(self, state: NGCMState, latent_increment: torch.Tensor) -> NGCMState:
+        """Packed state + increment / its family's state_scales factor."""
+        return NGCMState((state.state[0] + latent_increment * self._channel_scale)[None], state.date)
+
+    # --- static-ensemble B (jb_samples) support: grid <-> latent ---------
+    jb_sht_grid = "legendre-gauss"
+
+    def checkpoint_id(self) -> str:
+        return self._ckpt_id
+
+    def latent_from_state_diff(self, diff: torch.Tensor) -> torch.Tensor:
+        return diff / self._channel_scale
+
+    def latent_to_grid(self, latent: torch.Tensor) -> torch.Tensor:
+        """(161, 128, 65) -> (161, 64, 128): modal families to nodal, tracers
+        unpadded; latitudes flipped to north-to-south."""
+        out = self._to_grid_jit(jax_bridge.to_jax(latent.float()))
+        return jax_bridge.to_torch(out).to(self._device)
+
+    def latent_from_grid(self, grid: torch.Tensor) -> torch.Tensor:
+        return self._from_grid_fn(grid.float().contiguous())
 
     def _prime_noise(self) -> None:
         """No-op: deterministic."""
@@ -457,9 +505,9 @@ class NGCMModel(forecast_model.LatentForecastModel):
         so `use_checkpoint` has nothing further to do (the saved per-step
         input is the ~5 MB packed state)."""
         del use_checkpoint
-        x = state.state[0]
         if latent_increment is not None:
-            x = x + latent_increment * self._channel_scale
+            state = self.apply_increment(state, latent_increment)
+        x = state.state[0]
         date = state.date
         for _ in range(steps):
             x = self._advance_fn(x, constants=self._constants(date))

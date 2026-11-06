@@ -131,6 +131,13 @@ class NeuralGCMModel(forecast_model.LatentForecastModel):
         self._files = {}
         self._levels_by_base = {b: [(int(p), None) for p in self._plevs] for b in DECODED}
         self._single_by_base = {"z500": None, "sp": None}
+        import hashlib
+        h = hashlib.sha256()
+        with open(checkpoint_path, "rb") as f:
+            while chunk := f.read(1 << 24):
+                h.update(chunk)
+        self._ckpt_id = f"neuralgcm:sha256:{h.hexdigest()}"
+        self._build_grid_maps()
 
     # ------------------------------------------------------------------
     # properties
@@ -188,6 +195,54 @@ class NeuralGCMModel(forecast_model.LatentForecastModel):
 
     def wrap_state(self, state: torch.Tensor, date: datetime.datetime) -> NeuralGCMState:
         return NeuralGCMState(state, date)
+
+    # the latent is the ModelState's state channels: the analysis is valid
+    # at window start
+    increment_at_start = True
+
+    def apply_increment(self, state: NeuralGCMState, latent_increment: torch.Tensor) -> NeuralGCMState:
+        """The `state` channels + increment / their state_scales factor
+        (memory, diagnostics and sim_time unchanged)."""
+        x = state.state[0]
+        n = self._n_control
+        x = torch.cat([x[:n] + latent_increment * self._channel_scale, x[n:]], 0)
+        return NeuralGCMState(x[None], state.date)
+
+    # --- static-ensemble B (jb_samples) support: grid <-> latent ---------
+    jb_sht_grid = "legendre-gauss"
+
+    def checkpoint_id(self) -> str:
+        return self._ckpt_id
+
+    def latent_from_state_diff(self, diff: torch.Tensor) -> torch.Tensor:
+        """state.state channel difference / its scale (frozen channels -> 0)."""
+        s = self._channel_scale
+        return torch.where(s > 0, diff[:self._n_control] / torch.where(s > 0, s, 1.0), 0.0)
+
+    def latent_to_grid(self, latent: torch.Tensor) -> torch.Tensor:
+        """(193, 128, 65) modal (127 x 65 used) -> (193, 64, 128) nodal,
+        latitudes north-to-south."""
+        out = self._to_grid_jit(jax_bridge.to_jax(latent.float()))
+        return jax_bridge.to_torch(out).to(self._device)
+
+    def latent_from_grid(self, grid: torch.Tensor) -> torch.Tensor:
+        return self._from_grid_fn(grid.float().contiguous())
+
+    def _build_grid_maps(self) -> None:
+        sht = self.model.model_coords.horizontal
+        nm, nl = sht.modal_shape
+
+        def to_grid(latent):
+            nodal = sht.to_nodal(latent[:, :nm, :nl])                    # (C, lon, lat south-to-north)
+            return jnp.flip(nodal, axis=2).transpose(0, 2, 1)
+
+        def from_grid(constants, grid):
+            del constants
+            modal = sht.to_modal(jnp.flip(grid.transpose(0, 2, 1), axis=2))
+            return jnp.pad(modal, ((0, 0), (0, SPATIAL[0] - nm), (0, SPATIAL[1] - nl)))
+
+        self._to_grid_jit = jax.jit(to_grid)
+        self._from_grid_fn = jax_bridge.torch_function(from_grid)
 
     def _prime_noise(self) -> None:
         """No-op: deterministic."""
@@ -383,10 +438,9 @@ class NeuralGCMModel(forecast_model.LatentForecastModel):
         before the first. One bridge crossing per step (recomputed in
         backward, so use_checkpoint has nothing further to do)."""
         del use_checkpoint
-        x = state.state[0]
         if latent_increment is not None:
-            n = self._n_control
-            x = torch.cat([x[:n] + latent_increment * self._channel_scale, x[n:]], 0)
+            state = self.apply_increment(state, latent_increment)
+        x = state.state[0]
         date = state.date
         for _ in range(steps):
             x = self._advance_fn(x, constants=self._forcings(date))

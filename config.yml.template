@@ -147,7 +147,7 @@ exp:
   # kappa = n_points / (s^2 * N_obs).)
   #jc_ps_weight: 30.
   # jb_samples: optional background term Jb with a static-ensemble latent B
-  # (ACE2 only so far; latent_b.EnsembleB). The file holds N latent
+  # (ace2, ngcm, neuralgcm; latent_b.EnsembleB). The file holds N latent
   # background-error samples (z(ERA5) - z(cycled background) at the
   # increment's injection point, mean removed), built offline from a cycled
   # run by diagnostics/build_latent_ens_b.py (~8 GB for 161 samples); the run
@@ -161,6 +161,15 @@ exp:
   # prior, so learn_rate is in different units than without Jb (retune).
   # Leave jc_ps_weight off with Jb: the sampled B already carries the
   # (geostrophic) mass-wind balance the tendency penalty was standing in for.
+  # ngcm / neuralgcm (spectral states): samples by the NMC method instead,
+  # x(t | ERA5 at t-36h) - x(t | ERA5 at t-12h) (the default; 12h-6h
+  # differences are ~2.5x smaller in variance and their single-ob
+  # increments are unbalanced and lose ~60% of their ps within 6 h --
+  # diagnostics/check_jax_nmc_b.py), built by
+  # diagnostics/build_jax_nmc_b.py in latent units (state_scales applied)
+  # on the Gaussian grid; the solver maps B's grid-point output back to the
+  # spectral latent with the model's SHT (model.latent_from_grid). The file
+  # is tied to the checkpoint and to state_scales.
   #jb_samples: './output/latent_b/ace2_jc25_ens_samples.pt'
   # jb_loc_km: Gaussian localization scale (km; correlation exp(-d^2/(2 loc^2)),
   # 0.25 at d ~ 1.7 loc). Default 1500. A runtime parameter -- no need to
