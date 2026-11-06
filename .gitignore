@@ -244,3 +244,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# CI fixture downloads (tests/ace2, LW4DVAR_FIXTURE_CACHE in CI)
+.fixture-cache/
+# committed test fixtures (tests/make_fixtures.py)
+!tests/data/**/ic_cache/
+!tests/data/**/psobs/

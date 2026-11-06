@@ -13,7 +13,8 @@ The checks run on CPU, with no checkpoints, submodules, LFS content or
 network access, in a few seconds. `make check` runs:
 
 - `ruff check`: errors only (syntax errors, undefined names), not style.
-- `pytest -m "not gpu"`: everything under `tests/`.
+- `pytest -m "not gpu and not ace2"`: everything under `tests/` except the
+  mini-ACE2 run (below), which has its own target and CI job.
 
 ## Layout
 
@@ -26,6 +27,25 @@ network access, in a few seconds. `make check` runs:
   and `config.yml.template` must load) and the date helpers. Each test checks
   against an independent reference (exact spherical areas, an isothermal
   atmosphere, weights computed by hand), not a copy of the code under test.
+
+- `tests/ace2/` (marker `ace2`, `make check-ace2`, CI job `ace2-mini`): the
+  solver end to end with a real, tiny model -- the mini ACE2 (2.5 deg,
+  16-layer CRTM+land variables, SFNO embed_dim 64) on CPU, one 24 h window of
+  ps obs, 50 epochs through `long_window_4dvar.py`. Checks that it runs,
+  writes its outputs, and that the cost falls by at least 40% (observed 59%);
+  not analysis quality (the model is far too small). About a minute of
+  compute. Needs fme: `pip install -r requirements-ci-ace2.txt`.
+
+## Fixtures
+
+`tests/data/<name>/` holds small frozen inputs in plain git (about 1 MB per
+file, 10 MB in total), rebuilt by `tests/make_fixtures.py <name>` on Ursa.
+Anything bigger -- the mini-ACE2 checkpoint, 22 MB -- is a GitHub release
+asset (`ci-fixtures-vN`) pinned by sha256 in `tests/data/<name>/manifest.json`.
+Tests find it at `$LW4DVAR_MINI_ACE2_CKPT`, else in `$LW4DVAR_FIXTURE_CACHE`
+(default `~/.cache/lw4dvar`), else download it there; CI caches it under its
+sha256. A new checkpoint goes into a new release, never over an old asset,
+so older commits keep testing against the file they pinned.
 
 Still to come (issue #20): a CPU toy backend with a one-window smoke run,
 the math gates (gradients vs finite differences, Taylor and adjoint
