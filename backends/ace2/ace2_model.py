@@ -33,6 +33,12 @@ documentation):
   and decoder), shape `(embed_dim, h, w)` = `(384, 180, 360)`. Injected via
   a forward hook on `blocks[-1]`, registered/removed INSIDE the checkpointed
   function so the backward recompute re-applies it.
+- Our own checkpoints (ace2-training.md) may differ in layer count (16/32),
+  grid (e.g. the 2.5 deg mini ACE2 for CI) and variables: the CRTM+land ones
+  carry specific_humidity_k + specific_total_condensate_k instead of
+  specific_total_water_k, plus ozone/soil/snow prognostics. Everything here
+  follows the checkpoint's in/out names and ak/bk; "8 layers" and
+  "(180, 360)" below describe the released checkpoint.
 - Runs in fp32 (fme's NullOptimization.autocast is a no-op) -- none of
   Aurora's/AIFS's fp16-autocast gradient overflow concerns apply.
 
@@ -59,7 +65,11 @@ from fme.ace.models.modulus.sfnonet import SphericalFourierNeuralOperatorNet
 from fme.ace.stepper.single_module import Stepper
 from fme.core.step.args import StepArgs
 
+import fme_total_water
 import forecast_model
+
+# CRTM-family checkpoints: fme's correctors need total water = q + condensate.
+fme_total_water.install()
 
 GRAV = 9.80665
 RD = 287.05
@@ -76,7 +86,12 @@ _LAYER_RE = re.compile(r"^(.*)_(\d+)$")
 _LOWEST_LEVEL_KEYS = ("t_lowest", "q_lowest", "p_lowest")
 
 # Derived pressure-level family -> native ACE2 layer family it's built from.
+# 'q' is the checkpoint's humidity family (ACE2Model._humidity_family):
+# specific_total_water for the released ACE2-ERA5 (vapour + condensate in one
+# field), specific_humidity for our CRTM+land checkpoints, which carry vapour
+# and specific_total_condensate separately.
 _DERIVED_FROM = {"t": "air_temperature", "q": "specific_total_water", "u": "eastward_wind", "v": "northward_wind"}
+_HUMIDITY_FAMILIES = ("specific_total_water", "specific_humidity")
 
 
 class ACE2State:
@@ -239,6 +254,19 @@ class ACE2Model(forecast_model.LatentForecastModel):
                 self._single_cols[name] = i
         # top (k=0) to bottom, matching ak/bk interface order
         self._layer_cols = {b: [i for _, i in sorted(v)] for b, v in self._layer_cols.items()}
+        # Moisture family for the derived 'q', the virtual temperature of the
+        # hydrostatic z and ps_native's q_lowest: specific_total_water (the
+        # released checkpoint) or specific_humidity (CRTM+land checkpoints;
+        # their condensate is a separate family and, like ERA5's q, left
+        # out of Tv).
+        humidity = [f for f in _HUMIDITY_FAMILIES if f in self._layer_cols]
+        if not humidity:
+            raise ValueError(f"checkpoint has none of the humidity layer families {_HUMIDITY_FAMILIES}")
+        self._humidity_family = humidity[0]
+        self._derived_from = dict(_DERIVED_FROM, q=self._humidity_family)
+        nlay = len(self._layer_cols["air_temperature"])
+        if self._ak.numel() != nlay + 1:
+            raise ValueError(f"{nlay} layers but {self._ak.numel()} ak interface values in the checkpoint")
 
         self._forcing = _ForcingSource(
             forcing_dir, sorted(set(self._input_only) | set(self._next_step_input)), self._device
@@ -376,7 +404,7 @@ class ACE2Model(forecast_model.LatentForecastModel):
         """
         ps = flat[self._single_cols["PRESsfc"]]  # (P,) Pa
         T = flat[self._layer_cols["air_temperature"]]  # (8, P)
-        q = flat[self._layer_cols["specific_total_water"]]
+        q = flat[self._layer_cols[self._humidity_family]]
         nlay = T.shape[0]
         p_int = self._ak[:, None] + self._bk[:, None] * ps[None, :]  # (9, P), top -> bottom
         lnp_int = torch.log(p_int[1:].clamp_min(1.0))  # interfaces 1..8, ascending pressure
@@ -399,7 +427,7 @@ class ACE2Model(forecast_model.LatentForecastModel):
             phi_below = phi_sfc[None] + GRAV * (tv_sfc[None] / LAPSE) * (1.0 - torch.exp(kappa * (lnp_t - torch.log(ps)[None])))
             out["z"] = torch.where(idx >= nlay, phi_below, phi_above)
 
-        need = [b for b in _DERIVED_FROM if b in bases]
+        need = [b for b in self._derived_from if b in bases]
         if need:
             lnp_mid = torch.log((0.5 * (p_int[:-1] + p_int[1:])).clamp_min(1.0))  # (8, P)
             k = torch.searchsorted(lnp_mid.T.contiguous(), lnp_t.T.contiguous()).T  # (L, P), 0..8
@@ -408,7 +436,7 @@ class ACE2Model(forecast_model.LatentForecastModel):
             x_lo, x_hi = torch.gather(lnp_mid, 0, lo), torch.gather(lnp_mid, 0, hi)
             w = torch.where(hi > lo, (lnp_t - x_lo) / (x_hi - x_lo), torch.zeros_like(lnp_t))
             for b in need:
-                f = flat[self._layer_cols[_DERIVED_FROM[b]]]
+                f = flat[self._layer_cols[self._derived_from[b]]]
                 v = (1 - w) * torch.gather(f, 0, lo) + w * torch.gather(f, 0, hi)
                 if b == "t":
                     below = T[-1][None] * torch.exp(kappa * (lnp_t - lnp_mid[-1][None]))
@@ -458,12 +486,14 @@ class ACE2Model(forecast_model.LatentForecastModel):
         if want is None or "t_lowest" in want:
             out["t_lowest"] = flat[self._layer_cols["air_temperature"][-1]]
         if want is None or "q_lowest" in want:
-            out["q_lowest"] = flat[self._layer_cols["specific_total_water"][-1]]
+            out["q_lowest"] = flat[self._layer_cols[self._humidity_family][-1]]
         if want is None or "p_lowest" in want:
             ps = flat[self._single_cols["PRESsfc"]]
             out["p_lowest"] = 0.5 * ((self._ak[-2] + self._bk[-2] * ps) + (self._ak[-1] + self._bk[-1] * ps))
         for base, alias in (("z", "geopotential"), ("t", "temperature"), ("q", "specific_humidity"), ("sp", "surface_pressure")):
-            if base in out:
+            # never shadow a native family of the same name (the CRTM
+            # checkpoints' specific_humidity layers)
+            if base in out and alias not in self._layer_cols and alias not in self._single_cols:
                 out[alias] = out[base]
         return out
 

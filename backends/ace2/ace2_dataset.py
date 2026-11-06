@@ -47,9 +47,18 @@ Vertical resolution: `--layer_indices` takes the L137 interface indices of the
 coarse layers (default ACE2's 8: 0 48 67 79 90 100 109 119 137); any
 increasing list from 0 to 137 works, and `fme` reads the layer count from the
 ak_N/bk_N it finds. `--extra_layer_vars` adds layer-averaged ERA5 model-level
-fields beyond ACE2's four families (e.g. specific_humidity separate from total
-water, ozone_mass_mixing_ratio, fraction_of_cloud_cover -- what a radiance
-operator needs), named `<era5_name>_<i>`.
+fields beyond the layer families (e.g. fraction_of_cloud_cover,
+vertical_velocity), named `<era5_name>_<i>`.
+
+Layer families: `--layer_families ace2` (default) gives ACE2's four,
+air_temperature, specific_total_water (vapor + cloud liquid + cloud ice + rain
++ snow), eastward_wind, northward_wind. `--layer_families crtm` gives the
+prognostics a radiative transfer model (CRTM) needs for satellite radiances:
+total water is replaced by specific_humidity and specific_total_condensate
+(the four condensates summed; their sum is the ace2 set's total water), and
+ozone_mass_mixing_ratio is added -- 6 families, 9 ERA5 model-level fields
+read per time (vs 8). Files record the choice in the `layer_families`
+attribute.
 
 Cost (Polaris login node, 2026-10): the 8 model-level fields are ~10 s of
 reads per output time per process, the rest a few s more; a month is ~124
@@ -63,9 +72,11 @@ CLI (repo root):
     python backends/ace2/ace2_dataset.py co2 OUTDIR/co2.nc 1940 2022
     python backends/ace2/ace2_dataset.py build OUTDIR 1979-01 2022-12 \\
         --co2 OUTDIR/co2.nc --workers 8 [--layer_indices ...] \\
-        [--extra_layer_vars specific_humidity ozone_mass_mixing_ratio]
+        [--layer_families crtm] [--extra_layer_vars fraction_of_cloud_cover]
     python backends/ace2/ace2_dataset.py fix_presfc OUTDIR 1979-01 1988-12 --workers 16
+    python backends/ace2/ace2_dataset.py add_layer_families OUTDIR 1979-01 1988-12 --workers 16
     python backends/ace2/ace2_dataset.py stats OUTDIR STATSDIR 1990-01 2019-12 --workers 16
+    python backends/ace2/ace2_dataset.py capped_snow OUTDIR SIDECAR 1979-01 2025-12 [--cap 1000]
 `build` skips months whose file exists (resumable; files are written to .tmp
 and renamed), so disjoint month ranges can run as separate jobs into one
 OUTDIR.
@@ -89,6 +100,7 @@ from ace2_ic import (
     GRAVITY,
     LAYER_VARS,
     N_INPUT_LAYERS,
+    WATER_VARS,
     URL_FULL_37,
     URL_MODEL_LEVEL,
     _get_ak_bk,
@@ -187,6 +199,23 @@ MODEL_LEVEL_SURFACE_RENAME = {
     "10m_u_component_of_wind": "UGRD10m",
     "10m_v_component_of_wind": "VGRD10m",
 }
+# Layer families (output `<family>_<i>`) -> ERA5 model-level variable(s), by
+# --layer_families. "ace2": ACE2's four (vapor + the four condensates as one
+# total water). "crtm": what a radiative transfer model (CRTM) needs as
+# prognostics -- total water split into vapor and the summed condensates
+# (specific_total_condensate = specific_total_water - specific_humidity), plus
+# ozone.
+LAYER_FAMILY_SETS = {
+    "ace2": dict(LAYER_VARS),
+    "crtm": {
+        "air_temperature": ["temperature"],
+        "specific_humidity": ["specific_humidity"],
+        "specific_total_condensate": [v for v in WATER_VARS if v != "specific_humidity"],
+        "ozone_mass_mixing_ratio": ["ozone_mass_mixing_ratio"],
+        "eastward_wind": ["u_component_of_wind"],
+        "northward_wind": ["v_component_of_wind"],
+    },
+}
 # Model-level fields that --extra_layer_vars may add (output `<name>_<i>`).
 EXTRA_LAYER_VARS = [
     "specific_humidity",
@@ -282,6 +311,9 @@ DESIRED_ATTRS = {
 LAYER_FAMILY_ATTRS = {
     "air_temperature": ("Temperature", "K"),
     "specific_total_water": ("Specific total water", "kg/kg"),
+    "specific_humidity": ("Specific humidity", "kg/kg"),
+    "specific_total_condensate": ("Specific total condensate (cloud liquid + cloud ice + rain + snow)", "kg/kg"),
+    "ozone_mass_mixing_ratio": ("Ozone mass mixing ratio", "kg/kg"),
     "eastward_wind": ("U component of wind", "m/s"),
     "northward_wind": ("V component of wind", "m/s"),
 }
@@ -342,13 +374,13 @@ def _coarsen_layers(field: np.ndarray, ak, bk, ps: np.ndarray, layer_indices) ->
     return layers
 
 
-def _model_level(ml_store: xr.Dataset, t64, sfc: xr.Dataset, ak, bk, layer_indices, families: dict, check: bool) -> xr.Dataset:
-    """Vendored `_process_model_level_data`: pressure-weighted coarsening of
-    each family at 0.25 deg, then regrid; Q2m from the regridded DPT2m and
-    PRESsfc. A family that sums several ERA5 fields (total water) is the sum
-    of their coarsened layers -- the layer mean is linear, so this equals
-    coarsening the sum -- which lets one 3D field be in memory at a time."""
-    ps = sfc["surface_pressure"].values.astype(np.float64)
+def _layer_means(ml_store: xr.Dataset, t64, ps_da: xr.DataArray, ak, bk, layer_indices, families: dict, check: bool) -> xr.Dataset:
+    """Pressure-weighted layer means `<family>_<i>` of each family at 0.25 deg
+    (not regridded), given the 0.25-deg surface pressure `ps_da`. A family
+    that sums several ERA5 fields (total water) is the sum of their coarsened
+    layers -- the layer mean is linear, so this equals coarsening the sum --
+    which lets one 3D field be in memory at a time."""
+    ps = ps_da.values.astype(np.float64)
     out = xr.Dataset()
     for family, sources in families.items():
         total, attrs = None, {}
@@ -365,9 +397,17 @@ def _model_level(ml_store: xr.Dataset, t64, sfc: xr.Dataset, ak, bk, layer_indic
             out[f"{family}_{i}"] = xr.DataArray(
                 layer.astype(np.float32),
                 dims=("latitude", "longitude"),
-                coords={"latitude": sfc.latitude, "longitude": sfc.longitude},
+                coords={"latitude": ps_da.latitude, "longitude": ps_da.longitude},
                 attrs={"long_name": f"{long_name} level-{i}", "units": units},
             )
+    return out
+
+
+def _model_level(ml_store: xr.Dataset, t64, sfc: xr.Dataset, ak, bk, layer_indices, families: dict, check: bool) -> xr.Dataset:
+    """Vendored `_process_model_level_data`: pressure-weighted coarsening of
+    each family at 0.25 deg (`_layer_means`), then regrid; Q2m from the
+    regridded DPT2m and PRESsfc."""
+    out = _layer_means(ml_store, t64, sfc["surface_pressure"], ak, bk, layer_indices, families, check)
     for src, dst in MODEL_LEVEL_SURFACE_RENAME.items():
         out[dst] = sfc[src]
     out = _regrid(_only_horizontal_coords(out))
@@ -537,12 +577,12 @@ def _presfc_at_hgtsfc(ds: xr.Dataset, h: np.ndarray, hgtsfc: xr.DataArray, pairs
 _W: dict = {}
 
 
-def _init_worker(weights: str, invariant_path: str, layer_indices, extra_layer_vars, top_interface_midpoint, check, reduce_presfc):
+def _init_worker(weights: str, invariant_path: str, layer_indices, layer_families, extra_layer_vars, top_interface_midpoint, check, reduce_presfc):
     xr.set_options(keep_attrs=True)
     ic.make_regridder(weights)
     ml = xr.open_zarr(URL_MODEL_LEVEL, chunks=None, storage_options=STORAGE_OPTIONS)
     ak, bk = _get_ak_bk(ml, top_interface_midpoint)
-    families = dict(LAYER_VARS)
+    families = dict(LAYER_FAMILY_SETS[layer_families])
     families.update({v: [v] for v in extra_layer_vars})
     with xr.open_dataset(invariant_path) as inv:
         invariant = inv.load()
@@ -635,6 +675,9 @@ def build(args) -> None:
     unknown = set(args.extra_layer_vars) - set(EXTRA_LAYER_VARS)
     if unknown:
         raise ValueError(f"unknown --extra_layer_vars {sorted(unknown)}; choose from {EXTRA_LAYER_VARS}")
+    dup = set(args.extra_layer_vars) & set(LAYER_FAMILY_SETS[args.layer_families])
+    if dup:
+        raise ValueError(f"--extra_layer_vars {sorted(dup)} already in --layer_families {args.layer_families}")
     os.makedirs(args.outdir, exist_ok=True)
     xr.set_options(keep_attrs=True)
 
@@ -673,13 +716,14 @@ def build(args) -> None:
         "source": "ARCO-ERA5 (gs://gcp-public-data-arco-era5), processed by lw4dvar-torch backends/ace2/ace2_dataset.py",
         "processing": UPSTREAM,
         "output_layer_indices": layer_indices,
+        "layer_families": args.layer_families,
         "extra_layer_vars": " ".join(args.extra_layer_vars),
         "top_interface_midpoint": int(not args.model_top_zero),
         "global_mean_co2_source": os.path.abspath(args.co2),
         PRESFC_ATTR: int(not args.no_reduce_presfc),
     }
     ctx = mp.get_context("spawn")  # gcsfs/zarr event loops are not fork-safe
-    initargs = (weights, invariant_path, layer_indices, args.extra_layer_vars, not args.model_top_zero, not args.no_check, not args.no_reduce_presfc)
+    initargs = (weights, invariant_path, layer_indices, args.layer_families, args.extra_layer_vars, not args.model_top_zero, not args.no_check, not args.no_reduce_presfc)
     with ctx.Pool(args.workers, initializer=_init_worker, initargs=initargs) as pool:
         for m in todo:
             times = month_times(m)
@@ -797,6 +841,167 @@ def fix_presfc(args) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Add layer families to existing files
+# ---------------------------------------------------------------------------
+
+LAYER_FAMILIES_ATTR = "layer_families"  # global attribute; absent = "ace2"
+TOTAL_WATER_TOLERANCE = 1e-7  # kg/kg; float32 rounding of total water is ~1e-9
+
+
+def _init_add_worker(weights: str, layer_indices, families: dict, top_interface_midpoint: bool, check: bool):
+    xr.set_options(keep_attrs=True)
+    ic.make_regridder(weights)
+    ml = xr.open_zarr(URL_MODEL_LEVEL, chunks=None, storage_options=STORAGE_OPTIONS)
+    ak, bk = _get_ak_bk(ml, top_interface_midpoint)
+    _W.update(
+        ml=ml,
+        f37=xr.open_zarr(URL_FULL_37, chunks=None, storage_options=STORAGE_OPTIONS),
+        ak=ak,
+        bk=bk,
+        layer_indices=list(layer_indices),
+        families=families,
+        check=check,
+    )
+
+
+def _add_families_time(t: pd.Timestamp) -> xr.Dataset:
+    """This worker's layer families at output time `t`, F90 float32 -- the
+    same computation as `build` (`_layer_means`, then `_regrid`)."""
+    w = _W
+    t64 = np.datetime64(t, "ns")
+    ps = w["f37"]["surface_pressure"].sel(time=t64).load()
+    if w["check"]:
+        _check_data_validity(ps.to_dataset(), f"{t:%Y-%m-%dT%H}")
+    out = _layer_means(w["ml"], t64, ps, w["ak"], w["bk"], w["layer_indices"], w["families"], w["check"])
+    return _regrid(_only_horizontal_coords(out)).astype(np.float32)
+
+
+def add_layer_families(args) -> None:
+    """Add the layer families of `--layer_families` that the monthly files of
+    OUTDIR lack (e.g. specific_humidity, specific_total_condensate and
+    ozone_mass_mixing_ratio to an `ace2` build), at the files' own layer
+    interfaces and model top; existing fields are untouched (total water is
+    kept, so the files serve both sets). Reads only the needed ERA5
+    model-level fields and surface pressure (~1/6 of `build`'s time per
+    step). Before writing, vapor + condensate must match the file's
+    specific_total_water to TOTAL_WATER_TOLERANCE in every layer and time, so
+    a file whose times, grid or layers don't match is never changed. Each
+    month is written to a copy (.tmp) and renamed over the original;
+    finished months carry the family set in the LAYER_FAMILIES_ATTR
+    attribute and are skipped, so disjoint month ranges can run as separate
+    jobs and a killed job can simply be rerun."""
+    import shutil
+
+    import netCDF4
+
+    wanted = LAYER_FAMILY_SETS[args.layer_families]
+    weights = os.path.join(args.outdir, "regrid_weights_0p25deg_to_F90.nc")
+    todo, setup = [], None
+    for m in pd.date_range(pd.Timestamp(args.start), pd.Timestamp(args.end), freq="MS"):
+        path = os.path.join(args.outdir, f"{m:%Y%m%d%H}.nc")
+        if not os.path.exists(path):
+            continue
+        with netCDF4.Dataset(path) as nc:
+            names = set(nc.variables)
+            layer_indices = [int(k) for k in np.atleast_1d(nc.getncattr("output_layer_indices"))]
+            midpoint = bool(int(nc.getncattr("top_interface_midpoint")))
+            have = getattr(nc, LAYER_FAMILIES_ATTR, "ace2").split()
+        families = {f: src for f, src in wanted.items() if f"{f}_0" not in names}
+        if not families:
+            continue
+        this = (layer_indices, midpoint, sorted(families))
+        if setup is None:
+            setup = this
+        elif this != setup:
+            raise ValueError(f"{path}: layers/model top/missing families {this} differ from earlier months' {setup}")
+        with xr.open_dataset(path) as ds:
+            todo.append((path, pd.DatetimeIndex(ds.time.values), have))
+    logging.info(f"{len(todo)} months to add {args.layer_families} families to in {args.outdir}" + (f": {setup}" if setup else ""))
+    if not todo:
+        return
+    layer_indices, midpoint, _ = setup
+    families = {f: wanted[f] for f in setup[2]}
+    n_layers = len(layer_indices) - 1
+    check_water = {"specific_humidity", "specific_total_condensate"} <= set(families)
+    ctx = mp.get_context("spawn")
+    initargs = (weights, layer_indices, families, midpoint, not args.no_check)
+    with ctx.Pool(args.workers, initializer=_init_add_worker, initargs=initargs) as pool:
+        for path, times, have in todo:
+            t0 = _time.time()
+            new = xr.concat(list(pool.imap(_add_families_time, times)), "time")
+            with xr.open_dataset(path) as ds:
+                if not (np.array_equal(ds.latitude.values, new.latitude.values) and np.array_equal(ds.longitude.values, new.longitude.values)):
+                    raise ValueError(f"{path}: latitude/longitude differ from the regridded fields; not changing it")
+                err = np.nan
+                if check_water and "specific_total_water_0" in ds:
+                    err = max(
+                        float(
+                            np.abs(
+                                new[f"specific_humidity_{i}"].values.astype(np.float64)
+                                + new[f"specific_total_condensate_{i}"].values
+                                - ds[f"specific_total_water_{i}"].values
+                            ).max()
+                        )
+                        for i in range(n_layers)
+                    )
+                    if not err < TOTAL_WATER_TOLERANCE:
+                        raise ValueError(f"{path}: vapor + condensate differs from specific_total_water by {err:.3g} kg/kg; not changing it")
+            tmp = path + ".tmp"
+            shutil.copyfile(path, tmp)
+            with netCDF4.Dataset(tmp, "r+") as nc:
+                for name in new.data_vars:
+                    v = nc.createVariable(name, "f4", ("time", "latitude", "longitude"), fill_value=np.float32(np.nan))
+                    v.setncatts(new[name].attrs)
+                    v[:] = new[name].values
+                nc.setncattr(LAYER_FAMILIES_ATTR, " ".join(have + [args.layer_families]))
+            os.replace(tmp, path)
+            logging.info(
+                f"added {len(new.data_vars)} fields to {path}: {len(times)} times in {(_time.time() - t0) / 60:.1f} min "
+                f"(total water check {err:.2g} kg/kg)"
+            )
+
+
+def capped_snow(args) -> None:
+    """Write SIDECAR/YYYYMM0100.nc holding surface_snow_amount_capped =
+    min(surface_snow_amount, CAP) for the months of OUTDIR, with OUTDIR's
+    time/latitude/longitude, for fme to merge with OUTDIR (a `merge:` dataset
+    config). The training files are not touched. Why: ERA5's snow water
+    equivalent is pinned at 10 m (1e4 kg/m^2) on the ice sheets and reaches
+    thousands of kg/m^2 in partly glaciated 1-degree cells, so those nearly
+    static values set the normalization (std ~1700 kg/m^2 vs a 41 kg/m^2
+    median of snowy cells) and squeeze seasonal snow into a tiny normalized
+    range; beyond ~1 m water equivalent snow depth no longer matters for
+    surface emissivity. Months whose sidecar exists are skipped."""
+    import netCDF4
+
+    os.makedirs(args.sidecar, exist_ok=True)
+    name = "surface_snow_amount_capped"
+    for m in pd.date_range(pd.Timestamp(args.start), pd.Timestamp(args.end), freq="MS"):
+        src = os.path.join(args.outdir, f"{m:%Y%m%d%H}.nc")
+        dst = os.path.join(args.sidecar, f"{m:%Y%m%d%H}.nc")
+        if not os.path.exists(src) or os.path.exists(dst):
+            continue
+        tmp = dst + ".tmp"
+        with netCDF4.Dataset(src) as d, netCDF4.Dataset(tmp, "w") as o:
+            d.set_auto_mask(False)
+            o.setncatts({k: d.getncattr(k) for k in d.ncattrs()})
+            o.setncattr("history", f"{name} = min(surface_snow_amount, {args.cap:g}) from {src} (ace2_dataset.py capped_snow)")
+            for dim in ("time", "latitude", "longitude"):
+                o.createDimension(dim, None if d.dimensions[dim].isunlimited() else len(d.dimensions[dim]))
+                v = d[dim]
+                w = o.createVariable(dim, v.dtype, v.dimensions)
+                w.setncatts(v.__dict__)
+                w[:] = v[:]
+            snow = d["surface_snow_amount"]
+            v = o.createVariable(name, "f4", snow.dimensions, fill_value=np.float32(np.nan))
+            v.setncatts({k: snow.getncattr(k) for k in snow.ncattrs() if k != "_FillValue"})
+            v.long_name = f"Surface snow amount, capped at {args.cap:g} kg/m**2"
+            v[:] = np.minimum(snow[:], np.float32(args.cap))
+        os.replace(tmp, dst)
+        logging.info(f"wrote {dst}")
+
+
+# ---------------------------------------------------------------------------
 # CO2
 # ---------------------------------------------------------------------------
 
@@ -817,6 +1022,51 @@ def fetch_co2(path: str, first_year: int, last_year: int) -> None:
     co2.attrs = {"source": "global_mean_co2 from huggingface.co/allenai/ACE2-ERA5 forcing_data/forcing_YYYY.nc"}
     co2.to_netcdf(path, encoding={"time": {"units": TIME_UNITS, "dtype": "int64"}})
     logging.info(f"wrote {path}")
+
+
+def extend_co2_noaa(path_in: str, annmean: str, path_out: str, last_year: int) -> None:
+    """Append 6-hourly `global_mean_co2` through `last_year` to the series in
+    `path_in` (the `co2` mode's), from NOAA GML global annual means
+    (`annmean`: a co2_annmean_gl.txt path or URL). ACE2-ERA5's series is, from
+    ~2017 on, these annual means linearly interpolated between knots at
+    July 1 00Z (within 0.01 ppm; earlier years follow an older vintage);
+    this continues it the same way, the knot of the input's last year taken
+    from the input itself, and past the last NOAA year extrapolates its last
+    slope. Input times are kept bit-identical."""
+    with xr.open_dataset(path_in) as ds:
+        old = ds["global_mean_co2"].load()
+    t_old = pd.DatetimeIndex(old.time.values)
+    first_new = t_old[-1] + TIME_STEP
+    times = pd.date_range(first_new, pd.Timestamp(f"{last_year}-12-31T18:00"), freq=TIME_STEP)
+    if annmean.startswith(("http://", "https://")):
+        import io
+        import urllib.request
+
+        with urllib.request.urlopen(annmean) as r:
+            a = np.loadtxt(io.StringIO(r.read().decode()), comments="#")
+    else:
+        a = np.loadtxt(annmean, comments="#")
+    noaa = {int(y): v for y, v in zip(a[:, 0], a[:, 1])}
+    y0 = t_old[-1].year
+    years = [y for y in range(y0 + 1, last_year + 1) if y in noaa]
+    knots = [pd.Timestamp(f"{y0}-07-01")] + [pd.Timestamp(f"{y}-07-01") for y in years]
+    values = [float(old.sel(time=knots[0]).values) * 1e6] + [noaa[y] for y in years]
+    if len(knots) < 2:
+        raise ValueError(f"{annmean} has no annual means after {y0}")
+    x = np.asarray([(k - FIRST_TIME) / pd.Timedelta(hours=1) for k in knots])
+    xt = np.asarray((times - FIRST_TIME) / pd.Timedelta(hours=1))
+    ppm = np.interp(xt, x, values)
+    past = xt > x[-1]  # extrapolate the last segment's slope
+    ppm[past] = values[-1] + (xt[past] - x[-1]) * (values[-1] - values[-2]) / (x[-1] - x[-2])
+    new = xr.DataArray((ppm * 1e-6).astype(old.dtype), dims="time", coords={"time": times.values}, attrs=old.attrs)
+    co2 = _set_attrs(xr.concat([old, new], "time").to_dataset())
+    co2.attrs = {
+        "source": f"global_mean_co2 from huggingface.co/allenai/ACE2-ERA5 forcing_data/forcing_YYYY.nc through {t_old[-1]:%Y-%m-%dT%H}; "
+        f"after that NOAA GML global annual means ({annmean}, years {years}) linearly interpolated between July 1 knots"
+        + (f", extrapolated after {knots[-1]:%Y-%m-%d}" if past.any() else "")
+    }
+    co2.to_netcdf(path_out, encoding={"time": {"units": TIME_UNITS, "dtype": "int64"}})
+    logging.info(f"wrote {path_out}: {len(times)} times appended ({first_new} .. {times[-1]}), knots {dict(zip(map(str, knots), values))}")
 
 
 # ---------------------------------------------------------------------------
@@ -874,8 +1124,8 @@ def _month_stats(path: str) -> dict:
                 diff=_moments(np.diff(x, axis=0)),
                 tsum=np.where(ok, x, 0.0).sum(axis=0),
                 tcount=ok.sum(axis=0).astype(np.int64),
-                first=x[0],
-                last=x[-1],
+                first=x[0].copy(),  # copies: a view would keep all of x alive
+                last=x[-1].copy(),
                 vmin=float(np.nanmin(x)) if ok.any() else np.nan,
                 vmax=float(np.nanmax(x)) if ok.any() else np.nan,
                 nonfinite=int(x.size - ok.sum()),
@@ -991,6 +1241,12 @@ if __name__ == "__main__":
     b.add_argument("--co2", required=True, help="netCDF with 6-hourly global_mean_co2 (see the co2 mode)")
     b.add_argument("--workers", type=int, default=4, help="time steps processed in parallel (~2-3 GB each)")
     b.add_argument("--layer_indices", type=int, nargs="+", default=DEFAULT_OUTPUT_LAYER_INDICES)
+    b.add_argument(
+        "--layer_families",
+        choices=sorted(LAYER_FAMILY_SETS),
+        default="ace2",
+        help="ace2: T, total water, u, v (default); crtm: T, specific humidity, total condensate, ozone, u, v",
+    )
     b.add_argument("--extra_layer_vars", nargs="*", default=[], help=f"from {EXTRA_LAYER_VARS}")
     b.add_argument("--model_top_zero", action="store_true", help="model top 0 Pa (ACE2-ERA5) instead of ~1 Pa (upstream, default)")
     b.add_argument("--complevel", type=int, default=0, help="zlib level for time-varying fields (0: uncompressed, like Ai2's)")
@@ -1003,6 +1259,13 @@ if __name__ == "__main__":
     f.add_argument("end", help="last month, YYYY-MM (inclusive)")
     f.add_argument("--workers", type=int, default=4)
     f.add_argument("--no_check", action="store_true", help="skip the NaN checks on the ARCO inputs")
+    a = sub.add_parser("add_layer_families", help="add a layer family set's missing families to existing months")
+    a.add_argument("outdir")
+    a.add_argument("start", help="first month, YYYY-MM")
+    a.add_argument("end", help="last month, YYYY-MM (inclusive)")
+    a.add_argument("--layer_families", choices=sorted(LAYER_FAMILY_SETS), default="crtm")
+    a.add_argument("--workers", type=int, default=4, help="time steps processed in parallel (~2 GB each)")
+    a.add_argument("--no_check", action="store_true", help="skip the NaN checks on the ARCO inputs")
     st = sub.add_parser("stats", help="normalization statistics (as upstream get_stats.py) over a month range")
     st.add_argument("outdir", help="the dataset directory (monthly files)")
     st.add_argument("statsdir", help="where centering.nc, scaling-*.nc, time-mean.nc are written")
@@ -1010,16 +1273,33 @@ if __name__ == "__main__":
     st.add_argument("end", nargs="?", default="2019-12", help="last month, inclusive (default 2019-12)")
     st.add_argument("--workers", type=int, default=8, help="months read in parallel (~1 GB each)")
     st.add_argument("--allow_mixed", action="store_true", help="accept months without presfc_reduced_to_hgtsfc=1")
+    cs = sub.add_parser("capped_snow", help="sidecar months with surface_snow_amount capped (for an fme merge dataset)")
+    cs.add_argument("outdir", help="the dataset directory (monthly files)")
+    cs.add_argument("sidecar", help="where the sidecar monthly files are written")
+    cs.add_argument("start", help="first month, YYYY-MM")
+    cs.add_argument("end", help="last month, YYYY-MM (inclusive)")
+    cs.add_argument("--cap", type=float, default=1000.0, help="kg/m**2 (default 1000: 1 m water equivalent)")
     c = sub.add_parser("co2", help="extract ACE2-ERA5's global_mean_co2 from the HF forcing files")
     c.add_argument("path")
     c.add_argument("first_year", type=int)
     c.add_argument("last_year", type=int)
+    cn = sub.add_parser("co2_noaa", help="extend a co2-mode series past 2022 with NOAA GML global annual means")
+    cn.add_argument("path_in")
+    cn.add_argument("path_out")
+    cn.add_argument("last_year", type=int)
+    cn.add_argument("--annmean", default="https://gml.noaa.gov/webdata/ccgg/trends/co2/co2_annmean_gl.txt")
     args = p.parse_args()
     if args.mode == "co2":
         fetch_co2(args.path, args.first_year, args.last_year)
+    elif args.mode == "co2_noaa":
+        extend_co2_noaa(args.path_in, args.annmean, args.path_out, args.last_year)
     elif args.mode == "stats":
         stats(args)
     elif args.mode == "fix_presfc":
         fix_presfc(args)
+    elif args.mode == "add_layer_families":
+        add_layer_families(args)
+    elif args.mode == "capped_snow":
+        capped_snow(args)
     else:
         build(args)

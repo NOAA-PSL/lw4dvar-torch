@@ -24,7 +24,9 @@ documented in `config.yml.template`.
   the 1-degree `aifs2-1deg-ic1` -> `AIFS3Model`), `fcstnet3`
   (`run_fcn3.sh`; also runs `sfno` via `run_sfno.sh`), `aurora` (`run_aurora.sh`),
   `ace2` (`run_ace2.sh`), all
-  under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2ic` is a
+  under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2-rocm` is the
+  `ace2` env with ROCm torch, for ACE2 training on Ursa's AMD `u1-mi300x`
+  nodes (`run_ace2_train_mi300x.sh`; see `ace2-training.md`); `ace2ic` is a
   login-node-only env for ACE2 IC/verification fetching. Backend modules are
   imported lazily so a process never needs another backend's dependencies.
   Exception: `aifs2-1.0deg-v1.0` (a user-trained checkpoint, still
