@@ -1,0 +1,55 @@
+name: check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # No submodules and no LFS: the model packages are large LFS repos
+      # (ACE2-ERA5 alone is ~75 GB) and the CPU tests never load them.
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-ci.txt
+      - run: pip install -r requirements-ci.txt
+      - run: make check
+
+  # The solver end to end with a real (tiny) model: tests/ace2/test_ace2_mini.py.
+  # Separate job: it needs fme (requirements-ci-ace2.txt) and a 22 MB
+  # checkpoint, a release asset pinned in tests/data/mini_ace2/manifest.json
+  # and cached between runs under its sha256.
+  ace2-mini:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      LW4DVAR_FIXTURE_CACHE: ${{ github.workspace }}/.fixture-cache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+          lfs: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements-ci.txt
+            requirements-ci-ace2.txt
+      - id: ckpt
+        run: echo "sha=$(python -c "import json; print(json.load(open('tests/data/mini_ace2/manifest.json'))['checkpoint']['sha256'])")" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: .fixture-cache
+          key: mini-ace2-${{ steps.ckpt.outputs.sha }}
+      - run: pip install -r requirements-ci-ace2.txt
+      - run: make check-ace2

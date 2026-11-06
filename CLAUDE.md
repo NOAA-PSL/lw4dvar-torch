@@ -28,7 +28,9 @@ documented in `config.yml.template`.
   (`run_fcn3.sh`; also runs `sfno` via `run_sfno.sh`), `aurora` (`run_aurora.sh`),
   `ace2` (`run_ace2.sh`), `ngcm-torch` (`run_ngcm.sh`; a venv on the
   ngcm-sl env adding torch), all
-  under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2ic` is a
+  under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2-rocm` is the
+  `ace2` env with ROCm torch, for ACE2 training on Ursa's AMD `u1-mi300x`
+  nodes (`run_ace2_train_mi300x.sh`; see `ace2-training.md`); `ace2ic` is a
   login-node-only env for ACE2 IC/verification fetching. Backend modules are
   imported lazily so a process never needs another backend's dependencies.
   Exception: `aifs2-1.0deg-v1.0` (a user-trained checkpoint, still
@@ -54,6 +56,9 @@ documented in `config.yml.template`.
   wrong on AIFS's reduced grid.
 - One-off diagnostic/probe scripts and configs are left untracked by
   convention; commit only maintained code and tools.
+- **`make check` must pass before a PR** (CPU only, a few seconds; CI runs
+  the same target). Setup and scope are in `tests/README.md`. Never skip or
+  loosen a test to get it green.
 
 ## Task documents
 
