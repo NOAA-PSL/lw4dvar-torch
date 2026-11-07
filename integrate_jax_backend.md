@@ -1,7 +1,9 @@
-# JAX backends: the torch/JAX bridge and the NGCM backend
+# JAX backends: the torch/JAX bridge and the ngcm, neuralgcm and graphcast backends
 
-Read this when working on `backends/jax_bridge.py`, `backends/hybrid_levels.py`
-or `backends/ngcm/` (`model_backend: ngcm`), or when adding another JAX model.
+Read this when working on `backends/jax_bridge.py`, `backends/hybrid_levels.py`,
+`backends/ngcm/` (`model_backend: ngcm`), `backends/neuralgcm/`
+(`neuralgcm`) or `backends/graphcast/` (`graphcast`), or when adding another
+JAX model.
 
 ## Why a bridge (2026-11-04)
 
@@ -193,3 +195,152 @@ still poor, though.
 
 Open: the `ngcm` backend still excludes condensate via `control_variables`
 (its default 1e5 factor keeps condensate steps tiny, but it is not frozen).
+
+## The GraphCast backend (`backends/graphcast/`, `model_backend: graphcast`, 2026-11-06)
+
+GraphCast_small (DeepMind's `graphcast` package: 1 degree, 13 pressure
+levels, 6 h step) through the same bridge. It is the model of lw4dvar-jax's
+`graphcast` backend, run here with this solver.
+
+Keys:
+
+- `graphcast_checkpoint`: `graphcast_small.npz`.
+- `graphcast_stats_dir`: `{mean,stddev,diffs_stddev}_by_level.nc`.
+- `graphcast_input_dir`: lw4dvar-jax's per-time ERA5 netCDFs,
+  YYYY-MM-DDTHH.nc, 6-hourly. These also give the ICs, the z500 truth
+  and the orography.
+- `graphcast_frozen`: variables held at the background. Default
+  `[specific_humidity]`.
+
+All three paths currently live under
+`/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-jswhit2/`
+(`models/`, `stats/`, `input/2015-gc`, which covers 2014-12-29T18 to
+2015-04-30T18).
+
+### Environment: `graphcast-torch`
+
+A venv on the `ngcm-sl` conda env (JAX 0.11.1), built with
+`--system-site-packages`. `zz_ngcm_torch.pth` adds `ngcm-torch`'s
+site-packages, so torch 2.7.1+cu128 (and its nvidia symlinks) is not
+reinstalled. It adds, with `pip install --no-deps`:
+
+- graphcast 0.2, from `/scratch4/BMC/gsienkf/Jeffrey.Whitaker/python/weathernext`;
+- jraph, trimesh, rtree and dm-tree.
+
+Path: `/scratch4/BMC/gsienkf/whitaker/conda/envs/graphcast-torch`.
+Launcher: `run_graphcast.sh`, a copy of `run_ngcm.sh`. It runs
+`sbatch run_graphcast.sh CONFIG.yml`, or any `.py` given as the first
+argument.
+
+### State and control
+
+- **Packed state.** Channels-first `(1, 166, 181, 360)`.
+  - The model takes two input times, t - 6 h and t. The 83 target
+    channels at t come first, then the same 83 at t - 6 h.
+  - The 83 channels are 5 surface variables plus 6 variables on 13
+    levels. They are in task order, with levels running 50 -> 1000 hPa.
+  - Latitudes run south to north and include the pole rows. The FCN3
+    bilinear interpolator handles this grid.
+- **Forcings and static fields.** The 5 forcings (TOA solar, year/day
+  progress) are computed from the date with `graphcast.data_utils`, not
+  read from files. They are passed as the bridge's non-differentiated
+  `constants`, together with the static fields and the parameters.
+  Closing over the parameters instead would embed them as compile-time
+  constants.
+- **Latent control.**
+  - The latent is the t slice, and the analysis is valid at window start
+    (`increment_at_start`).
+  - Increment = latent x `stddev_by_level`. This is lw4dvar-jax's
+    normalization, so learning rates carry over.
+  - The t - 6 h slice stays at the background. It is not in the latent;
+    it is a `diagnostic_column`.
+  - Frozen variables get an increment scale of 0.
+  - One difference from lw4dvar-jax: AdamW's weight decay pulls toward
+    the background. lw4dvar-jax's offset normalization pulled toward the
+    climatological mean.
+- **decode_state.** It is pure torch, with no model call.
+  - Level families are returned surface first, the order
+    `get_surface_pressure` assumes.
+  - It adds `z500`. Both the short names (z, t, q, u, v, w, t2m, msl,
+    u10, v10, tp6) and the long names are accepted.
+  - There is no surface pressure. Ps obs need `ps_operator: logpinterp`
+    (validation enforces this), and `jc_ps_weight` uses `msl`.
+- **Not supported:** `jb_samples`.
+
+### Validation
+
+`backends/graphcast/smoke_test_graphcast.py`, 2015-01-02T00, H100.
+
+**Against lw4dvar-jax's own adapter.** Same input files, 2 steps.
+
+- Max |diff| after step 1: z 27 m^2/s^2 (field rms 9.8e4), T 0.27 K,
+  u 0.7 m/s, msl 29 Pa.
+- This is bf16 noise: the differences are the same size under XLA's
+  deterministic ops.
+
+**Skill.** z500 rms vs ERA5: 1.9, 3.1, 3.6 and 4.4 m at +6, +12, +18 and
++24 h.
+
+**Speed.** A 16-step (4-day) rollout takes 0.6 s forward and 1.7 s forward
+plus backward. Peak torch memory is 0.3 GB.
+
+**Run-to-run noise.** GraphCast's forward pass is not exactly repeatable on
+the GPU. The model runs in bf16, and its GNN sums are scatter-adds whose
+order varies.
+
+- The same 24 h cost repeated 4 times spreads by 0.14 on a cost of about
+  19.
+- The same config's first cost differed by 0.15% between two runs (12713
+  vs 12733).
+- `XLA_FLAGS=--xla_gpu_deterministic_ops=true` removes the spread but is
+  about 25x slower (1.7 s -> 45 s for 16 steps). Don't use it for runs.
+
+**Gradient vs central finite differences.** The cost is the 24 h z500 error
+against ERA5. Each test perturbs one family with a smooth bump of
+amplitude 0.003-0.3 latent units (stddevs).
+
+| family | relative difference |
+|---|---|
+| u | 0.4-3 % at 0.03-0.1, 3-6 % at 0.3 |
+| msl | 1-13 % at 0.1-0.3 |
+| T | 14-25 % at 0.03-0.1, ~40 % at 0.3 |
+| z | 27-86 % at every amplitude |
+
+- **Small perturbations.** Below about 0.03 stddevs the finite
+  differences are meaningless, even with deterministic ops. GraphCast
+  normalizes its inputs and then casts them to bf16, which resolves only
+  about 0.004 normalized units, so the cost is a staircase at that scale.
+- **z is strongly nonlinear.** Its finite difference grows about 9x when
+  the amplitude triples from 0.1 to 0.3. The model reacts nonlinearly to
+  geopotential increments that are not in balance with T.
+- **The bridge is not at fault.** A layout or transpose error would break
+  every family. Since u and msl agree, the mismatches come from bf16 and
+  nonlinearity.
+- **Untested.** Freezing z (`graphcast_frozen: [specific_humidity,
+  geopotential]`) might make the descent better behaved.
+
+### Solver test (`config_test_graphcast.yml`)
+
+The setup of lw4dvar-jax's test: 2 cycles of a 12 h window from
+2015-01-11T00, `nhrs_back: 0`, 3 epochs, lr 1e-3, weight decay 1e-4.
+
+**Learning-rate schedule.** Use `start_factor: 1.0`. lw4dvar-jax's
+warmup is `int(0.2 * max_epoch)` steps, which is 0 at 3 epochs, so its
+first step runs at the full lr. With `warmup_steps: 1, start_factor: 0.1`
+this solver's first step was 10x smaller.
+
+Results:
+
+| | this solver | lw4dvar-jax |
+|---|---|---|
+| obs used per slot | identical (9755 / 9783 / 10110) | |
+| cycle 1 epoch-1 cost | 12713-12733 | 12694.5 |
+| cycle 1 Jo at t+0 (no model step) | 4032.8 | 4028.6 |
+| cycle 1 cost after 3 epochs | 11368 | 11807 |
+| cycle 2 z500 rms after analysis (NH / tropics / SH / global) | 2.73 / 2.29 / 2.21 / 2.41 m | 2.74 / 2.31 / 2.11 / 2.40 m |
+
+- The Jo difference at t+0 involves no model step, so part of the gap in
+  the first cost comes from the ps operator and its interpolation.
+- The cost falls faster here because the later steps are larger. This
+  solver decays the lr with a cosine to `end_factor`; lw4dvar-jax decays
+  from 1e-3 to about 3e-4 and then 1e-5.

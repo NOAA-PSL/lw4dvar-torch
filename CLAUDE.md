@@ -12,9 +12,9 @@ pressure observations, with a latent-space control variable, running on
 interchangeable ML forecast-model backends selected by `exp.model_backend`
 in the config: `aifs` (AIFS-single 2.0 / 1.1), `fcn3` (FourCastNet3),
 `aurora` (Aurora v1.5), `ace2` (ACE2-ERA5), `sfno` (SFNO-73ch-small),
-`ngcm` (ngcm-train's JAX NeuralGCM-style model) and `neuralgcm` (official
-NeuralGCM checkpoints), both via the torch/JAX bridge
-`backends/jax_bridge.py`. Shared driver/solver:
+`ngcm` (ngcm-train's JAX NeuralGCM-style model), `neuralgcm` (official
+NeuralGCM checkpoints) and `graphcast` (GraphCast_small), all via the
+torch/JAX bridge `backends/jax_bridge.py`. Shared driver/solver:
 `long_window_4dvar.py`, `long_window_4dvar_utils.py`; backend interface:
 `forecast_model.py`; backends: `backends/<name>/`; all config keys are
 documented in `config.yml.template`.
@@ -27,7 +27,8 @@ documented in `config.yml.template`.
   the 1-degree `aifs2-1deg-ic1` -> `AIFS3Model`), `fcstnet3`
   (`run_fcn3.sh`; also runs `sfno` via `run_sfno.sh`), `aurora` (`run_aurora.sh`),
   `ace2` (`run_ace2.sh`), `ngcm-torch` (`run_ngcm.sh`; a venv on the
-  ngcm-sl env adding torch), all
+  ngcm-sl env adding torch), `graphcast-torch` (`run_graphcast.sh`; the
+  same plus graphcast), all
   under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2-rocm` is the
   `ace2` env with ROCm torch, for ACE2 training on Ursa's AMD `u1-mi300x`
   nodes (`run_ace2_train_mi300x.sh`; see `ace2-training.md`); `ace2ic` is a
@@ -67,7 +68,7 @@ documented in `config.yml.template`.
 | `running_at_alcf.md` | running on ALCF Polaris (PBS): building envs there, `run_ace2_polaris.sh`, A100 memory limits, Eagle data paths |
 | `ace2-training.md` | training our own ACE2 checkpoint: building the training dataset from public ARCO-ERA5 (`backends/ace2/ace2_dataset.py`, `run_ace2_dataset_polaris.sh`), CO2, normalization stats, training configs and `run_ace2_train_polaris.sh` (fme, the checkpointing workaround `fme_train.py`), adding vertical layers for radiances |
 | `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics, the AIFS dry-air mass fixer (`dry_mass_fixer`)|
-| `integrate_jax_backend.md` | the torch/JAX bridge (`backends/jax_bridge.py`), the `ngcm` and `neuralgcm` backends, the `ngcm-torch` env, `backends/hybrid_levels.py` |
+| `integrate_jax_backend.md` | the torch/JAX bridge (`backends/jax_bridge.py`), the `ngcm`, `neuralgcm` and `graphcast` backends, the `ngcm-torch` and `graphcast-torch` envs, `backends/hybrid_levels.py` |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.
