@@ -316,8 +316,7 @@ amplitude 0.003-0.3 latent units (stddevs).
 - **The bridge is not at fault.** A layout or transpose error would break
   every family. Since u and msl agree, the mismatches come from bf16 and
   nonlinearity.
-- **Untested.** Freezing z (`graphcast_frozen: [specific_humidity,
-  geopotential]`) might make the descent better behaved.
+- **Open issue: the geopotential increment** (2026-11-07, see below).
 
 ### Solver test (`config_test_graphcast.yml`)
 
@@ -344,3 +343,38 @@ Results:
 - The cost falls faster here because the later steps are larger. This
   solver decays the lr with a cosine to `end_factor`; lw4dvar-jax decays
   from 1e-3 to about 3e-4 and then 1e-5.
+
+### Open issue: the geopotential increment (2026-11-07, not yet tested)
+
+**The problem.** GraphCast takes z as an input independent of T. The
+control therefore lets z move freely on all 13 levels. Physically, z
+follows hydrostatically from T and surface pressure. An increment that
+moves z without a matching change in T is an input combination the model
+never saw in training. The gradient check shows the model reacting to it
+very nonlinearly, which likely makes the minimization harder.
+
+**Option 1: freeze z.** Set `graphcast_frozen: [specific_humidity,
+geopotential]`. The analysis then changes T, u, v, w, msl and the other
+surface fields, and z changes only through the model from +6 h on. The
+drawback is that `logpinterp` computes model surface pressure from the z
+profile alone (`get_surface_pressure`). With z frozen, Jo at window start
+no longer depends on the control. The window-start obs are then wasted,
+and the other obs times are fitted only through GraphCast's response to
+the T, wind and msl increments.
+
+**Option 2 (preferred): derive z from T and msl.** Drop z from the
+independent control and compute its increment hydrostatically inside
+`apply_increment`:
+
+- start with a surface term from the msl increment;
+- integrate the T increment upward over the 13 pressure levels;
+- optionally account for the humidity (virtual temperature) contribution,
+  although q is frozen by default.
+
+This keeps the input consistent with what the model expects and keeps the
+window-start obs informative.
+
+**How to test it.** Run `config_test_graphcast.yml` and a longer cycling
+run with the current control and with option 2. Compare the cost descent,
+the gradient check for z and T, and the z500 analysis and background
+errors.
