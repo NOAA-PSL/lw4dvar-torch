@@ -262,6 +262,50 @@ class LatentForecastModel(abc.ABC):
     # Differentiable rollout
     # ------------------------------------------------------------------
 
+    # True for backends whose latent IS the model state (the JAX ngcm /
+    # neuralgcm backends): the increment is added at window start
+    # (`apply_increment`), so compute_optimal returns an analysis valid at
+    # window start instead of window start + dt_verif, and the window-start
+    # obs constrain the increment. False (encoder/processor models: AIFS,
+    # FCN3, Aurora, ACE2, SFNO) keeps the one-shot injection inside the
+    # first `advance` step.
+    increment_at_start: bool = False
+
+    def apply_increment(self, state: ModelState, latent_increment: torch.Tensor) -> ModelState:
+        """`state` with `latent_increment` (latent_shape) added, at the same
+        valid time; differentiable. Only for backends with
+        `increment_at_start`."""
+        raise NotImplementedError(f"{type(self).__name__} has no window-start increment (increment_at_start=False)")
+
+    # Static-ensemble B (jb_samples, latent_b.EnsembleB) works on GRID-POINT
+    # samples (C, H, W) -- H latitudes north to south on the Gaussian
+    # ('legendre-gauss') grid, W longitudes -- because its localization is a
+    # Schur product in grid space. For backends whose latent is already such
+    # a grid (ACE2) both maps are the identity; spectral-state backends
+    # (ngcm, neuralgcm) transform modal channels with their own SHT.
+    jb_sht_grid: Optional[str] = None
+
+    def latent_to_grid(self, latent: torch.Tensor) -> torch.Tensor:
+        """Latent (latent_shape) -> grid-point (C, H, W); for building B samples."""
+        return latent
+
+    def latent_from_grid(self, grid: torch.Tensor) -> torch.Tensor:
+        """Grid-point (C, H, W) -> latent (latent_shape); differentiable
+        (applied to EnsembleB's output every epoch)."""
+        return grid
+
+    def latent_from_state_diff(self, diff: torch.Tensor) -> torch.Tensor:
+        """Packed-state difference (state shape without the batch dim) ->
+        the latent increment that apply_increment would turn into it (the
+        inverse of the state_scales scaling; 0 for frozen channels). For
+        building B samples; only for backends with increment_at_start."""
+        raise NotImplementedError(f"{type(self).__name__} has no latent_from_state_diff")
+
+    def checkpoint_id(self) -> Optional[str]:
+        """Identity of the loaded weights, recorded in B sample files and
+        checked when they are loaded (None: the solver's ACE2 sha256 check)."""
+        return None
+
     @abc.abstractmethod
     def advance(
         self,

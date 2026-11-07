@@ -1,0 +1,62 @@
+# NGCM JAX backend set up like the original NeuralGCM pressure-obs runs
+# (long-window-4dvar-psobs/config.yml, deterministic_2_8_deg, 2015):
+# 4-day window with 3-hourly ps obs, AdamW lr 1e-4 (constant), weight decay
+# 1e-3, 50 epochs, cycling every 6 h from a 48 h forecast on 2015-01-01.
+# Differences that can't be matched exactly:
+#  - the model step is 6 h, so the 3-hourly obs are time-interpolated between
+#    steps (dt_verif 6, dt_obs 3) instead of verified at 3-hourly model output;
+#  - the original `lam: 20` geopotential-tendency penalty has no counterpart
+#    here (jc_ps_weight is a different, surface-pressure balance penalty) --
+#    off;
+#  - the control is an increment to the background (weight decay pulls it
+#    toward the background, not the state toward 0; at lr * wd = 1e-7 per
+#    epoch that difference is negligible anyway).
+# state_scales: the backend default reproduces the original
+# {specific_humidity: 1e5} in this model's units (see ngcm_model.py);
+# condensate is left out of control_variables, as the original did not
+# optimize tracers other than humidity.
+exp:
+  model_backend: ngcm
+
+  nhrs_back: 48
+  restart: False
+  rpath: './output/ngcm_4d_2015/'
+  obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
+  nobs_max: 15000
+  ic_suffix: '96h_50it'
+  sdate: '2015-01-01T00'
+  n_init: 100
+  dt_init: 6
+  save_levs: [1000, 850, 500]
+  cycle: True
+  exp_name: 'ngcm_4d_2015'
+
+  ngcm_exp: '/scratch4/BMC/gsienkf/whitaker/ngcm_runs/r72_top150'
+  ngcm_step: 51660
+  ngcm_data: '/scratch4/BMC/gsienkf/whitaker/ngcm_data/era5_ace2l32_tl63'
+  ngcm_train_path: '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'
+  device: 'cuda'
+  path_output: './output/'
+  print_every: 50
+  oberrstart: -1.0
+  oberrdeltaperday: 0.0
+  # ps_operator defaults to 'ps_native' for NGCM
+  control_variables: [vorticity, divergence, air_temperature, log_surface_pressure, hybrid_specific_humidity]
+
+windows:
+  '4':
+    n_verif: 16
+    dt_verif: 6
+    dt_obs: 3
+    learn_rate: 1.0e-4
+    weight_decay: 1.0e-3
+    max_epoch: 50
+    # as in the original: linear warmup from lr/10 over 10 epochs, then
+    # constant (optax warmup_constant_schedule)
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 1.0
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''
