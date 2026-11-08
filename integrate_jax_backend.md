@@ -193,6 +193,29 @@ only adds cost. Kappa 30 roughly reaches the original's `lam: 20`
 analyses (~10.2, 9.0, 9.1, 9.1, verified at t0). Its optimization is
 still poor, though.
 
+Static-ensemble Jb and learning-rate sweep (2026-11-06..08; 120 cycles,
+2015-01-01..01-30, `config_neuralgcm_4d_2015_t0inc_jb36m12_*_120.yml`,
+untracked; logs `logs/neuralgcm_t0inc_jb36m12_*`). All runs use a t0
+increment, Jc off, and an NMC Jb from 36 h − 12 h forecast differences
+(`jb_samples: .../neuralgcm_2p8_nmc36m12_dec2020may2021_6h.pt`,
+`jb_loc_km: 1500`). Z500 rms (m) within the 4-day window, averaged over
+the 120 cycles (`diagnostics/z500err_window.py`), analysis at 0 h / 96 h:
+
+| run | NH | Tropics | SH | Global |
+|---|---|---|---|---|
+| lr 1e-3 | 12.7 / 19.5 | 9.7 / 11.2 | 19.8 / 29.5 | 14.7 / 21.5 |
+| lr 5e-3 | 12.0 / 17.4 | 9.2 / 10.5 | 17.0 / 25.3 | 13.1 / 18.8 |
+| `jb_inflation: 4`, lr 2.5e-3 | 12.0 / 17.4 | 9.2 / 10.5 | 17.0 / 25.2 | 13.2 / 18.7 |
+| lr 1e-2, `obs_density_box_deg: 10` | 12.2 / 16.7 | 8.2 / 9.5 | 15.7 / 19.6 | 12.5 / 15.9 |
+
+- Inflating B 4x at half the lr gives the same result as lr 5e-3.
+- lr 1e-2 with obs-density weighting is best, mostly in the SH and tropics
+  (sparse or clustered obs), while the NH barely changes. The background
+  also improves (global 96 h 20.4 → 17.2 m), so the gain carries from cycle
+  to cycle. This run changed both lr and the weighting, so their separate
+  effects are not known.
+- Running: lr 5e-2 with the same settings (job 25823479).
+
 Open: the `ngcm` backend still excludes condensate via `control_variables`
 (its default 1e5 factor keeps condensate steps tiny, but it is not frozen).
 
