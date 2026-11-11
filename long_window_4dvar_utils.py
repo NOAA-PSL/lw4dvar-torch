@@ -276,9 +276,9 @@ def load_config(config_path='config.yml'):
     exp['path_output'] = exp['path_output'] + exp['exp_name'] + '/'
 
     backend = exp.get('model_backend')
-    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno'):
+    if backend not in ('aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', 'neuralgcm', 'graphcast'):
         raise ValueError(
-            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno', got {backend!r} -- "
+            f"exp.model_backend must be 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', 'neuralgcm', or 'graphcast', got {backend!r} -- "
             "this key is required (see config.yml.template)"
         )
     # reset_skt_ocean: AIFS and Aurora both have 'skt'/'lsm' packed-state
@@ -323,6 +323,31 @@ def load_config(config_path='config.yml'):
             )
         if exp['ps_operator'] == 'ps':
             raise ValueError("ps_operator='ps' is not supported for ACE2 -- use 'ps_native' (the default)")
+    # NGCM (JAX, via backends/jax_bridge.py): 32 hybrid layers, so the same
+    # 'ps_native' default as ACE2.
+    if backend == 'ngcm':
+        exp.setdefault('ps_operator', 'ps_native')
+        if exp['ps_operator'] == 'ps':
+            raise ValueError("ps_operator='ps' is not supported for NGCM -- use 'ps_native' (the default)")
+        for key in ('ngcm_exp', 'ngcm_step', 'ngcm_data'):
+            if key not in exp:
+                raise ValueError(f"model_backend 'ngcm' needs exp.{key} (see config.yml.template)")
+    # official NeuralGCM (JAX, via the bridge): pressure-level outputs only,
+    # no surface pressure -- 'logpinterp', as in the original experiments.
+    if backend == 'neuralgcm':
+        if exp.get('ps_operator', 'logpinterp') != 'logpinterp':
+            raise ValueError("model_backend 'neuralgcm' has no surface-pressure output -- use ps_operator 'logpinterp'")
+        for key in ('neuralgcm_checkpoint', 'neuralgcm_input_dir'):
+            if key not in exp:
+                raise ValueError(f"model_backend 'neuralgcm' needs exp.{key} (see config.yml.template)")
+    # GraphCast (JAX, via the bridge): pressure-level outputs and MSLP, no
+    # surface pressure -- 'logpinterp', as in lw4dvar-jax.
+    if backend == 'graphcast':
+        if exp.get('ps_operator', 'logpinterp') != 'logpinterp':
+            raise ValueError("model_backend 'graphcast' has no surface-pressure output -- use ps_operator 'logpinterp'")
+        for key in ('graphcast_checkpoint', 'graphcast_stats_dir', 'graphcast_input_dir'):
+            if key not in exp:
+                raise ValueError(f"model_backend 'graphcast' needs exp.{key} (see config.yml.template)")
     # jc_ps_sigma (the original, un-normalized penalty) was removed -- fail
     # loudly rather than silently run without the penalty.
     if 'jc_ps_sigma' in exp:
@@ -335,17 +360,20 @@ def load_config(config_path='config.yml'):
     if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
     if exp.get('jb_samples'):
-        if backend != 'ace2':
-            raise ValueError("jb_samples (static-ensemble latent B) is only implemented for the ACE2 backend so far")
+        if backend not in ('ace2', 'ngcm', 'neuralgcm'):
+            raise ValueError("jb_samples (static-ensemble latent B) is only implemented for the ace2, ngcm and "
+                             f"neuralgcm backends, got {backend!r}")
         if float(exp.get('jb_loc_km', 1500.0)) <= 0:
             raise ValueError(f"jb_loc_km must be > 0 (km), got {exp['jb_loc_km']!r}")
         if float(exp.get('jb_weight', 1.0)) <= 0:
             raise ValueError(f"jb_weight must be > 0, got {exp['jb_weight']!r}")
+        if float(exp.get('jb_inflation', 1.0)) <= 0:
+            raise ValueError(f"jb_inflation must be > 0, got {exp['jb_inflation']!r}")
         if float(exp.get('latent_scale', 1.0)) != 1.0:
             raise ValueError("latent_scale has no effect with jb_samples (the control is B^-1/2-preconditioned) "
                              "-- leave it unset or 1.0")
-    elif exp.get('jb_loc_km') is not None or exp.get('jb_weight') is not None:
-        raise ValueError("jb_loc_km / jb_weight are set but jb_samples is not -- no Jb term would be used")
+    elif any(exp.get(k) is not None for k in ('jb_loc_km', 'jb_weight', 'jb_inflation')):
+        raise ValueError("jb_loc_km / jb_weight / jb_inflation are set but jb_samples is not -- no Jb term would be used")
     if float(exp.get('obs_density_box_deg', 0.0)) < 0:
         raise ValueError(f"obs_density_box_deg must be >= 0 (degrees; 0 = off), got {exp['obs_density_box_deg']!r}")
     if _dry_mass_fixer_hpa(exp) is not None and backend != 'aifs':
@@ -380,10 +408,11 @@ def load_config(config_path='config.yml'):
             raise ValueError(f"autocast_dtype for {backend!r} must be one of {sorted(allowed)}, got {exp['autocast_dtype']!r}")
         exp['autocast_dtype'] = name
     # ps_native needs decode_state's lowest-native-level keys
-    # (t_lowest/q_lowest/p_lowest), which only the ACE2 backend provides.
-    if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend != 'ace2':
+    # (t_lowest/q_lowest/p_lowest), which only the hybrid-layer backends
+    # (ACE2, NGCM) provide.
+    if exp.get('ps_operator', 'logpinterp') == 'ps_native' and backend not in ('ace2', 'ngcm'):
         raise ValueError(
-            f"ps_operator='ps_native' is only supported for model_backend 'ace2', got {backend!r} "
+            f"ps_operator='ps_native' is only supported for model_backends 'ace2' and 'ngcm', got {backend!r} "
             "(it needs decode_state's lowest-native-level t_lowest/q_lowest/p_lowest fields)."
         )
     return exp, windows
@@ -434,7 +463,8 @@ def log_window(exp, logger):
                                         if exp.get('jc_ps_weight') else '(off)'))
     if exp.get('jb_samples'):
         logger.info(f"   jb_samples: {exp['jb_samples']} (static-ensemble latent B), jb_loc_km: "
-                    f"{float(exp.get('jb_loc_km', 1500.0))}, jb_weight: {float(exp.get('jb_weight', 1.0))}")
+                    f"{float(exp.get('jb_loc_km', 1500.0))}, jb_weight: {float(exp.get('jb_weight', 1.0))}, "
+                    f"jb_inflation: {float(exp.get('jb_inflation', 1.0))}")
     else:
         logger.info('   jb_samples: (off -- latent increment is the control, regularized by weight_decay)')
     logger.info('   obs_density_box_deg: ' + (str(exp['obs_density_box_deg']) + ' (area-weighted Jo)'
@@ -545,7 +575,44 @@ def get_model(exp):
             forcing_dir=exp.get('forcing_dir', exp['path_model'] + 'forcing_data/'),
             device=exp.get('device', 'cuda'),
         )
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+    elif backend == 'ngcm':
+        # JAX model (ngcm-train's NeuralGCM-style TL63 model) behind the
+        # torch interface via backends/jax_bridge.py; ngcm-torch env
+        # (run_ngcm.sh).
+        _ensure_backend_on_path('ngcm')
+        import ngcm_model
+        return ngcm_model.NGCMModel(
+            exp_dir=exp['ngcm_exp'],
+            step=int(exp['ngcm_step']),
+            data_dir=exp['ngcm_data'],
+            ngcm_train_path=exp.get('ngcm_train_path', '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'),
+            device=exp.get('device', 'cuda'),
+            use_ema=exp.get('ngcm_use_ema', True),
+            state_scales=exp.get('ngcm_state_scales'),
+        )
+    elif backend == 'neuralgcm':
+        # the official NeuralGCM checkpoint (ngcm-torch env, run_ngcm.sh)
+        _ensure_backend_on_path('neuralgcm')
+        import neuralgcm_model
+        return neuralgcm_model.NeuralGCMModel(
+            checkpoint_path=exp['neuralgcm_checkpoint'],
+            input_dir=exp['neuralgcm_input_dir'],
+            device=exp.get('device', 'cuda'),
+            state_scales=exp.get('neuralgcm_state_scales'),
+            ngcm_train_path=exp.get('ngcm_train_path', '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'),
+        )
+    elif backend == 'graphcast':
+        # GraphCast_small (graphcast-torch env, run_graphcast.sh)
+        _ensure_backend_on_path('graphcast')
+        import graphcast_model
+        return graphcast_model.GraphCastModel(
+            checkpoint_path=exp['graphcast_checkpoint'],
+            stats_dir=exp['graphcast_stats_dir'],
+            input_dir=exp['graphcast_input_dir'],
+            device=exp.get('device', 'cuda'),
+            frozen=exp.get('graphcast_frozen'),
+        )
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', 'neuralgcm', or 'graphcast')")
 
 
 def get_grid_interpolator(model, exp):
@@ -573,7 +640,8 @@ def get_grid_interpolator(model, exp):
         if kind == 'kdtree':
             return aifs_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    elif backend in ('fcn3', 'aurora', 'sfno'):
+    elif backend in ('fcn3', 'aurora', 'sfno', 'graphcast'):
+        # GraphCast's 1-degree grid is regular with pole rows too.
         # Aurora shares FCN3's regular-grid machinery directly (same 0.25deg
         # ERA5 grid, just 720 rather than 721 rows -- fcn3_grid.py's classes
         # derive nlat/nlon from the data itself). Deliberately imports from
@@ -590,8 +658,8 @@ def get_grid_interpolator(model, exp):
         if kind == 'kdtree':
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    elif backend == 'ace2':
-        # F90 Gaussian grid: unevenly spaced latitudes, so fcn3_grid's
+    elif backend in ('ace2', 'ngcm', 'neuralgcm'):
+        # F90 (ACE2) / TL63 (NGCM) Gaussian grids: unevenly spaced latitudes, so fcn3_grid's
         # uniform-latitude BilinearGridInterpolator doesn't apply --
         # ace2_grid's rectilinear version is the same scheme on the real
         # latitudes. 'kdtree' falls back to fcn3_grid.GridInterpolator.
@@ -605,7 +673,7 @@ def get_grid_interpolator(model, exp):
             import fcn3_grid
             return fcn3_grid.GridInterpolator(model.lons, model.lats)
         raise ValueError(f"unknown grid_interp kind: {kind!r} (expected 'bilinear' or 'kdtree')")
-    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+    raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', 'neuralgcm', or 'graphcast')")
 
 
 # ---------------------------------------------------------------------------
@@ -663,8 +731,12 @@ def get_input(exp, model, logger):
             _ensure_backend_on_path('ace2')
             import ace2_ic
             input_state = ace2_ic.build_input_state(back_dt, cache_dir)
+        elif backend in ('ngcm', 'neuralgcm', 'graphcast'):
+            # read straight from local files (ngcm_data zarr / neuralgcm and
+            # graphcast per-time netCDFs) -- no login-node prefetch needed.
+            input_state = model.read_inputs(back_dt)
         else:
-            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+            raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', 'neuralgcm', or 'graphcast')")
         input_encoded = model.prepare_initial_state(input_state, back_dt)
         dt_hours = exp['nhrs_back']
         logger.info('generating input state from a forecast...')
@@ -789,8 +861,17 @@ def get_verif(exp, model, logger, date_override=None):
         truth = ace2_ic.load_verif(date_dt, cache_dir)
         verif_ic['z500'] = GRAV * torch.as_tensor(truth['h500'], dtype=torch.float32, device=model.device).reshape(-1)
         verif_ic['TMP850'] = torch.as_tensor(truth['TMP850'], dtype=torch.float32, device=model.device).reshape(-1)
+    elif backend == 'ngcm':
+        # Orography: the model's own T63 orography (what its ps is consistent
+        # with). Truth for the z500 diagnostic: ERA5 z500 on the model grid
+        # from the store's pressure.zarr.
+        verif_ic['geopotential_at_surface'] = model.surface_geopotential
+        verif_ic['z500'] = model.read_z500(date_dt)
+    elif backend in ('neuralgcm', 'graphcast'):
+        # ERA5 z500 and surface geopotential from the per-time input file.
+        verif_ic.update(model.read_verif(date_dt))
     else:
-        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', or 'sfno')")
+        raise ValueError(f"unknown model_backend {backend!r} (expected 'aifs', 'fcn3', 'aurora', 'ace2', 'sfno', 'ngcm', 'neuralgcm', or 'graphcast')")
 
     if "z" in verif_ic:
         verif_ic["geopotential"] = verif_ic["z"]
@@ -1388,6 +1469,12 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
       - obs in the first 6h bracket `background(0) <-> analysis(6h)`; only the
         `analysis(6h)` end depends on the increment, weighted by `alpha`.
 
+    Exception: backends with `model.increment_at_start` (ngcm, neuralgcm,
+    whose latent is the state itself) add the increment at window start
+    (`model.apply_increment`), so every obs, including t=0, sees the
+    corrected state; `keep_mask` then applies at step 0 (ref_state1 is the
+    background at window start) and Jc's "first step" is steps 0 -> 1.
+
     `keep_mask` / `ref_state1` (both from `compute_optimal`, present iff
     `control_variables` is configured): after the injection step, packed-state
     columns with `keep_mask == False` are overwritten with `ref_state1` (the
@@ -1474,19 +1561,36 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             Jt = ((innov / oberr_stdev) ** 2).sum()
         if do_print:
             wtag = f", max ob weight {w.max().item():.2f}" if obs_density_box_deg > 0 else ''
-            tag = ' [background, uncorrected]' if (step_lo[j] == 0 and alpha[j] == 0.0) else ''
+            tag = (' [background, uncorrected]'
+                   if (step_lo[j] == 0 and alpha[j] == 0.0 and not model.increment_at_start) else '')
             print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): J {Jt.item()}, "
                   f"{int(used.sum().item())} obs used (out of {int(psobs_traj['n_valid'][j])}){wtag}{tag}")
         return Jt
 
     jc_sp = {}
+    # increment_at_start (JAX backends: the latent is the state): the
+    # increment and the control mask apply at step 0, so the window-start
+    # obs and the first in-step interpolations see the corrected state.
+    at_start = model.increment_at_start
+    inj_step = 0 if at_start else 1
+    jc_steps = (inj_step, inj_step + 1)   # Jc: the first step after injection
     f_state = input_state
-    decoded_prev = model.decode_state(f_state, only=loss_bases)   # step 0 = uncorrected background
+    if at_start:
+        f_state = model.apply_increment(f_state, scaled_increment)
+        if keep_mask is not None:
+            f_state = model.wrap_state(
+                _apply_control_mask(f_state.state, keep_mask, ref_state1.state, model.state_layout),
+                f_state.date,
+            )
+        if jc_ref is not None:
+            jc_sp[0] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
+    # step 0: the uncorrected background unless increment_at_start
+    decoded_prev = model.decode_state(f_state, only=loss_bases)
     for s in range(1, n_steps + 1):
-        inj = scaled_increment if s == 1 else None
+        inj = scaled_increment if s == inj_step else None
         use_ckpt = (checkpoint_stride > 0) and (s % checkpoint_stride == 0)
         f_state = model.advance(f_state, steps=1, latent_increment=inj, use_checkpoint=use_ckpt)
-        if s == 1 and keep_mask is not None:
+        if s == inj_step and keep_mask is not None:
             # Confine the increment's direct effect to the controlled
             # columns; the rest revert to the uncorrected forecast
             # (ref_state1 is detached, so those columns carry no gradient to
@@ -1496,7 +1600,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                 f_state.date,
             )
         decoded_cur = model.decode_state(f_state, only=loss_bases)
-        if jc_ref is not None and s in (1, 2):
+        if jc_ref is not None and s in jc_steps:
             jc_sp[s] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
         for j in slots_by_step.get(s - 1, []):
             a = alpha[j]
@@ -1511,8 +1615,8 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
 
     J = sum(Jol)
     if jc_ref is not None:
-        jc_field, bg1, bg2, jc_w, jc_factor = jc_ref
-        delta = ((jc_sp[2] - bg2) - (jc_sp[1] - bg1)) / 100.0   # hPa
+        jc_field, bg1, bg2, jc_w, jc_factor = jc_ref   # background at jc_steps
+        delta = ((jc_sp[jc_steps[1]] - bg2) - (jc_sp[jc_steps[0]] - bg1)) / 100.0   # hPa
         Jc = jc_factor * (jc_w * delta ** 2).sum()
         J = J + Jc
         if do_print:
@@ -1534,32 +1638,48 @@ def get_jb_operator(exp, model, logger):
     localization of scale `exp['jb_loc_km']` (default 1500 km). Loaded once
     per process (~8 GB of fp16 samples on the GPU) and cached across cycles.
     Refuses samples built for a different checkpoint or latent shape -- the
-    latent space is specific to the checkpoint."""
+    latent space is specific to the checkpoint. `exp['jb_inflation']` c
+    (default 1) multiplies B by c (samples by sqrt(c))."""
     import hashlib
     from latent_b import EnsembleB
     path, loc = exp['jb_samples'], float(exp.get('jb_loc_km', 1500.0))
-    key = (path, loc)
+    infl = float(exp.get('jb_inflation', 1.0))
+    key = (path, loc, infl)
     if key not in _JB_CACHE:
         d = torch.load(path, map_location='cpu', weights_only=False)
         meta = d['meta']
-        ckpt = exp['path_model'] + exp.get('model_name', 'ace2_era5_ckpt.tar')
-        h = hashlib.sha256()
-        with open(ckpt, 'rb') as f:
-            while chunk := f.read(1 << 24):
-                h.update(chunk)
-        if meta.get('backend') != exp['model_backend'] or h.hexdigest() != meta['checkpoint_sha256']:
-            raise ValueError(f"jb_samples {path} was built for {meta.get('backend')} checkpoint "
-                             f"{meta['checkpoint']} (sha256 {meta['checkpoint_sha256'][:12]}), not the running "
-                             f"{ckpt} (sha256 {h.hexdigest()[:12]})")
+        if model.checkpoint_id() is not None:
+            # spectral-state JAX backends (diagnostics/build_jax_nmc_b.py)
+            if meta.get('backend') != exp['model_backend'] or meta.get('checkpoint_id') != model.checkpoint_id():
+                raise ValueError(f"jb_samples {path} was built for {meta.get('backend')} checkpoint "
+                                 f"{meta.get('checkpoint_id')}, not the running {model.checkpoint_id()}")
+            scales = exp.get(f"{exp['model_backend']}_state_scales")
+            if meta.get('state_scales') != scales:
+                raise ValueError(f"jb_samples {path} are in latent units for state_scales {meta.get('state_scales')}, "
+                                 f"not this run's {scales}")
+            ck = meta['checkpoint_id']
+        else:
+            ckpt = exp['path_model'] + exp.get('model_name', 'ace2_era5_ckpt.tar')
+            h = hashlib.sha256()
+            with open(ckpt, 'rb') as f:
+                while chunk := f.read(1 << 24):
+                    h.update(chunk)
+            if meta.get('backend') != exp['model_backend'] or h.hexdigest() != meta['checkpoint_sha256']:
+                raise ValueError(f"jb_samples {path} was built for {meta.get('backend')} checkpoint "
+                                 f"{meta['checkpoint']} (sha256 {meta['checkpoint_sha256'][:12]}), not the running "
+                                 f"{ckpt} (sha256 {h.hexdigest()[:12]})")
+            ck = f"sha256 {meta['checkpoint_sha256'][:12]}"
         if tuple(meta['latent_shape']) != tuple(model.latent_shape):
             raise ValueError(f"jb_samples latent shape {meta['latent_shape']} != model {model.latent_shape}")
         samples = d['samples'].to(model.device)
+        if infl != 1.0:
+            samples = samples * infl ** 0.5
         del d
         _JB_CACHE.clear()   # one B at a time (GPU memory)
         _JB_CACHE[key] = EnsembleB(samples, loc, meta['sht_grid']).to(model.device)
-        logger.info(f"jb: {meta['n_samples']} latent samples from {meta['run_dir']} ({meta['dates'][0]} .. "
-                    f"{meta['dates'][-1]}), localization {loc:.0f} km, control "
-                    f"{tuple(_JB_CACHE[key].control_shape)}; checkpoint sha256 {meta['checkpoint_sha256'][:12]} ok")
+        logger.info(f"jb: {meta['n_samples']} latent samples from {meta.get('run_dir', meta.get('method'))} "
+                    f"({meta['dates'][0]} .. {meta['dates'][-1]}), localization {loc:.0f} km, inflation {infl:g}, control "
+                    f"{tuple(_JB_CACHE[key].control_shape)}; checkpoint {ck} ok")
     return _JB_CACHE[key]
 
 
@@ -1587,6 +1707,10 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     `printz500err`) all use its `.date` rather than assuming it matches the
     background's. Also saves `*_latent_increment_*.pt` for offline
     inspection of the raw increment.
+
+    Backends with `model.increment_at_start` (ngcm, neuralgcm: the latent
+    is the state itself) are the exception: the increment is added at window
+    start and the returned analysis is valid at `input_encoded.date`.
 
     With `exp['jb_samples']` the control is not the latent increment itself
     but v, with increment = B^1/2 v (`get_jb_operator`, static-ensemble B
@@ -1639,8 +1763,12 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
                            f'{[b for b, _ in interp_specs]} -- the first-6h obs terms will have '
                            'no gradient to the increment (only downstream-coupled terms will)')
         model._prime_noise()  # no-op for AIFS
-        with torch.no_grad():
-            ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
+        if model.increment_at_start:
+            # the mask applies at window start: revert to the background there
+            ref_state1 = model.wrap_state(input_encoded.state.detach(), input_encoded.date)
+        else:
+            with torch.no_grad():
+                ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
 
     # jc_ps_weight (kappa, hPa^-2): balance penalty on the first-step change
     # of the pressure increment -- see compute_loss_4dvar's docstring. Needs
@@ -1657,10 +1785,16 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             jc_field = 'msl'
         else:
             raise ValueError("jc_ps_weight needs a surface ('sp') or mean-sea-level ('msl') pressure field")
+        # The background at the first step after injection and the next:
+        # steps 1, 2 (one-shot injection inside step 1), or 0, 1 with
+        # increment_at_start.
         model._prime_noise()
         with torch.no_grad():
             bg1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
-            bg2 = model.advance(bg1, steps=1, use_checkpoint=False)
+            if model.increment_at_start:
+                bg1, bg2 = input_encoded, bg1
+            else:
+                bg2 = model.advance(bg1, steps=1, use_checkpoint=False)
             p1 = model.decode_state(bg1, only=[jc_field])[jc_field].detach()
             p2 = model.decode_state(bg2, only=[jc_field])[jc_field].detach()
         # Jc = kappa * N_obs * mean_w(Delta^2): area-weighted grid mean
@@ -1736,7 +1870,9 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # loss surface for the fixed `increment`. No-op for AIFS.
         model._prime_noise()
         optimizer.zero_grad()
-        increment = control if jb_op is None else jb_op(control)
+        # B works on grid-point samples; latent_from_grid is the identity
+        # for grid latents (ACE2) and the model's SHT for spectral states.
+        increment = control if jb_op is None else model.latent_from_grid(jb_op(control))
         loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref)
         if jb_op is not None:
             Jb = jb_weight * control.pow(2).sum()
@@ -1822,7 +1958,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     # earliest point a real physical analysis exists (see docstring). Falls
     # back to a plain (uncorrected) forecast advance if no epoch improved on
     # the background, keeping the contract "always returns a state dated
-    # `+dt_verif`" regardless of optimization success. Re-primes FCN3's
+    # `+dt_verif`" (window start with increment_at_start) regardless of
+    # optimization success. Re-primes FCN3's
     # noise once more first (no-op for AIFS), so this materialization is a
     # deterministic function of increment_best rather than whatever noise
     # state the epoch loop happened to leave behind.
@@ -1831,7 +1968,17 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     scaled_increment_best = increment_best / latent_scale if increment_best is not None else None
     model._prime_noise()
     with torch.no_grad():
-        if keep_mask is None:
+        if model.increment_at_start:
+            # the latent is the state: the analysis is valid at window start
+            analysis_state = input_encoded
+            if scaled_increment_best is not None:
+                analysis_state = model.apply_increment(input_encoded, scaled_increment_best)
+                if keep_mask is not None:
+                    analysis_state = model.wrap_state(
+                        _apply_control_mask(analysis_state.state, keep_mask, ref_state1.state, model.state_layout),
+                        analysis_state.date,
+                    )
+        elif keep_mask is None:
             analysis_state = model.advance(
                 input_encoded, steps=steps_per_verif, use_checkpoint=False,
                 latent_increment=scaled_increment_best,
