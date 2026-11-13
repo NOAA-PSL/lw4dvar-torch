@@ -28,6 +28,34 @@ network access, in a few seconds. `make check` runs:
   against an independent reference (exact spherical areas, an isothermal
   atmosphere, weights computed by hand), not a copy of the code under test.
 
+- `tests/math/`: the math gates, in float64 on a toy model
+  (`toy_model.py`: a `LatentForecastModel` on an 8 x 16 grid, nonlinear in
+  the latent increment, with a pressure-level geopotential the logpinterp
+  operator reads). `problem.py` builds one 24 h window of synthetic ps obs
+  every 3 h (between model steps) and evaluates the solver's own
+  `compute_loss_4dvar` with QC frozen. The gates (`gates.py`) each return
+  an error measure:
+  - `gradient_error`: the cost's gradient against central finite
+    differences, for plain Jo, `checkpoint_stride` 0 / 2,
+    `control_variables`, `jc_ps_weight`, `obs_density_box_deg` and all of
+    them together (~1e-9 to 2e-8; tolerance 1e-6);
+  - `taylor_order`: the first-order Taylor remainder falls as eps^2 (order
+    1.99; must exceed 1.9);
+  - checkpointing (`checkpoint_stride` 1, 2, 3) leaves cost and gradient
+    unchanged to 1e-12;
+  - `dot_product_error`: <A v, w> = <v, A^T w> for the toy model's
+    tangent-linear / adjoint (3e-16) and for `latent_b._WeightedSampleSum`,
+    the custom backward of the ensemble B (fp32 inside, ~1e-7).
+
+  Each gate has a planted bug it must catch, with a wide margin: one
+  term of `get_surface_pressure`'s interpolation weight detached (gradient
+  error 0.26), a checkpoint wrapper that detaches its input (0.82), a
+  gradient 1 % too large (Taylor order 0.76), an advection whose backward
+  rolls the wrong way (dot-product error 0.33), and `_WeightedSampleSum`'s
+  backward with its sign flipped. A new backend with a hand-written
+  backward (a custom `autograd.Function` or VJP) should get the same
+  dot-product test (`model_tangent_and_adjoint`).
+
 - `tests/ace2/` (marker `ace2`, `make check-ace2`, CI job `ace2-mini`): the
   solver end to end with a real, tiny model -- the mini ACE2 (2.5 deg,
   16-layer CRTM+land variables, SFNO embed_dim 64) on CPU, one 24 h window of
@@ -47,9 +75,8 @@ Tests find it at `$LW4DVAR_MINI_ACE2_CKPT`, else in `$LW4DVAR_FIXTURE_CACHE`
 sha256. A new checkpoint goes into a new release, never over an old asset,
 so older commits keep testing against the file they pinned.
 
-Still to come (issue #20): a CPU toy backend with a one-window smoke run,
-the math gates (gradients vs finite differences, Taylor and adjoint
-dot-product tests, each with a planted bug), and golden outputs.
+Still to come (issue #20): golden outputs, and the dot-product gate on
+`backends/jax_bridge.py`'s custom VJP once the `jax-backend` branch merges.
 
 ## What CI does not cover
 
