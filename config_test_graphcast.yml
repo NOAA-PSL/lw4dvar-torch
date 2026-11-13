@@ -1,0 +1,46 @@
+# Small end-to-end test of the graphcast backend, set up like lw4dvar-jax's
+# config_test_graphcast.yml (2 cycles of a 12-h window, 3 epochs, lr 1e-3,
+# weight decay 1e-4, warmup + cosine decay, IC read straight from ERA5) so
+# the first-epoch cost (the background's Jo) can be compared with that
+# repo's log (12694.5 and 12366.8 for the two cycles).
+#   sbatch run_graphcast.sh config_test_graphcast.yml
+exp:
+  model_backend: graphcast
+
+  nhrs_back: 0          # lw4dvar-jax's `perfect: False`: no spin-up forecast
+  restart: False
+  rpath: './output/test_graphcast/'
+  obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
+  nobs_max: 15000
+  ic_suffix: '12h_3it'
+  sdate: '2015-01-11T00'
+  n_init: 2
+  dt_init: 6
+  save_levs: [1000, 850, 500]
+  cycle: True
+  exp_name: 'test_graphcast'
+
+  graphcast_checkpoint: '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-jswhit2/models/graphcast_small.npz'
+  graphcast_stats_dir: '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-jswhit2/stats'
+  graphcast_input_dir: '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-jswhit2/input/2015-gc'
+  device: 'cuda'
+  path_output: './output/'
+  print_every: 1
+  oberrstart: -1.0
+  oberrdeltaperday: 0.0
+
+windows:
+  '0.5':
+    n_verif: 2
+    dt_verif: 6
+    dt_obs: 6
+    learn_rate: 1.0e-3
+    weight_decay: 1.0e-4
+    max_epoch: 3
+    warmup_steps: 1
+    start_factor: 1.0     # lw4dvar-jax: int(0.2*max_epoch)=0 warmup steps -> first step at full lr
+    end_factor: 0.0
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''

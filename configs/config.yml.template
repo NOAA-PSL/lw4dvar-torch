@@ -2,18 +2,20 @@ exp:
   # model_backend selects which forecast model backs the 4D-Var solver:
   # 'aifs' (ECMWF AIFS-single-2.0, backends/aifs/), 'fcn3' (NVIDIA
   # FourCastNet3, backends/fcn3/), 'aurora' (Microsoft Aurora v1.5,
-  # backends/aurora/), or 'ace2' (Ai2 ACE2-ERA5, backends/ace2/). Required --
+  # backends/aurora/), 'ace2' (Ai2 ACE2-ERA5, backends/ace2/), 'sfno', or
+  # 'ngcm' (JAX NeuralGCM-style model, backends/ngcm/), or 'neuralgcm'
+  # (the official NeuralGCM checkpoints, backends/neuralgcm/). Required --
   # load_config() raises if this is missing or not one of these values.
   # This one key also picks which conda env the job must run under (aifs2 /
-  # fcstnet3 / aurora / ace2 -- see run_aifs.sh / run_fcn3.sh /
-  # run_aurora.sh / run_ace2.sh). Exception: AIFS checkpoints trained with
+  # fcstnet3 / aurora / ace2 / ngcm-torch -- see run_aifs.sh / run_fcn3.sh /
+  # run_aurora.sh / run_ace2.sh / run_ngcm.sh). Exception: AIFS checkpoints trained with
   # the multi-dataset anemoi API (anemoi-models >= 0.19, e.g. the 1-degree
   # aifs2-1deg-ic1) keep model_backend: aifs but run in the aifs3 env
   # (run_aifs3.sh), where get_model() picks aifs3_model.AIFS3Model -- see
   # config_test_aifs3.yml. The envs are NOT
   # co-installed (see integrate_multiple_backends.md), so backends not selected here don't need
   # to be importable at all in the env you actually run with.
-  model_backend: fcn3  # or: aifs, aurora, ace2, sfno
+  model_backend: fcn3  # or: aifs, aurora, ace2, sfno, ngcm
 
   # get_input() always builds the very first initial condition from an
   # ERA5 forecast `nhrs_back` hours before `sdate`, fetched via CDS -- see
@@ -68,6 +70,42 @@ exp:
   exp_name: 'test_v1' # data is saved in this subdirectory
 
   # --- path_model / model_backend-specific checkpoint keys ---
+  # NGCM (JAX, run_ngcm.sh; integrate_jax_backend.md): no path_model. An
+  # ngcm-train run dir and checkpoint step, its data store (ICs, forcings
+  # and z500 truth are read from it directly), and the ngcm-train checkout:
+  #   ngcm_exp: '/scratch4/BMC/gsienkf/whitaker/ngcm_runs/r72_top150'
+  #   ngcm_step: 51660
+  #   ngcm_data: '/scratch4/BMC/gsienkf/whitaker/ngcm_data/era5_ace2l32_tl63'
+  #   ngcm_train_path: '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'
+  #   ngcm_use_ema: True
+  # ngcm_state_scales ({family: factor}; the optimizer works on factor *
+  # state): default {vorticity: 6857, divergence: 6857,
+  # hybrid_specific_humidity: 1e5, specific_total_condensate: 1e5}, i.e.
+  # the original NeuralGCM runs' {specific_humidity: 1e5} in NeuralGCM's
+  # nondimensional units.
+  # Official NeuralGCM (JAX, run_ngcm.sh, model_backend: neuralgcm;
+  # integrate_jax_backend.md): a PressureLevelModel pickle and the per-time
+  # ERA5 input netCDFs (ICs, forcings, verification); ps_operator must be
+  # 'logpinterp'. neuralgcm_state_scales default
+  # {tracer_specific_humidity: 1e5}; tracers not named there are frozen.
+  #   neuralgcm_checkpoint: '.../models/deterministic_2_8_deg.pkl'
+  #   neuralgcm_input_dir: '.../input/2015'
+  # GraphCast (JAX via backends/jax_bridge.py; graphcast-torch env,
+  # run_graphcast.sh): GraphCast_small (1 deg, 13 levels, 6 h step), the
+  # model of lw4dvar-jax's graphcast backend. graphcast_input_dir holds that
+  # repo's per-time ERA5 netCDFs (YYYY-MM-DDTHH.nc, 6-hourly: ICs at t and
+  # t - 6 h, z500 truth, orography); graphcast_stats_dir its
+  # {mean,stddev,diffs_stddev}_by_level.nc. The control is the t slice of
+  # the state at window start (dt_verif 6), increment = latent x
+  # stddev_by_level, the t - 6 h slice held at the background; ps_operator
+  # must be 'logpinterp'; jc_ps_weight uses mean sea-level pressure.
+  # graphcast_frozen (default [specific_humidity]): target variables left
+  # at the background (unconstrained q steps made the loss NaN in
+  # lw4dvar-jax). No jb_samples yet.
+  #   graphcast_checkpoint: '.../models/graphcast_small.npz'
+  #   graphcast_stats_dir: '.../stats'
+  #   graphcast_input_dir: '.../input/2015-gc'
+  #   graphcast_frozen: [specific_humidity]
   # AIFS: path_model is the DIRECTORY containing the checkpoint; the
   # checkpoint's own filename is given separately via model_name.
   #   path_model: './backends/aifs/aifs-single-2.0/'
@@ -155,7 +193,7 @@ exp:
   # kappa = n_points / (s^2 * N_obs).)
   #jc_ps_weight: 30.
   # jb_samples: optional background term Jb with a static-ensemble latent B
-  # (ACE2 only so far; latent_b.EnsembleB). The file holds N latent
+  # (ace2, ngcm, neuralgcm; latent_b.EnsembleB). The file holds N latent
   # background-error samples (z(ERA5) - z(cycled background) at the
   # increment's injection point, mean removed), built offline from a cycled
   # run by diagnostics/build_latent_ens_b.py (~8 GB for 161 samples); the run
@@ -169,13 +207,29 @@ exp:
   # prior, so learn_rate is in different units than without Jb (retune).
   # Leave jc_ps_weight off with Jb: the sampled B already carries the
   # (geostrophic) mass-wind balance the tendency penalty was standing in for.
+  # ngcm / neuralgcm (spectral states): samples by the NMC method instead,
+  # x(t | ERA5 at t-36h) - x(t | ERA5 at t-12h) (the default; 12h-6h
+  # differences are ~2.5x smaller in variance and their single-ob
+  # increments are unbalanced and lose ~60% of their ps within 6 h --
+  # diagnostics/check_jax_nmc_b.py), built by
+  # diagnostics/build_jax_nmc_b.py in latent units (state_scales applied)
+  # on the Gaussian grid; the solver maps B's grid-point output back to the
+  # spectral latent with the model's SHT (model.latent_from_grid). The file
+  # is tied to the checkpoint and to state_scales.
   #jb_samples: './output/latent_b/ace2_jc25_ens_samples.pt'
   # jb_loc_km: Gaussian localization scale (km; correlation exp(-d^2/(2 loc^2)),
   # 0.25 at d ~ 1.7 loc). Default 1500. A runtime parameter -- no need to
   # rebuild the samples to change it.
   #jb_loc_km: 1500.
-  # jb_weight: multiplies Jb (default 1; > 1 tightens the prior).
+  # jb_weight: multiplies Jb (default 1; > 1 tightens the prior). At the
+  # minimum this is B / jb_weight, but with a fixed number of Adam steps it
+  # does not change the per-step increment size (Adam's step in v is ~lr).
   #jb_weight: 1.
+  # jb_inflation: multiplies B (samples by its square root; default 1).
+  # Changes the prior AND makes each Adam step's increment sqrt(c) larger --
+  # B x c at learn_rate lr takes the same-size steps as B x 1 at
+  # sqrt(c) * lr, with a weaker prior.
+  #jb_inflation: 1.
   # obs_density_box_deg (degrees): optional observation-density weighting of
   # Jo, giving more weight to obs in sparsely observed regions (SH, oceans).
   # At each obs time the used obs are binned into box x box degree lat-lon

@@ -32,6 +32,12 @@ ERA5 -- see integrate_multiple_backends.md's ACE2 section), and truth is the ERA
 to ACE2's F90 grid by `backends/ace2/ace2_ic.py --verif` (`load_verif`,
 default cache `./ic_cache_ace2/`). Same row-major (lat, lon) flattening as
 the saved file's `values` dimension, so no regridding here either.
+
+NeuralGCM output (`model_backend: neuralgcm`, detected from its 128x64
+grid) is saved every model step (1 h); truth is the ERA5 z500 in the
+backend's own 6-hourly per-time input files (`neuralgcm_input_dir`, the
+default cache dir; same latitude-major order as `read_verif`), so only the
+6-hourly lead times are scored.
 """
 
 import glob
@@ -59,8 +65,13 @@ def _backend_module(backend, name):
 
 _FCN3_ERA5_CACHE = '/scratch4/BMC/gsienkf/Jeffrey.Whitaker/long-window-4dvar-fcstnetv3/ic_cache/'
 DEFAULT_CACHE_DIR = {'aifs': './ic_cache/', 'ace2': './ic_cache_ace2/',
-                     'fcn3': _FCN3_ERA5_CACHE, 'sfno': _FCN3_ERA5_CACHE}
-BACKEND_NAMES = {'aifs': 'AIFS', 'ace2': 'ACE2-ERA5 (own h500)', 'fcn3': 'FCN3', 'sfno': 'SFNO-73ch'}
+                     'fcn3': _FCN3_ERA5_CACHE, 'sfno': _FCN3_ERA5_CACHE,
+                     'neuralgcm': '/scratch4/BMC/gsienkf/whitaker/long-window-4dvar-psobs/input/2015/'}
+BACKEND_NAMES = {'aifs': 'AIFS', 'ace2': 'ACE2-ERA5 (own h500)', 'fcn3': 'FCN3', 'sfno': 'SFNO-73ch',
+                 'neuralgcm': 'NeuralGCM-2.8'}
+# hours between saved trajectory times (every backend's native 6 h step, but
+# NeuralGCM's trajectory is saved every 1 h model step)
+STEP_HOURS = {'neuralgcm': 1}
 
 GRAV = 9.80665
 _DATE_RE = re.compile(r'^(\d{4}-\d{2}-\d{2}T\d{2})_control_forecast_(.+)\.nc$')
@@ -118,12 +129,22 @@ _verif_cache = {}
 def get_z500_truth(date_str, cache_dir, backend='aifs'):
     """ERA5 z (geopotential, m^2/s^2) at 500 hPa, raw (n_points,) array
     already on the model's native grid (see module docstring). Cached
-    in-process since the same valid date is shared by many cycles/lead-times."""
+    in-process since the same valid date is shared by many cycles/lead-times.
+    None for a NeuralGCM lead time between its 6-hourly truth files."""
     key = (backend, date_str)
     if key not in _verif_cache:
         date_dt = datetime.strptime(date_str, '%Y-%m-%dT%H')
         try:
-            if backend == 'ace2':
+            if backend == 'neuralgcm':
+                if date_dt.hour % 6:
+                    return None
+                path = os.path.join(cache_dir, date_str + '.nc')
+                if not os.path.exists(path):
+                    raise FileNotFoundError(path)
+                with xr.open_dataset(path) as ds_in:
+                    z = ds_in['geopotential'].isel(time=0).sel(level=500).transpose('latitude', 'longitude')
+                    _verif_cache[key] = np.asarray(z.values, dtype=np.float64).reshape(-1)
+            elif backend == 'ace2':
                 truth = _backend_module('ace2', 'ace2_ic').load_verif(date_dt, cache_dir)
                 _verif_cache[key] = GRAV * np.asarray(truth['h500'], dtype=np.float64).reshape(-1)
             elif backend in ('fcn3', 'sfno'):
@@ -154,12 +175,16 @@ def get_z500_truth(date_str, cache_dir, backend='aifs'):
 def detect_backend(nc_path):
     """Backend that wrote a saved forecast, from its contents: ACE2 carries its
     own h500 output; the 721x1440 makani grid (1038240 points) is FCN3, or SFNO
-    if it also has native 'sp'; AIFS's N320 grid has 542080 points. Aurora
-    (720x1440) is not supported here yet."""
+    if it also has native 'sp'; AIFS's N320 grid has 542080 points;
+    NeuralGCM-2.8's 128x64 Gaussian grid 8192 (the `ngcm` backend's TL63 grid
+    is the same, but its truth source differs and it is not supported here
+    yet). Aurora (720x1440) is not supported here yet."""
     with xr.open_dataset(nc_path) as ds:
         n = ds.sizes.get('values')
         if 'h500' in ds.data_vars:
             return 'ace2'
+        if n == 128 * 64:
+            return 'neuralgcm'
         if n == 721 * 1440:
             return 'sfno' if 'sp' in ds.data_vars else 'fcn3'
         if n == 720 * 1440:
@@ -190,12 +215,14 @@ def z500_error_curve(nc_path, cache_dir, backend='aifs'):
     masks = region_masks(lats)
     z500 = _model_z500(ds, backend)  # (time, values)
     ntime = z500.shape[0]
-    lead_hours = np.arange(ntime) * 6  # every backend's native 6h timestep
+    lead_hours = np.arange(ntime) * STEP_HOURS.get(backend, 6)
     errs = {r: np.full(ntime, np.nan) for r in masks}
     n_diverged = 0
     for t in range(ntime):
         vdate = add_hours(start_date, lead_hours[t])
         truth = get_z500_truth(vdate, cache_dir, backend)
+        if truth is None:  # no truth at this lead time (NeuralGCM, off 6-hourly)
+            continue
         diff = (z500[t] - truth) / GRAV
         if np.isnan(diff).all():
             n_diverged += 1
@@ -298,14 +325,18 @@ if __name__ == '__main__':
     # Optional `--cache_dir=DIR` overrides the per-backend default
     # (./ic_cache/ for AIFS, ./ic_cache_ace2/ for ACE2).
     # Optional `--suffix=120h_100it` keeps only that run's files.
+    # Optional `--out=FILE.png` (default z500err_window.png).
     cache_dir = None
     suffix = None
+    out = 'z500err_window.png'
     args = []
     for arg in sys.argv[1:]:
         if arg.startswith('--cache_dir='):
             cache_dir = arg.split('=', 1)[1]
         elif arg.startswith('--suffix='):
             suffix = arg.split('=', 1)[1]
+        elif arg.startswith('--out='):
+            out = arg.split('=', 1)[1]
         else:
             args.append(arg)
     if args:
@@ -353,5 +384,5 @@ if __name__ == '__main__':
     fig.suptitle('Z500 error growth within window, averaged across DA cycles ('
                  + ', '.join(BACKEND_NAMES[b] for b in sorted(backends_seen) or ['aifs']) + ')')
     fig.tight_layout()
-    fig.savefig('z500err_window.png')
-    print('wrote z500err_window.png' if any_data else 'wrote z500err_window.png (empty -- no complete cycles yet)')
+    fig.savefig(out)
+    print(f'wrote {out}' if any_data else f'wrote {out} (empty -- no complete cycles yet)')
