@@ -5,7 +5,7 @@ and CI (`.github/workflows/check.yml`) runs the same target on every pull
 request and push to `main`. Don't skip or loosen a test to get it green.
 
 ```
-python -m venv .venv-ci && .venv-ci/bin/pip install -r requirements-ci.txt
+python -m venv .venv-ci && .venv-ci/bin/pip install -r envs/requirements-ci.txt
 make check PYTHON=.venv-ci/bin/python
 ```
 
@@ -23,18 +23,22 @@ network access, in a few seconds. `make check` runs:
   (`get_surface_pressure`, `preduce`), the horizontal interpolators
   (`backends/{fcn3,ace2,aifs}/*_grid.py`, and `get_grid_interpolator`'s
   choice among them), the obs-density Jo weights, the
-  control-variable mask, config validation (every tracked `config_test_*.yml`
-  and `config.yml.template` must load) and the date helpers. Each test checks
-  against an independent reference (exact spherical areas, an isothermal
-  atmosphere, weights computed by hand), not a copy of the code under test.
+  control-variable mask, the parquet ps-obs reader (`src/psobs_parquet.py`,
+  `tests/unit/test_psobs_parquet.py`, against tiny hand-crafted archives, not
+  `tests/data/mini_ace2`'s fixture), config validation (every tracked
+  `config_test_*.yml` and `config.yml.template` must load) and the date
+  helpers. Each test checks against an independent reference (exact
+  spherical areas, an isothermal atmosphere, weights computed by hand, a
+  known-by-construction parquet table), not a copy of the code under test.
 
 - `tests/ace2/` (marker `ace2`, `make check-ace2`, CI job `ace2-mini`): the
   solver end to end with a real, tiny model -- the mini ACE2 (2.5 deg,
   16-layer CRTM+land variables, SFNO embed_dim 64) on CPU, one 24 h window of
-  ps obs, 50 epochs through `long_window_4dvar.py`. Checks that it runs,
-  writes its outputs, and that the cost falls by at least 40% (observed 59%);
-  not analysis quality (the model is far too small). About a minute of
-  compute. Needs fme: `pip install -r requirements-ci-ace2.txt`.
+  ps obs (synthetic parquet psobs, see "Fixtures" below), 50 epochs through
+  `long_window_4dvar.py`. Checks that it runs, writes its outputs, and that
+  the cost falls by at least 40% (observed 55%); not analysis quality (the
+  model is far too small). About a minute and a half of compute. Needs fme
+  and pyarrow: `pip install -r envs/requirements-ci-ace2.txt`.
 
 ## Fixtures
 
@@ -46,6 +50,14 @@ Tests find it at `$LW4DVAR_MINI_ACE2_CKPT`, else in `$LW4DVAR_FIXTURE_CACHE`
 (default `~/.cache/lw4dvar`), else download it there; CI caches it under its
 sha256. A new checkpoint goes into a new release, never over an old asset,
 so older commits keep testing against the file they pinned.
+
+`data/mini_ace2/psobs/` is the one exception to "rebuilt on Ursa": it's a
+synthetic normalized-PREPBUFR-parquet archive (the schema
+`src/psobs_parquet.py`/`src/prepbufr_parquet_common.py` read -- see
+`docs/integrate_multiple_parquetobs.md`), generated entirely in-process by
+`tests/make_fixtures.py`'s `_write_psobs_parquet` (fixed seed, no real obs
+archive needed), so it rebuilds anywhere `pip install pyarrow` reaches,
+including a laptop.
 
 Still to come (issue #20): a CPU toy backend with a one-window smoke run,
 the math gates (gradients vs finite differences, Taylor and adjoint

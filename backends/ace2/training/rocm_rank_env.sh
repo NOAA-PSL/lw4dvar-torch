@@ -1,5 +1,5 @@
 #!/bin/bash
-# torchrun --no-python entry point for ROCm runs (run_ace2_train_mi300x.sh):
+# torchrun --no-python entry point for ROCm runs (slurm/run_ace2_train_mi300x.sh):
 # gives each rank its own MIOpen user DB and kernel cache on node-local /tmp,
 # then runs "python $@". fme turns on cudnn.benchmark, i.e. MIOpen's
 # exhaustive convolution search, and all ranks writing one shared (sqlite)

@@ -1,14 +1,14 @@
 """
 Warm the ERA5 IC/verification cache (aurora_ic.py) for a planned
 long_window_4dvar.py run, BEFORE submitting the job to the (offline) H100
-partition via run_aurora.sh.
+partition via slurm/run_aurora.sh.
 
 get_input()/get_verif() fetch from CDS (needs internet); the H100 compute
 nodes have none. Run this from a login node first:
 
     conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/aurora
     python -u backends/aurora/aurora_prefetch_ic.py
-    sbatch run_aurora.sh
+    sbatch slurm/run_aurora.sh
 
 Fetches, in order:
   - (non-restart only) the initial "nhrs_back"-hours-before-sdate LAGGED
@@ -56,7 +56,7 @@ from datetime import datetime, timezone
 # fcn3_prefetch_ic.py now that they've been copied into backends/{aifs,
 # fcn3}/ instead of living at the repo root as in their single-backend
 # source repos).
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 import aurora_ic
 import long_window_4dvar_utils as utils

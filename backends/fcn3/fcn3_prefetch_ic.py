@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 # scripts, and a sys.path bug they share"). Didn't exist in the original
 # single-backend repo, where this script lived at the repo root alongside
 # long_window_4dvar_utils.py itself.
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'src')))
 
 import fcn3_ic
 import long_window_4dvar_utils as utils

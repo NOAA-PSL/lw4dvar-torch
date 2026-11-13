@@ -13,6 +13,6 @@ test:
 	$(PYTHON) -m pytest -m "not gpu and not ace2"
 
 # The mini-ACE2 solver smoke test (tests/ace2/): needs fme
-# (requirements-ci-ace2.txt) and downloads its checkpoint on first use.
+# (envs/requirements-ci-ace2.txt) and downloads its checkpoint on first use.
 check-ace2:
 	$(PYTHON) -m pytest -m ace2

@@ -1,0 +1,55 @@
+# Official NeuralGCM-2.8 (deterministic_2_8_deg.pkl) behind the torch solver,
+# set up like the original JAX ps-obs runs (long-window-4dvar-psobs/config.yml,
+# test_realpsobs_3hrly_4d_2015_updateinc: cycling z500 rms ~11 m global):
+# 4-day window, 3-hourly ps obs at 3-hourly model output (1 h model step),
+# logpinterp operator, AdamW lr 1e-4 (10-epoch warmup from 1e-5, then constant), weight decay 1e-3, 50 epochs,
+# cycling every 6 h from a 48 h forecast on 2015-01-01, state_scales
+# {specific_humidity: 1e5} (the backend default), cloud ice / liquid not
+# controlled. Differences: no `lam: 20` geopotential-tendency penalty; the
+# control is an increment to the background (weight decay pulls toward it).
+exp:
+  model_backend: neuralgcm
+
+  nhrs_back: 48
+  restart: False
+  rpath: './output/neuralgcm_4d_2015/'
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      use_source_error: True # preserve the legacy .txt reader's per-ob error (parquet pressure_error_mb)
+  ic_suffix: '96h_50it'
+  sdate: '2015-01-01T00'
+  n_init: 100
+  dt_init: 6
+  save_levs: [1000, 850, 500]
+  cycle: True
+  exp_name: 'neuralgcm_4d_2015'
+
+  neuralgcm_checkpoint: '/scratch4/BMC/gsienkf/whitaker/long-window-4dvar-psobs/models/deterministic_2_8_deg.pkl'
+  neuralgcm_input_dir: '/scratch4/BMC/gsienkf/whitaker/long-window-4dvar-psobs/input/2015'
+  ngcm_train_path: '/scratch4/BMC/gsienkf/whitaker/python/ngcm-train'
+  device: 'cuda'
+  path_output: './output/'
+  print_every: 50
+  oberrstart: -1.0
+  oberrdeltaperday: 0.0
+  control_variables: [vorticity, divergence, temperature_variation, log_surface_pressure, tracer_specific_humidity]
+
+windows:
+  '4':
+    n_verif: 32
+    dt_verif: 3
+    dt_obs: 3
+    learn_rate: 1.0e-4
+    weight_decay: 1.0e-3
+    max_epoch: 50
+    # as in the original: linear warmup from lr/10 over 10 epochs, then
+    # constant (optax warmup_constant_schedule)
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 1.0
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''
