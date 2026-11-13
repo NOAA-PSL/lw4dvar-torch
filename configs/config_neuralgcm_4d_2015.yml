@@ -13,8 +13,11 @@ exp:
   nhrs_back: 48
   restart: False
   rpath: './output/neuralgcm_4d_2015/'
-  obspath: '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs'
-  nobs_max: 15000
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      use_source_error: True # preserve the legacy .txt reader's per-ob error (parquet pressure_error_mb)
   ic_suffix: '96h_50it'
   sdate: '2015-01-01T00'
   n_init: 100

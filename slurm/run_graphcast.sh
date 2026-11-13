@@ -28,5 +28,5 @@ export XLA_PYTHON_CLIENT_PREALLOCATE=false
 if [[ "${1:-}" == *.py ]]; then
   python -u -W ignore::DeprecationWarning "$@"
 else
-  python -u -W ignore::DeprecationWarning long_window_4dvar.py ${1:-config_test_graphcast.yml}
+  python -u -W ignore::DeprecationWarning src/long_window_4dvar.py ${1:-configs/config_test_graphcast.yml}
 fi
