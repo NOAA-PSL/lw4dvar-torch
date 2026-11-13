@@ -12,8 +12,8 @@
 #SBATCH -t 24:00:00
 
 # Warms ic_cache_aifs2-1.0deg-v1.0/ (backends/aifs/aifs_ic.py) for
-# config_test_aifs2-1.0deg-v1.0.yml, BEFORE submitting
-# run_aifs2-1.0deg-v1.0.sh -- the H100 partition that job runs on has no
+# configs/config_test_aifs2-1.0deg-v1.0.yml, BEFORE submitting
+# slurm/run_aifs2-1.0deg-v1.0.sh -- the H100 partition that job runs on has no
 # internet (see CLAUDE.md), so the CDS/ERA5 fetch has to happen here first.
 #
 # u1-service (not the GPU partition), because this is network-bound (CDS

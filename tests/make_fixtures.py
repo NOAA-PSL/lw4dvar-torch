@@ -12,7 +12,11 @@ one 24 h window from 2015-01-02T00 with a 6 h spin-up, on the 2.5 deg
       steps through (2015-01-01T18 .. 2015-01-03T00), ACE2Model's layout
   data/mini_ace2/ic_cache/ace2_ic_2015010118.nc  the initial state
   data/mini_ace2/ic_cache/ace2_verif_*.nc  h500/TMP850 truth (the dataset's own)
-  data/mini_ace2/psobs/psobs1_*.txt  2000 ps obs per time (fixed seed)
+  data/mini_ace2/psobs/<YYYY-MM-DD>/<HH>/{reports,levels}/{ADPSFC,SFCSHP}/
+      part-00000.parquet  a synthetic normalized-PREPBUFR-parquet archive
+      (see src/psobs_parquet.py/docs/integrate_multiple_parquetobs.md for the schema),
+      ~2000 ps obs per cycle, globally scattered, fixed seed -- entirely
+      generated in-process, no real obs archive needed to rebuild this fixture
   data/mini_ace2/manifest.json  provenance and the checkpoint asset's sha256
 --weights_out writes the weights-only checkpoint (the `stepper` config,
 dataset_info and step state; no training history). torch.save is not
@@ -43,7 +47,6 @@ MINI_ACE2 = {
     'checkpoint': '/scratch4/BMC/gsienkf/whitaker/ace2_training/mini-ace2-crtm-land-16layer-2p5deg-e64-l8/'
                   'training_checkpoints/best_inference_ckpt.tar',
     'dataset': '/scratch4/BMC/gsienkf/whitaker/ace2_era5_2p5deg_16layer',
-    'obspath': '/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs',
     'asset_name': 'mini-ace2-crtm-land-16layer-2p5deg-e64-l8.tar',
     'release': 'ci-fixtures-v1',
     'url': 'https://github.com/NOAA-PSL/lw4dvar-torch/releases/download/ci-fixtures-v1/'
@@ -75,6 +78,47 @@ def strip_checkpoint(src, dst):
 
     st = torch.load(src, map_location='cpu', weights_only=False)['stepper']
     torch.save({'stepper': {k: st[k] for k in ('config', 'dataset_info', 'step')}}, dst)
+
+
+def _write_psobs_parquet(root, cycle_times, rng, nobs):
+    """Write a synthetic normalized-PREPBUFR-parquet archive (the schema
+    src/psobs_parquet.py/src/prepbufr_parquet_common.py read) under `root`, one
+    cycle directory per entry in `cycle_times` (each must land exactly on a
+    6-hourly boundary -- every synthetic report's observation_time equals
+    the cycle time exactly, so get_psobs's default 0.5h time_tolerance_hours
+    never needs a neighboring cycle directory). `nobs` globally-scattered,
+    fixed-seed reports per cycle, split evenly across the two classes
+    get_psobs reads by default (ADPSFC report_type 181, SFCSHP 180) -- only
+    the columns src/psobs_parquet.py actually requests are written."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    classes = {'ADPSFC': 181, 'SFCSHP': 180}
+    n_each = nobs // len(classes)
+    for t in cycle_times:
+        cycle_dir = os.path.join(root, f'{t:%Y-%m-%d}', f'{t:%H}')
+        for cls, report_type in classes.items():
+            report_id = np.arange(n_each, dtype=np.int64)
+            reports = pa.table({
+                'report_id': pa.array(report_id),
+                'observation_time': pa.array([t] * n_each, type=pa.timestamp('s')),
+                'station_id': pa.array([f'{cls[:2]}{i:06d}' for i in report_id]),
+                'latitude': pa.array(rng.uniform(-80., 80., n_each)),
+                'longitude': pa.array(rng.uniform(0., 360., n_each)),
+                'elevation_m': pa.array(rng.uniform(0., 500., n_each)),
+                'report_type': pa.array(np.full(n_each, report_type, dtype=np.int32)),
+            })
+            levels = pa.table({
+                'report_id': pa.array(report_id),
+                'level_index': pa.array(np.zeros(n_each, dtype=np.int32)),
+                'pressure_mb': pa.array(1013. + rng.normal(0., 4., n_each)),
+                'pressure_quality': pa.array(rng.integers(0, 4, n_each).astype(np.float64)),
+                'pressure_error_mb': pa.array(np.clip(rng.normal(0.5, 0.15, n_each), 0.2, None)),
+            })
+            for table_name, table in (('reports', reports), ('levels', levels)):
+                out_path = os.path.join(cycle_dir, table_name, cls, 'part-00000.parquet')
+                os.makedirs(os.path.dirname(out_path), exist_ok=True)
+                pq.write_table(table, out_path)
 
 
 def mini_ace2(args):
@@ -118,14 +162,9 @@ def mini_ace2(args):
         v.to_netcdf(os.path.join(idir, f'ace2_verif_{t:%Y%m%d%H}.nc'), encoding=_zlib(v))
 
     rng = np.random.default_rng(c['seed'])
-    for t in window:
-        with open(os.path.join(c['obspath'], f'psobs1_{t:%Y%m%d%H}.txt')) as fh:
-            lines = fh.readlines()
-        keep = np.sort(rng.choice(len(lines), min(c['nobs'], len(lines)), replace=False))
-        with open(os.path.join(odir, f'psobs1_{t:%Y%m%d%H}.txt'), 'w') as fh:
-            fh.writelines(lines[i] for i in keep)
+    _write_psobs_parquet(odir, window, rng, c['nobs'])
 
-    manifest = {k: c[k] for k in ('sdate', 'spinup_h', 'window_h', 'nobs', 'seed', 'dataset', 'obspath')}
+    manifest = {k: c[k] for k in ('sdate', 'spinup_h', 'window_h', 'nobs', 'seed', 'dataset')}
     manifest['checkpoint'] = {'source': c['checkpoint'], 'release': c['release'], 'name': c['asset_name'], 'url': c['url']}
     if args.weights_out:
         strip_checkpoint(c['checkpoint'], args.weights_out)

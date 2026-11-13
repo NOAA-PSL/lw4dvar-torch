@@ -43,7 +43,7 @@ import torch
 import xarray as xr
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, _REPO)
+sys.path.insert(0, os.path.join(_REPO, 'src'))
 import long_window_4dvar_utils as utils  # noqa: E402
 
 utils._ensure_backend_on_path('ace2')

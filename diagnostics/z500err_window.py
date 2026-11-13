@@ -99,8 +99,9 @@ def region_masks(lats):
     # exact grid-cell areas (forecast_model.area_weights_from_lats) -- the same
     # weights the driver's printz500err uses; cos(lat) per point was wrong
     # for AIFS's reduced octahedral grid
-    if _REPO_ROOT not in sys.path:
-        sys.path.insert(0, _REPO_ROOT)
+    src_dir = os.path.join(_REPO_ROOT, 'src')
+    if src_dir not in sys.path:
+        sys.path.insert(0, src_dir)
     from forecast_model import area_weights_from_lats
     w = area_weights_from_lats(lats)
     return {
