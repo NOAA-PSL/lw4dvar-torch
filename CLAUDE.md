@@ -69,6 +69,7 @@ documented in `config.yml.template`.
 | `ace2-training.md` | training our own ACE2 checkpoint: building the training dataset from public ARCO-ERA5 (`backends/ace2/ace2_dataset.py`, `run_ace2_dataset_polaris.sh`), CO2, normalization stats, training configs and `run_ace2_train_polaris.sh` (fme, the checkpointing workaround `fme_train.py`), adding vertical layers for radiances |
 | `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics, the AIFS dry-air mass fixer (`dry_mass_fixer`)|
 | `integrate_jax_backend.md` | the torch/JAX bridge (`backends/jax_bridge.py`), the `ngcm`, `neuralgcm` and `graphcast` backends, the `ngcm-torch` and `graphcast-torch` envs, `backends/hybrid_levels.py` |
+| `jedi_ufo_observations.md` | JEDI UFO observation processing (QC, thinning, obs errors) and satellite radiances with `crtm-torch`: the plan and phases, data sources (NNJA BUFR, GEFSv13-replay GSI diags), the JEDI builds on Ursa, validation against GSI (branch `jediufo`, issue #25) |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.
