@@ -6,7 +6,7 @@ Read this when working on: where a file should live in this repo, why
 paths, or anything that looks like a stale path reference to a file that
 used to live at the repo root.
 
-## Status: done, not yet committed (2026-11-10)
+## Status: done, committed, merged with main's jax-backend work (2026-11-13)
 
 The repo root held ~64 non-directory entries -- 20 env/requirement files, 16
 SLURM/PBS job scripts, 10 config files, 4 long-form docs, and only 6 actual
@@ -159,6 +159,66 @@ a meaningfully riskier class of operation than anything else in this
 reorg, for a repo where other people/processes may have their own
 checkouts. Scoped down to "6 loose files only, `backends/`/`diagnostics/`
 untouched" instead.
+
+## Follow-up: merging main's jax-backend work (2026-11-13)
+
+This reorg landed on `add-parquet-ps-dev` as a single squashed commit
+(`69ed2ce`, alongside the parquet ps-obs work -- see
+`docs/integrate_multiple_parquetobs.md`), pushed, and opened as PR #26.
+`main` had moved 11 commits ahead in the meantime (PR #22,
+`jax-backend`: the `ngcm`/`neuralgcm`/`graphcast` backends, predating this
+reorg). Merging `origin/main` in (`git merge-tree` dry run first, then a
+real merge, commit `d8a1983`) found only 2 real conflicts, both narrow
+textual overlaps on lines both branches happened to touch for unrelated
+reasons -- not a logical clash -- and auto-merged `configs/config.yml.template`,
+`diagnostics/z500err_window.py`, `tests/unit/test_config.py` cleanly on
+its own:
+
+- **`CLAUDE.md`**: 3 hunks (intro backend list, conda-env launcher bullet,
+  task-docs table) -- this branch re-pathed the existing rows into
+  `src/`/`configs/`/`docs/`/`slurm/` and added 2 new doc rows; `main` added
+  the `ngcm`/`neuralgcm`/`graphcast` backends and 1 new doc row
+  (`integrate_jax_backend.md`). Resolved by keeping both sides' additions
+  and re-pathing `main`'s new doc row to `docs/integrate_jax_backend.md`
+  for consistency with the rest of the table.
+- **`src/long_window_4dvar_utils.py`**: 1 hunk, 1 line -- the
+  `model_backend` validation error message, where this branch's
+  `config.yml.template` -> `configs/config.yml.template` path fix and
+  `main`'s expanded allowed-backend list landed on the same f-string line.
+  (The `if backend not in (...)` tuple check itself, one line above,
+  auto-merged with no conflict since only `main` touched it.)
+
+**A real bug the merge surfaced, not just a conflict**: `main`'s
+jax-backend work predates this reorg, so its 7 new root-level files landed
+back at the flat repo root after the merge -- `config_neuralgcm_4d_2015.yml`,
+`config_ngcm_4d_2015.yml`, `config_test_graphcast.yml`, `config_test_ngcm.yml`,
+`integrate_jax_backend.md`, `run_graphcast.sh`, `run_ngcm.sh`. Git doesn't
+flag this as a conflict (no shared history to diff against), so it's easy
+to miss. Worse than cosmetic: `tests/unit/test_config.py`'s `TRACKED_CONFIGS`
+glob only looks under `configs/config_test_*.yml`, so
+`config_test_graphcast.yml`/`config_test_ngcm.yml` were silently excluded
+from the "every tracked config must load" test -- and when actually
+loaded (`.venv-ci` + `load_config()`), all 4 new configs failed outright:
+they still used the pre-parquet-migration flat `obspath` key, which this
+branch's `_resolve_observations_config` has no fallback for anymore (see
+`docs/integrate_multiple_parquetobs.md`). Fixed in a follow-up commit
+(`a8a3798`): `git mv` all 7 files into `configs/`/`docs/`/`slurm/`,
+migrated all 4 configs to the `observations.psobs` schema (same pattern as
+every other tracked config), and fixed `run_ngcm.sh`/`run_graphcast.sh`'s
+own solver-invocation line (`long_window_4dvar.py` -> `src/long_window_4dvar.py`,
+default config -> `configs/config_test_*.yml`) -- their narrative comments
+(`sbatch run_ngcm.sh ...` usage examples in docstrings elsewhere) were left
+bare, same "historical prose, not copy-paste commands" convention as
+`integrate_multiple_backends.md` etc. above. `make check` went from 117 to
+119 passed (the 2 newly-relocated configs are now actually exercised).
+
+**Lesson for next time**: after merging in a sibling branch that predates
+this kind of reorg, explicitly diff the new-file list against the merge
+base (`git diff --diff-filter=A --name-only <merge-base> <other-branch>`)
+and check which of those look like they belong in `configs/`/`docs/`/`envs/`/`slurm/`
+by naming convention -- git's conflict detection has nothing to say about
+files only one side added, so this class of issue is silent by
+construction.
 
 ## Verification
 
