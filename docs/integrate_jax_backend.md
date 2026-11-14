@@ -119,7 +119,8 @@ terrax's `InferenceModel` (assimilate / advance / observe).
   (long-window-4dvar-psobs/config.yml): 4-day window, 3-hourly obs
   (dt_verif 6, dt_obs 3: the model step is 6 h), lr 1e-4 constant, weight
   decay 1e-3, 50 epochs, 100 cycles from 2015-01-01. Its `lam: 20`
-  geopotential-tendency penalty has no counterpart (off).
+  geopotential-tendency penalty is `jc_z_weight` (off in this config; see
+  below).
 
 ## The official NeuralGCM backend (`backends/neuralgcm/`, `model_backend: neuralgcm`, 2026-11-05)
 
@@ -173,8 +174,28 @@ Analyses are 3-7 m worse than the original's (global 16.9, 13.1, 12.5, 11.9
 vs ~10.2, 9.0, 9.1, 9.1 m), narrowing each cycle. Known differences: the
 original's `lam: 20` penalty on the first-step (1 h) geopotential tendency
 at all levels (normalized per level by its spatial std, times N_obs) has no
-counterpart here; and this solver reports the analysis at window start +
-dt_verif (+3 h), the original at the window start.
+counterpart here (now `jc_z_weight`, below); and this solver reported the
+analysis at window start + dt_verif (+3 h), the original at the window
+start. Since the window-start increments (`increment_at_start`, 2026-11-06)
+the analysis is valid at window start here too.
+
+Geopotential-tendency penalty (`jc_z_weight`, 2026-11-14). The original's
+`lam`, ported:
+
+    Jz = lam * N_obs * grid mean of level mean of (dz_k / zstd_k)^2
+
+dz_k is the analysis z change on pressure level k over the first model step
+after the increment (steps 0 -> 1 with `increment_at_start`, 1 h for
+neuralgcm), zstd_k the spatial std of the analysis z on level k (same
+weights), N_obs the obs available in the window. Unlike `jc_ps_weight` it
+penalizes the analysis' whole tendency, not the change of the increment.
+`jc_z_mean: area` (default) is the original's August 2026 form (cos lat
+weights); `uniform` is its July 2026 form, used for the GRL paper runs
+(`test_realpsobs_3hrly_4d_2015`, which also normalized by the ERA5 z std at
+window start rather than the analysis'). Needs decoded 'z' on pressure
+levels. Check: the original August code's first cycle printed epoch-1
+Jt = 325.95 before the factor lam (Jt = 4983.65 including lam = 20 in the
+July form).
 
 `jc_ps_weight` sweep (2026-11-05, 4 cycles, `logs/neuralgcm_jc{30,300,3000}_*.out`).
 Global z500 analysis rms, cycles 1-4:

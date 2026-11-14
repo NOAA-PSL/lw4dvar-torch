@@ -192,6 +192,22 @@ exp:
   # unless set. (Replaces the removed jc_ps_sigma: sigma = s corresponds to
   # kappa = n_points / (s^2 * N_obs).)
   #jc_ps_weight: 30.
+  # jc_z_weight (lam, dimensionless): optional penalty on the analysis' TOTAL
+  # geopotential tendency over the first model step after injection, the
+  # original JAX NeuralGCM ps-obs runs' `lam` (long-window-4dvar-psobs; 20
+  # there, with a 1 h step and 37 levels):
+  #   Jz = lam * N_obs * area-weighted grid mean of
+  #        level-mean of (dz_k / zstd_k)^2,
+  # dz_k = z change on pressure level k over that step, zstd_k = the
+  # area-weighted spatial std of the analysis z on level k. Needs decoded
+  # 'z' on pressure levels (neuralgcm, ngcm, aifs, ...). Unlike jc_ps_weight
+  # it penalizes real tendencies too, so its size depends on the model step.
+  # Can be combined with jc_ps_weight. Off unless set.
+  #jc_z_weight: 20.
+  # jc_z_mean: 'area' (default; area-weighted grid mean and per-level std,
+  # the original's later form) or 'uniform' (unweighted, as in the
+  # original's July 2026 runs used in the GRL paper).
+  #jc_z_mean: area
   # jb_samples: optional background term Jb with a static-ensemble latent B
   # (ace2, ngcm, neuralgcm; latent_b.EnsembleB). The file holds N latent
   # background-error samples (z(ERA5) - z(cycled background) at the

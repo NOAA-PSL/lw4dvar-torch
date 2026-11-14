@@ -425,6 +425,10 @@ def load_config(config_path='config.yml'):
         )
     if exp.get('jc_ps_weight') and float(exp['jc_ps_weight']) <= 0:
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
+    if exp.get('jc_z_weight') and float(exp['jc_z_weight']) <= 0:
+        raise ValueError(f"jc_z_weight must be > 0 (dimensionless), got {exp['jc_z_weight']!r}")
+    if exp.get('jc_z_mean', 'area') not in ('area', 'uniform'):
+        raise ValueError(f"jc_z_mean must be 'area' or 'uniform', got {exp['jc_z_mean']!r}")
     if exp.get('jb_samples'):
         if backend not in ('ace2', 'ngcm', 'neuralgcm'):
             raise ValueError("jb_samples (static-ensemble latent B) is only implemented for the ace2, ngcm and "
@@ -527,6 +531,9 @@ def log_window(exp, logger):
     logger.info('   checkpoint_stride: ' + str(exp.get('checkpoint_stride', 1)) + ' (1 = checkpoint every step)')
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
+    logger.info('   jc_z_weight: ' + (str(exp['jc_z_weight']) + f" (x N_obs, first-step geopotential tendency, "
+                                       f"{exp.get('jc_z_mean', 'area')} grid mean)"
+                                       if exp.get('jc_z_weight') else '(off)'))
     if exp.get('jb_samples'):
         logger.info(f"   jb_samples: {exp['jb_samples']} (static-ensemble latent B), jb_loc_km: "
                     f"{float(exp.get('jb_loc_km', 1500.0))}, jb_weight: {float(exp.get('jb_weight', 1.0))}, "
@@ -1537,9 +1544,21 @@ def _obs_density_weights(used, lat, lon, box_deg):
     return w * m.sum() / torch.clamp(w.sum(), min=1e-30)
 
 
+def _jc_z_penalty(z0, z1, w, factor):
+    """`jc_z_weight` penalty (see compute_loss_4dvar):
+    factor * sum_i w_i * mean_k ((z1 - z0)_ki / zstd_k)^2, with zstd_k the
+    w-weighted spatial std of z0 on level k. z0, z1: (n_levels, n_points)
+    (or anything reshapeable to it); w: (n_points,) summing to 1."""
+    z0 = z0.reshape(-1, w.shape[0])
+    z1 = z1.reshape(-1, w.shape[0])
+    zmean = (w * z0).sum(dim=1, keepdim=True)
+    zstd = torch.sqrt((w * (z0 - zmean) ** 2).sum(dim=1, keepdim=True))
+    return factor * (w * (((z1 - z0) / zstd) ** 2).mean(dim=0)).sum()
+
+
 def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif_ic,
                        psobs_traj, epoch, exp, grid_interp, print_every, interp_specs,
-                       keep_mask=None, ref_state1=None, jc_ref=None):
+                       keep_mask=None, ref_state1=None, jc_ref=None, jcz_ref=None):
     """Latent-space 4D-Var cost function, with sub-6h observations.
 
     `latent_increment` lives in the model's latent space -- AIFS's hidden-
@@ -1603,6 +1622,21 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     makes kappa independent of resolution; the N_obs factor keeps Jc / Jo
     roughly fixed as obs counts change.
 
+    `jcz_ref` (from `compute_optimal`, present iff `exp['jc_z_weight']` is
+    set): `(weights, factor)` -- grid weights summing to 1 (area weights, or
+    uniform with `jc_z_mean: uniform`) and factor = lam * N_obs. The original JAX NeuralGCM runs' (long-window-4dvar-psobs,
+    `lam`) penalty on the TOTAL geopotential tendency of the analysis over
+    the first model step after injection, on every pressure level of 'z':
+        Jz = lam * N_obs * sum_i weights_i * mean_k (dz_ki / zstd_k)^2,
+        dz = z(first step after injection + 1) - z(first step after injection)
+    with zstd_k the (same-weighted) spatial std of the analysis z on level k
+    at the first of those times. The original's August 2026 form uses
+    area (cos lat) weights; its July 2026 form (the GRL paper runs) a
+    uniform grid mean and the std of the ERA5 z at window start --
+    `jc_z_mean: uniform` gives that, up to analysis vs ERA5 in zstd. Unlike
+    Jc this penalizes the analysis' own tendency, not the change of the
+    increment, so real tendencies (tides, moving systems) are penalized too.
+
     Callers (`compute_optimal`) must re-prime the model's stochastic noise
     state (`model._prime_noise()`) immediately before calling this, once per
     epoch -- not once before the epoch loop -- so every epoch evaluates the
@@ -1652,6 +1686,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         return Jt
 
     jc_sp = {}
+    jcz = {}
     # increment_at_start (JAX backends: the latent is the state): the
     # increment and the control mask apply at step 0, so the window-start
     # obs and the first in-step interpolations see the corrected state.
@@ -1668,6 +1703,8 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
             )
         if jc_ref is not None:
             jc_sp[0] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
+        if jcz_ref is not None:
+            jcz[0] = model.decode_state(f_state, only=['z'])['z']
     # step 0: the uncorrected background unless increment_at_start
     decoded_prev = model.decode_state(f_state, only=loss_bases)
     for s in range(1, n_steps + 1):
@@ -1686,6 +1723,8 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         decoded_cur = model.decode_state(f_state, only=loss_bases)
         if jc_ref is not None and s in jc_steps:
             jc_sp[s] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
+        if jcz_ref is not None and s in jc_steps:
+            jcz[s] = model.decode_state(f_state, only=['z'])['z']
         for j in slots_by_step.get(s - 1, []):
             a = alpha[j]
             if a == 0.0:
@@ -1706,6 +1745,13 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         if do_print:
             rms = torch.sqrt((jc_w * delta ** 2).sum() / jc_w.sum()).item()
             print(f"epoch {epoch}, Jc = {Jc.item()} (first-step {jc_field} increment change {rms:.4f} hPa rms)")
+    if jcz_ref is not None:
+        jcz_w, jcz_factor = jcz_ref
+        Jz = _jc_z_penalty(jcz[jc_steps[0]], jcz[jc_steps[1]], jcz_w, jcz_factor)
+        J = J + Jz
+        if do_print:
+            print(f"epoch {epoch}, Jz = {Jz.item()} (first-step normalized z tendency "
+                  f"{(Jz.item() / jcz_factor) ** 0.5:.4g} rms)")
     if do_print:
         print(f"epoch {epoch}, Jtot = {J.item()}")
 
@@ -1894,6 +1940,22 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
                     f"{(model.n_points / jc_factor) ** 0.5:.4g} hPa on this grid)")
         jc_ref = (jc_field, p1, p2, jc_w, jc_factor)
 
+    # jc_z_weight (lam): the original JAX NeuralGCM runs' penalty on the
+    # analysis' first-step geopotential tendency -- see compute_loss_4dvar.
+    jcz_ref = None
+    if exp.get('jc_z_weight'):
+        if not model.is_known_variable('z'):
+            raise ValueError("jc_z_weight needs decoded geopotential 'z' on pressure levels")
+        if exp.get('jc_z_mean', 'area') == 'uniform':
+            areaw = torch.ones(model.n_points, dtype=torch.float32, device=model.device)
+        else:
+            areaw = torch.as_tensor(model.area_weights, dtype=torch.float32, device=model.device)
+        n_obs = int(psobs_traj['n_valid'].sum())
+        jcz_factor = float(exp['jc_z_weight']) * n_obs
+        logger.info(f"jc_z_weight: {exp['jc_z_weight']} x N_obs={n_obs} -- first-step geopotential "
+                    f"tendency penalty (per-level std normalized, {exp.get('jc_z_mean', 'area')} grid mean)")
+        jcz_ref = (areaw / areaw.sum(), jcz_factor)
+
     optimizer = torch.optim.AdamW([control], lr=lr, weight_decay=wd, betas=(beta1,beta2))
 
     # linear warmup/cosine decay
@@ -1957,7 +2019,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         # B works on grid-point samples; latent_from_grid is the identity
         # for grid latents (ACE2) and the model's SHT for spectral states.
         increment = control if jb_op is None else model.latent_from_grid(jb_op(control))
-        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref)
+        loss, all_loss = compute_loss_4dvar(model, increment, latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, jcz_ref)
         if jb_op is not None:
             Jb = jb_weight * control.pow(2).sum()
             if print_every > 0 and (epoch % print_every == 0 or epoch == 1):
