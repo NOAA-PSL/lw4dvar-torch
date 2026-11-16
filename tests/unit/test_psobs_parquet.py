@@ -88,6 +88,19 @@ def test_report_outside_time_tolerance_rejected(tmp_path):
     assert data['ob'][0].size == 0
 
 
+def test_off_cycle_slot_finds_report_in_earlier_cycle_partition(tmp_path):
+    # Verification slot 01Z isn't itself a 6-hourly cycle boundary, so the
+    # only partition on disk is 00Z -- but it holds a report timestamped
+    # 01Z, within the requested tolerance of the 01Z slot. cycle_directories
+    # must select the 00Z partition even though 01Z's own tolerance window
+    # (00:30-01:30) doesn't reach back to the 00Z cycle's nominal hour.
+    cycle = datetime(2015, 1, 1, 0)
+    slot = datetime(2015, 1, 1, 1)
+    write_cycle(tmp_path, cycle, [report(1, time=slot)], [level(1, pressure=1013.2)])
+    data = load(tmp_path, [slot], time_tolerance_hours=0.5)
+    assert data['ob'][0].tolist() == pytest.approx([1013.2])
+
+
 def test_report_type_filter(tmp_path):
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, report_type=120, time=t0)], [level(1)])

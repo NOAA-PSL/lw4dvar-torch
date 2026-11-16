@@ -152,7 +152,14 @@ def _ensure_backend_on_path(backend):
     `import forecast_model` / `import {aifs,fcn3,aurora}_grid` / etc.
     resolve -- idempotent, and never touches any OTHER backend's
     directory, so a process that only ever calls one backend's branch
-    never needs the other backends' dependencies importable."""
+    never needs the other backends' dependencies importable. Also keeps
+    the repo root itself on sys.path: running as
+    `python src/long_window_4dvar.py` only puts `src/` on sys.path[0],
+    but ngcm/neuralgcm/graphcast do `from backends import jax_bridge`
+    (repo-root-relative -- `backends` has no `__init__.py`, so it's
+    imported as a namespace package)."""
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
     d = os.path.join(_REPO_ROOT, 'backends', backend)
     if d not in sys.path:
         sys.path.insert(0, d)

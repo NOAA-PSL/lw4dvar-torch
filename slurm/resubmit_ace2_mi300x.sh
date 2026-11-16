@@ -30,6 +30,7 @@ SBATCH_ARGS=${SBATCH_ARGS:-}
 STATE=${LOGS}.lastjob
 STOP=${LOGS}.STOP
 
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$(dirname "$0")"
 exec 9> ${LOGS}.lock
 flock -n 9 || exit 0
@@ -55,7 +56,8 @@ if [[ -n "$last" ]]; then
 fi
 
 j=$(sbatch --parsable -t 1-00:00:00 ${SBATCH_ARGS} -o ${LOGS}_%j.out -e ${LOGS}_%j.err \
-    --export="ALL,CONFIG=${CONFIG},OVERRIDE=${OVERRIDE}" ${SCRIPT} 2>&1)
+    --chdir="${REPO_ROOT}" \
+    --export="ALL,CONFIG=${CONFIG},OVERRIDE=${OVERRIDE}" "${REPO_ROOT}/slurm/${SCRIPT}" 2>&1)
 if [[ "$j" =~ ^[0-9]+$ ]]; then
     echo $j > $STATE
     echo "$(now) ${LOGS}: previous ${last:-none} ${st:-}; submitted $j [${OVERRIDE}] ${SBATCH_ARGS} ($(grep -c 'Time taken for epoch' ${EXP}/out.log 2>/dev/null) epochs done)"

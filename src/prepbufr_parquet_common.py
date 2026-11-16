@@ -32,8 +32,35 @@ def to_datetime(value):
     return datetime.strptime(str(value), '%Y-%m-%dT%H')
 
 
+_CYCLE_SPAN = timedelta(hours=6)
+_HALF_CYCLE = timedelta(hours=3)
+
+
+def _nearest_cycle(moment, prefer):
+    """Round `moment` to the 6-hourly cycle it reports into: each cycle
+    directory holds reports from its own nominal hour +/- 3h (the
+    standard, non-overlapping PREPBUFR synoptic window), so a report
+    doesn't necessarily carry the directory's own nominal hour as its
+    timestamp (e.g. a 00Z partition can hold a report timestamped 01Z).
+    Exactly on the 3h midpoint between two cycles, breaks the tie toward
+    `prefer` -- so a query centered exactly on a cycle hour doesn't
+    spuriously pull in that cycle's neighbor."""
+    floor_cycle = moment.replace(
+        hour=(moment.hour // 6) * 6, minute=0, second=0, microsecond=0
+    )
+    offset = moment - floor_cycle
+    if offset < _HALF_CYCLE:
+        return floor_cycle
+    if offset > _HALF_CYCLE:
+        return floor_cycle + _CYCLE_SPAN
+    if prefer in (floor_cycle, floor_cycle + _CYCLE_SPAN):
+        return prefer
+    return floor_cycle + _CYCLE_SPAN
+
+
 def cycle_directories(directory, verification_times, tolerance_hours):
-    """Return the six-hourly archive cycle directories spanning the window."""
+    """Return the six-hourly archive cycle directories that can hold a
+    report within `tolerance_hours` of each verification time."""
     directory = Path(os.path.expanduser(directory)).resolve()
     if not directory.is_dir():
         raise FileNotFoundError(
@@ -43,16 +70,12 @@ def cycle_directories(directory, verification_times, tolerance_hours):
     cycles = set()
     for value in verification_times:
         center = to_datetime(value)
-        start = center - tolerance
-        end = center + tolerance
-        cycle = start.replace(
-            hour=(start.hour // 6) * 6, minute=0, second=0, microsecond=0
-        )
-        if cycle < start:
-            cycle += timedelta(hours=6)
-        while cycle <= end:
+        center_cycle = _nearest_cycle(center, None)
+        cycle = _nearest_cycle(center - tolerance, center_cycle)
+        last_cycle = _nearest_cycle(center + tolerance, center_cycle)
+        while cycle <= last_cycle:
             cycles.add(cycle)
-            cycle += timedelta(hours=6)
+            cycle += _CYCLE_SPAN
     paths = []
     for cycle in sorted(cycles):
         path = directory / cycle.strftime('%Y-%m-%d') / cycle.strftime('%H')
