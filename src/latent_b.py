@@ -20,7 +20,13 @@ diagonal B, for comparison).
 
 import numpy as np
 import torch
-import torch_harmonics as th
+
+
+def _th():
+    # imported on use: _WeightedSampleSum needs no SHT, and the CPU CI env
+    # (requirements-ci.txt) has no torch-harmonics (a source-only package)
+    import torch_harmonics
+    return torch_harmonics
 
 DEFAULT_BANDS = (0, 6, 10, 15, 20, 30, 40, 60, 90, 130)
 
@@ -50,7 +56,7 @@ class SpectralChannelB(torch.nn.Module):
         for i, (lo, hi) in enumerate(self.bands):
             band_of[lo:hi] = i
         self.register_buffer('band_of', band_of)
-        self.isht = th.InverseRealSHT(H, W, lmax=L, mmax=W // 2 + 1, grid=grid, norm='ortho').double()
+        self.isht = _th().InverseRealSHT(H, W, lmax=L, mmax=W // 2 + 1, grid=grid, norm='ortho').double()
         M = self.isht.mmax
         mask = (torch.arange(M)[None, :] <= torch.arange(L)[:, None]).double()   # (L, M)
         scale = torch.full((M,), 0.5 ** 0.5, dtype=torch.float64)
@@ -88,7 +94,7 @@ def localization_sqrt_spectrum(loc_km: float, H: int, W: int, grid: str, lmax: i
     obtained by Funk-Hecke from the orthonormal SHT of rho centred on the
     pole; truncated where it falls below `tol` of its maximum (returned
     length = the l cutoff), then renormalised to unit point variance."""
-    sht = th.RealSHT(H, W, lmax=lmax, grid=grid, norm='ortho').double()
+    sht = _th().RealSHT(H, W, lmax=lmax, grid=grid, norm='ortho').double()
     lat = torch.as_tensor(np.degrees(np.arcsin(_grid_sinlat(H, grid))), dtype=torch.float64)
     d = torch.deg2rad(90.0 - lat) * radius_km                       # distance from the north pole
     rho = torch.exp(-0.5 * (d / loc_km) ** 2)[:, None].expand(H, W).contiguous()
@@ -132,7 +138,7 @@ class EnsembleB(torch.nn.Module):
         sq = localization_sqrt_spectrum(loc_km, H, W, grid)
         Lc = sq.shape[0]
         self.register_buffer('sqrt_lam', sq)
-        self.isht = th.InverseRealSHT(H, W, lmax=Lc, mmax=Lc, grid=grid, norm='ortho').double()
+        self.isht = _th().InverseRealSHT(H, W, lmax=Lc, mmax=Lc, grid=grid, norm='ortho').double()
         mask = (torch.arange(Lc)[None, :] <= torch.arange(Lc)[:, None]).double()
         scale = torch.full((Lc,), 0.5 ** 0.5, dtype=torch.float64)
         scale[0] = 1.0
