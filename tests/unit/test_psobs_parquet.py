@@ -180,6 +180,21 @@ def test_flat_vs_source_error(tmp_path):
     assert source['oberr'][0].tolist() == pytest.approx([0.37])
 
 
+def test_nonpositive_source_error_falls_back_to_flat(tmp_path):
+    # A zero or negative pressure_error_mb would otherwise reach the Jo
+    # denominator and can produce NaN (e.g. an exact O-B match with a
+    # zero error) -- must fall back to the validated flat default, just
+    # like a non-finite source error already does.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0,
+        [report(1, time=t0), report(2, time=t0)],
+        [level(1, error=0.), level(2, error=-0.5)],
+    )
+    data = load(tmp_path, [t0], time_tolerance_hours=3., observation_error_std_hpa=2.5, use_source_error=True)
+    assert data['oberr'][0].tolist() == pytest.approx([2.5, 2.5])
+
+
 def test_missing_cycle_directory_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         load(tmp_path, [datetime(2015, 1, 1, 0)], time_tolerance_hours=3.)

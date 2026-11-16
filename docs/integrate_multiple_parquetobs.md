@@ -203,6 +203,75 @@ configs, 5h walltime instead of the original 1-day) -- was submitted
 2026-11-12 to confirm the fix end to end through the real solver path (jobs
 26262652 ace2, 26262653 aifs).
 
+## Off-cycle-hour slots and cycle-boundary duplication (found/fixed 2026-11-16)
+
+**Bug** (PR #26 review): `prepbufr_parquet_common.py`'s `cycle_directories`
+picked a cycle directory by checking whether the directory's *own nominal
+hour* fell inside `[verification_time - tolerance, verification_time +
+tolerance]`, not whether the directory could actually *contain* a report in
+that range. For any verification time that isn't itself a 00/06/12/18Z
+cycle hour (e.g. `dt_obs: 1`/`2`/`3` instead of `6`), this returned **zero
+cycle directories -- and silently zero observations** -- even when the
+correct 00Z partition had a report timestamped e.g. 01Z sitting right
+there on disk. None of this repo's tracked configs hit it (all use
+`dt_obs: 6`, so every slot already lands exactly on a cycle hour -- the
+`-longcyc-obsint-1hour-*` configs' name describes `time_tolerance_hours`,
+the width of the per-slot acceptance window, not `dt_obs`), so no past run's
+results are affected.
+
+**Fix**: `cycle_directories` now rounds each tolerance-window endpoint to
+the *nearest* 6-hourly cycle (`_nearest_cycle`), reflecting that a cycle
+directory's reports span its own nominal hour +/- 3h, not just the hour
+itself. Exactly on the 3h midpoint between two cycles, the tie breaks
+toward the verification time's own cycle, so a query centered exactly on a
+cycle hour doesn't spuriously demand a neighboring directory that may not
+exist. `tests/unit/test_psobs_parquet.py::test_off_cycle_slot_finds_report_in_earlier_cycle_partition`
+covers the off-cycle-hour case directly.
+
+**Cycle partitions genuinely overlap at their shared boundary -- but only
+for some PREPBUFR classes.** Checked against this account's real archive
+copy (`/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/
+prepbufr_to_parquet/`) and its generator (`convert_prepbufr_to_parquet.py`:
+`observation_time = cycle_time + timedelta(hours=dhr)`, `dhr` taken straight
+from the raw PREPBUFR `DHR` field, itself cut to `[-3, +3]` by NCEP's
+operational dump upstream of this repo's archive entirely):
+
+- `AIRCAR`/`AIRCFT` (aircraft, continuous reporting, not read by this
+  repo): genuinely duplicated at the boundary -- e.g. 2015-01-01, reports
+  timestamped exactly `03:00` appear **identically** (same station +
+  lat/lon) in both the `00Z` partition (`397` `AIRCAR` + `92` `AIRCFT`
+  rows, its own `+3h` edge) and the `06Z` partition (same `397`+`92`, its
+  own `-3h` edge) -- a closed `[cycle-3h, cycle+3h]` window on both sides.
+- **`ADPSFC`/`SFCSHP` (what `psobs_parquet.py` actually reads): no
+  duplication.** Checked across all 201 days available locally, 57.5M
+  surface-level rows: the observed offset range is `[-3.0h, +3.0h)` --
+  closed at `-3h`, but the exact `+3.0h` offset never occurs in either
+  partition (verified at three independent boundaries: 2015-01-01's 00Z/06Z
+  and 12Z/18Z seams). A surface report exactly at a boundary instant (e.g.
+  `03:00`) lives **only** in the later cycle's file (`06Z`, as its `-3h`
+  edge) -- `00Z`'s own file has zero rows at its nominal `+3h` edge. So
+  surface pressure is already a clean, non-overlapping `[cycle-3h,
+  cycle+3h)` partition of time; nothing needed changing in the generator
+  for this obs type.
+- `ADPUPA` (radiosondes, not read by this repo; see "raobs design this
+  repo doesn't need" above): concentrated tightly around each launch's own
+  nominal hour (2015-01-01: 863 of 1252 `00Z` reports at exactly `+0.0h`
+  offset; observed range only `-2.5h` to `+2.0h` across all four cycles) --
+  nowhere near the `+-3h` boundary, so no overlap either way. Worth
+  re-checking on whatever archive the raobs port (`add-raobs-parquet`
+  branch) ends up using, rather than assuming this holds everywhere.
+
+**Residual edge case, not exercised by any current config**: because
+`ADPSFC`/`SFCSHP` partitions are clean (not duplicated), the fix's
+midpoint tie-break has one narrow blind spot -- a query with
+`time_tolerance_hours` exactly `3.0` centered exactly on a cycle hour
+(`center=00:00`, window `[21:00, 03:00]` closed) resolves toward its own
+cycle (`00Z`) and never opens the neighbor (`06Z`), so a surface report
+timestamped exactly at the far edge (`03:00`, which lives only in `06Z`)
+would be missed rather than double-counted. No tracked config uses
+anything but the `0.5` default, so this is purely a documented limitation,
+not a live bug.
+
 ## Config schema: `exp.observations`, extensible to future obs types
 
 Observation settings are grouped under `exp.observations.<type>` on disk
