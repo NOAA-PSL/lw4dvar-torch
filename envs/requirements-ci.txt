@@ -1,5 +1,6 @@
 # CPU-only environment for `make check` (CI and local). Versions follow the
 # backend envs' *-requirements.txt; torch is the CPU build of the same release.
+# jax (CPU) is for the jax_bridge math gate (tests/math/test_jax_bridge.py).
 #   python -m venv .venv-ci && .venv-ci/bin/pip install -r envs/requirements-ci.txt
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch==2.7.1+cpu
@@ -8,6 +9,7 @@ scipy==1.18.1
 xarray==2026.7.0
 netCDF4==1.7.4
 pyarrow==25.0.1
+jax==0.11.1
 PyYAML==6.0.3
 pytest
 ruff

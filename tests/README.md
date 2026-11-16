@@ -58,6 +58,17 @@ network access, in a few seconds. `make check` runs:
   backward with its sign flipped. A new backend with a hand-written
   backward (a custom `autograd.Function` or VJP) should get the same
   dot-product test (`model_tangent_and_adjoint`).
+  - `test_jax_bridge.py`: the same dot-product gate for
+    `backends/jax_bridge.py`'s custom VJP, the backward every JAX backend
+    (`ngcm`, `neuralgcm`, `graphcast`) relies on. A from `jax.jvp` on a
+    small scanned, checkpointed rollout, A^T from torch autograd through
+    the bridge, for all inputs and both outputs, one output unused (None
+    cotangent) and constant inputs (~1e-15; tolerance 1e-12), float64 on
+    CPU. Planted bugs: a backward that drops one output's cotangent (error
+    0.90) and one that linearizes about the wrong point (0.64). Needs jax
+    (in `envs/requirements-ci.txt`; skipped without it).
+    `backends/test_jax_bridge.py` stays as the GPU check (zero-copy,
+    streams).
 
 - `tests/ace2/` (marker `ace2`, `make check-ace2`, CI job `ace2-mini`): the
   solver end to end with a real, tiny model -- the mini ACE2 (2.5 deg,
@@ -87,8 +98,7 @@ synthetic normalized-PREPBUFR-parquet archive (the schema
 archive needed), so it rebuilds anywhere `pip install pyarrow` reaches,
 including a laptop.
 
-Still to come (issue #20): golden outputs, and the dot-product gate on
-`backends/jax_bridge.py`'s custom VJP once the `jax-backend` branch merges.
+Still to come (issue #20): golden outputs.
 
 ## What CI does not cover
 
