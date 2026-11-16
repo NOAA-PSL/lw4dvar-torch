@@ -60,9 +60,56 @@ network access, in a few seconds. `make check` runs:
   solver end to end with a real, tiny model -- the mini ACE2 (2.5 deg,
   16-layer CRTM+land variables, SFNO embed_dim 64) on CPU, one 24 h window of
   ps obs, 50 epochs through `long_window_4dvar.py`. Checks that it runs,
-  writes its outputs, and that the cost falls by at least 40% (observed 59%);
-  not analysis quality (the model is far too small). About a minute of
-  compute. Needs fme: `pip install -r requirements-ci-ace2.txt`.
+  writes its outputs, that the cost falls by at least 40% (observed 59%),
+  and that its outputs match the golden summary (below); not analysis
+  quality (the model is far too small). About a minute and a half of
+  compute, pinned to one thread. Needs fme:
+  `pip install -r requirements-ci-ace2.txt`. The run, its config and its
+  summary are in `tests/ace2/mini_ace2.py`.
+
+## Golden outputs
+
+Frozen summaries of whole minimizations under `tests/data/golden/` (a few
+KB each), so any change to the numbers -- a default, a QC threshold, the
+optimizer or its schedule, a weighting, an operator -- fails a test even
+when the gradients stay right. If the change is intended, regenerate in the
+CI env and say in the PR what moved and why:
+
+```
+python tests/make_fixtures.py golden          # the toy-model files
+python tests/make_fixtures.py golden --ace2   # also mini_ace2.json (needs fme)
+```
+
+A failure lists the values that moved, with golden and new values.
+
+- `tests/golden/` (in `make check`): the solver's `compute_optimal` on the
+  math gates' toy problem, float64, 20 epochs of AdamW with the warmup +
+  cosine schedule, with QC active -- four obs carry gross errors the
+  background check rejects, and the station-height check rejects a few
+  more. Four configs (`toy_golden.CONFIGS`): defaults; obs-density weights
+  plus `jc_ps_weight`; `control_variables` plus `checkpoint_stride: 2`;
+  `ps_operator: ps`. Frozen: the cost at every epoch, Jo per obs slot at
+  the first and last epoch, the increment's statistics and a sample of its
+  values, the analysis' per-channel mean and std, and per-slot obs counts,
+  mean and rms O-B and O-A. Deterministic, compared to 1e-8 relative. A
+  planted change -- the learning rate 1% higher, `bg_check` 4 -> 3.5 -- must
+  move the cost far outside that (`test_planted_change_is_caught`).
+- `tests/data/golden/mini_ace2.json` (in `make check-ace2`): the mini-ACE2
+  run's cost history, Jo per slot, obs diagnostics per slot (counts, QC
+  flags, mean and rms O-B and O-A) and area-weighted mean and std of h500,
+  TMP850 and PRESsfc in the analysis forecast. Float32, so tolerances are
+  per quantity (`mini_ace2.tolerance`), set from running at 1 and at 4
+  threads: everything from the background is bit-identical or within 1e-5,
+  the cost agrees to ~5e-6 for the first epochs, and the minimization then
+  amplifies fp32 rounding to ~2e-3 by epoch 50. So the background, QC and
+  the first five epochs are checked tightly (1e-5 / 1e-4), later epochs
+  and the analysis to 1e-2. Checked against planted changes: `bg_check`
+  4 -> 3.5 moves 76 values (first-epoch Jo by 4-14%), `jc_ps_weight`
+  10 -> 11 moves 43 (the cost by 0.06% at epoch 2 to 0.8% at epoch 5).
+
+The config saved in each file is the test's input config. The solver
+applies its defaults where it reads each key, so there is no resolved
+config to freeze yet (rule 4's resolved-config diff needs that first).
 
 ## Fixtures
 
@@ -75,8 +122,8 @@ Tests find it at `$LW4DVAR_MINI_ACE2_CKPT`, else in `$LW4DVAR_FIXTURE_CACHE`
 sha256. A new checkpoint goes into a new release, never over an old asset,
 so older commits keep testing against the file they pinned.
 
-Still to come (issue #20): golden outputs, and the dot-product gate on
-`backends/jax_bridge.py`'s custom VJP once the `jax-backend` branch merges.
+Still to come (issue #20): the dot-product gate on
+`backends/jax_bridge.py`'s custom VJP (in PR #27).
 
 ## What CI does not cover
 
