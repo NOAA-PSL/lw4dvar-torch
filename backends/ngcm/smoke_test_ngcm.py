@@ -21,6 +21,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), 'src'))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ngcm_model  # noqa: E402
 
