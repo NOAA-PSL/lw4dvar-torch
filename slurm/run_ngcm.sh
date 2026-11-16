@@ -9,6 +9,14 @@
 #SBATCH --mem=96g
 #SBATCH --qos=gpu
 
+# Resolve the repo root regardless of where `sbatch` was run from: SLURM
+# copies this script to a spool dir before executing it, so $0 points there,
+# not here. scontrol's Command is what was passed to sbatch -- relative to
+# the job's initial cwd (always the submission dir) when sbatch was given a
+# bare relative filename -- so resolve it with readlink -f before any cd.
+SCRIPT=$(readlink -f "$(scontrol show job "$SLURM_JOB_ID" | grep -oP 'Command=\S+' | cut -d= -f2)")
+cd "$(dirname "$(dirname "$SCRIPT")")"
+
 # JAX backend (model_backend: ngcm): the ngcm-torch env is a venv layered on
 # the ngcm-sl conda env (JAX 0.11.1, ngcm-train's dependencies) that adds
 # torch 2.7.1+cu128 against the base env's CUDA 12.9 libraries (see

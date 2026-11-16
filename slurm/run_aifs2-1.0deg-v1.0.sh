@@ -9,6 +9,14 @@
 #SBATCH --mem=96g
 #SBATCH --qos=gpu
 
+# Resolve the repo root regardless of where `sbatch` was run from: SLURM
+# copies this script to a spool dir before executing it, so $0 points there,
+# not here. scontrol's Command is what was passed to sbatch -- relative to
+# the job's initial cwd (always the submission dir) when sbatch was given a
+# bare relative filename -- so resolve it with readlink -f before any cd.
+SCRIPT=$(readlink -f "$(scontrol show job "$SLURM_JOB_ID" | grep -oP 'Command=\S+' | cut -d= -f2)")
+cd "$(dirname "$(dirname "$SCRIPT")")"
+
 # cuda/12.8.1 explicitly, matching the torch==2.7.1+cu128 this env pins (see
 # run_aifs.sh's own note on this).
 module load cuda/12.8.1

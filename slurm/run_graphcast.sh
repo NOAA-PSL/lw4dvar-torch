@@ -9,6 +9,14 @@
 #SBATCH --mem=96g
 #SBATCH --qos=gpu
 
+# Resolve the repo root regardless of where `sbatch` was run from: SLURM
+# copies this script to a spool dir before executing it, so $0 points there,
+# not here. scontrol's Command is what was passed to sbatch -- relative to
+# the job's initial cwd (always the submission dir) when sbatch was given a
+# bare relative filename -- so resolve it with readlink -f before any cd.
+SCRIPT=$(readlink -f "$(scontrol show job "$SLURM_JOB_ID" | grep -oP 'Command=\S+' | cut -d= -f2)")
+cd "$(dirname "$(dirname "$SCRIPT")")"
+
 # GraphCast backend (model_backend: graphcast, JAX via backends/jax_bridge.py):
 # the graphcast-torch env is a venv on the ngcm-sl conda env (JAX 0.11.1)
 # whose .pth file adds ngcm-torch's site-packages (torch 2.7.1+cu128), plus
