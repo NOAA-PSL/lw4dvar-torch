@@ -152,7 +152,8 @@ def load_psobs_parquet(
                 key = (slot_index, station_key)
                 error_std = (
                     float(source_error[level_row])
-                    if use_source_error and np.isfinite(source_error[level_row])
+                    if use_source_error and source_error[level_row] > 0.
+                    and np.isfinite(source_error[level_row])
                     else float(observation_error_std_hpa)
                 )
                 record = {
