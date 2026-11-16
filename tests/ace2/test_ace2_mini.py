@@ -33,8 +33,10 @@ pytestmark = [pytest.mark.ace2, pytest.mark.slow]
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 DATA = os.path.join(REPO_ROOT, 'tests', 'data', 'mini_ace2')
 EPOCHS = 50
-# observed: 1979 -> 891 (-55%, synthetic parquet psobs fixture); the margin
-# absorbs CPU/BLAS differences
+# observed: 2722 -> 1465 (-46%, synthetic parquet psobs+raobs fixture, raobs
+# t/u/v sampled from the real background + noise -- see
+# tests/make_fixtures.py's _ace2_background_profiles); the margin absorbs
+# CPU/BLAS differences
 MAX_FINAL_TO_FIRST = 0.6
 
 
@@ -74,9 +76,21 @@ def _config(tmp_path, ckpt):
         'model_name': os.path.basename(ckpt),
         'forcing_dir': os.path.join(DATA, 'forcing_data') + '/',
         'ic_cache': os.path.join(DATA, 'ic_cache') + '/',
-        'observations': {'psobs': {
-            'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
-        }},
+        'observations': {
+            'psobs': {
+                'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
+            },
+            'raobs': {
+                'enabled': True, 'path': os.path.join(DATA, 'raobs'),
+                'variables': ['temperature', 'u_component_of_wind', 'v_component_of_wind'],
+                # The synthetic fixture's t/u/v aren't tied to this tiny
+                # model's own background climatology (unlike the psobs
+                # fixture, which is loose Gaussian noise around a plausible
+                # ps value) -- a larger error than the real-archive default
+                # (1.0 K / 2.0 m/s) keeps raobs Jo from swamping ps Jo + Jc.
+                'error_std': {'t': 5.0, 'u': 8.0, 'v': 8.0},
+            },
+        },
         'path_output': str(tmp_path / 'output') + '/',
         'exp_name': 'test_ace2_mini',
         'rpath': str(tmp_path / 'unused') + '/',
@@ -121,6 +135,9 @@ def test_ace2_mini_window(tmp_path, checkpoint):
 
     out = os.path.join(exp['path_output'], exp['exp_name'])
     stem = f"{exp['sdate']}_"
-    for kind in ('latent_increment', 'observation_diagnostics', 'control_forecast', 'optimal_forecast'):
+    for kind in (
+        'latent_increment', 'observation_diagnostics', 'control_forecast', 'optimal_forecast',
+        'raobs_diagnostics',
+    ):
         hits = [f for f in os.listdir(out) if f.startswith(stem + kind)]
         assert hits, f'no {kind} output in {out}: {sorted(os.listdir(out))}'

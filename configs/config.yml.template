@@ -28,8 +28,8 @@ exp:
   # and settings -- load_config's _resolve_observations_config parses this
   # into the flat keys get_psobs (etc.) actually read. Grouping by
   # observation type (rather than flat top-level keys) is meant to scale to
-  # future types (radiosondes, aircraft, AMV, GPSRO, ...) without renaming
-  # anything already here -- see integrate_prepbufr_obs.md and
+  # future types (aircraft, AMV, GPSRO, ...) without renaming anything
+  # already here -- see docs/integrate_multiple_parquetobs.md and
   # _resolve_observations_config's docstring.
   observations:
     psobs:
@@ -53,6 +53,63 @@ exp:
       #quality_mark_max: 4 # max accepted PREPBUFR pressure quality mark
       #error_std_hpa: 1.0 # flat ob error (hPa) unless use_source_error
       #use_source_error: False # True: use each report's own pressure_error_mb instead of the flat value above
+
+    # raobs (radiosonde profile) settings -- omit this whole block (the
+    # default) or leave `enabled: False` to assimilate surface pressure
+    # only, unchanged. Only model_backend aifs/aurora/ace2/ngcm/neuralgcm/
+    # graphcast are supported (see RAOBS_SUPPORTED_BACKENDS in
+    # long_window_4dvar_utils.py) -- the 't'/'u'/'v'/'q' base-name forward
+    # operator has not been checked for fcn3/sfno. See
+    # docs/integrate_multiple_parquetobs.md.
+    raobs:
+      enabled: False
+      # Which variables to assimilate -- any subset of these four; omit an
+      # entry (e.g. drop specific_humidity) to turn just that one off
+      # without disabling raobs entirely. Default (if enabled but this key
+      # is omitted): all four, including specific_humidity.
+      #variables: [temperature, u_component_of_wind, v_component_of_wind, specific_humidity]
+      #path: same as observations.psobs.path by default -- the same parquet archive, ADPUPA class
+      #prepbufr_classes: [ADPUPA]
+      #time_tolerance_hours: 3.0 # default dt_obs/2, same convention as observations.psobs.time_tolerance_hours
+      #quality_mark_max: 3
+      # Mandatory-level matching tolerance (hPa): an obs level is kept only
+      # if its reported pressure is within this of one of the MODEL's own
+      # pressure levels (model.pressure_levels('t'/'u'/'v'/'q')) -- no
+      # vertical interpolation. 0.05 hPa comfortably separates true
+      # mandatory-level reports (recorded at exact round pressures) from
+      # significant levels.
+      #pressure_match_tolerance_hpa: 0.05
+      # Height-based QC, applied per matched level: reject levels outside
+      # this physical height range, or below the station's own elevation
+      # (by more than the tolerance), or where height is non-monotonic with
+      # pressure.
+      #height_min_m: -1000.
+      #height_max_m: 60000.
+      #below_station_tolerance_m: 100.
+      # Observation-error standard deviations for temperature (K) and wind
+      # components (m/s) -- NOT specific humidity, see below.
+      #error_std: {t: 1.0, u: 2.0, v: 2.0}
+      # Specific humidity error: a fixed per-level table (g/kg; ln(p)-
+      # interpolated between entries, nearest beyond them). Default below:
+      # Desroziers estimates from a ps + raobs run. Set null to use instead
+      # a FRACTION of the observed value, floored (q_error_fraction /
+      # q_error_floor_kg_kg) -- weights dry obs most and pulls the analysis
+      # dry.
+      #q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+      #q_error_fraction: 0.2
+      #q_error_floor_kg_kg: 1.e-5
+      # Background check on q: reject |O-B| > q_bg_check * error, at the
+      # current state (default 4.0; null turns it off).
+      #q_bg_check: 4.0
+      # Radiosonde humidity sensors are unreliable above the lower/mid
+      # troposphere -- mask 'q' at any matched level with pressure below
+      # this (set null to disable the floor entirely).
+      #humidity_min_pressure_hpa: 300.
+      # Fixed per-slot station capacity (padding size) -- by default (this
+      # key omitted) sized to the largest slot actually read; set an
+      # explicit integer only if you need a stable shape across
+      # configs/runs.
+      #station_capacity: 1000
   ic_suffix: '96h_100it' # pkl file info for restart
   sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
   n_init: 24 # number of DA cycles

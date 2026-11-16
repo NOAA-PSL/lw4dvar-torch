@@ -63,6 +63,14 @@ def test_missing_file_returns_none(tmp_path):
     ({'observations': {'bogus': {}}}, "unknown keys \\['bogus'\\]"),
     ({'observations': {'psobs': {'bogus': 1}}}, 'observations.psobs has unknown keys'),
     ({'observations': {}}, 'observations.psobs.path is required'),
+    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'bogus': 1}}},
+     'observations.raobs has unknown keys'),
+    ({'model_backend': 'fcn3', 'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True}}},
+     r"observations.raobs.enabled is only supported for model_backend in .*got 'fcn3'"),
+    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'variables': ['bogus']}}},
+     r"observations.raobs.variables entries must be a subset of .*got unsupported entries \['bogus'\]"),
+    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'variables': []}}},
+     'observations.raobs.variables must be non-empty'),
 ])
 def test_invalid_configs_rejected(tmp_path, exp, match):
     with pytest.raises(ValueError, match=match):
@@ -81,6 +89,45 @@ def test_observations_psobs_resolved_to_flat_keys(tmp_path):
     assert exp['psobs_use_source_error'] is True
     assert exp['psobs_quality_mark_max'] == 2
     assert 'psobs_time_tolerance_hours' not in exp  # left unset -> get_psobs's own default applies
+
+
+def test_observations_raobs_resolved_to_flat_keys(tmp_path):
+    exp, _ = utils.load_config(write_config(
+        tmp_path, observations={
+            'psobs': {'path': './psobs'},
+            'raobs': {
+                'enabled': True, 'variables': ['temperature', 'u_component_of_wind'],
+                'quality_mark_max': 2, 'q_bg_check': None,
+            },
+        },
+    ))
+    assert exp['raobs_enabled'] is True
+    assert exp['raobs_variables'] == ['temperature', 'u_component_of_wind']
+    assert exp['raobs_quality_mark_max'] == 2
+    assert exp['raobs_q_bg_check'] is None
+    assert exp['raobs_path'] == exp['obspath']  # defaults to psobs's resolved path
+
+
+def test_observations_raobs_disabled_by_default(tmp_path):
+    exp, _ = utils.load_config(write_config(tmp_path))
+    assert exp['raobs_enabled'] is False
+
+
+@pytest.mark.parametrize('backend', ['aurora', 'ace2', 'ngcm', 'neuralgcm', 'graphcast'])
+def test_raobs_enabled_backends_accepted(tmp_path, backend):
+    extra = {}
+    if backend == 'ngcm':
+        extra = {'ngcm_exp': 'x', 'ngcm_step': 1, 'ngcm_data': 'y'}
+    elif backend == 'neuralgcm':
+        extra = {'neuralgcm_checkpoint': 'x', 'neuralgcm_input_dir': 'y'}
+    elif backend == 'graphcast':
+        extra = {'graphcast_checkpoint': 'x', 'graphcast_stats_dir': 'y', 'graphcast_input_dir': 'z'}
+    exp, _ = utils.load_config(write_config(
+        tmp_path, model_backend=backend,
+        observations={'psobs': {'path': './psobs'}, 'raobs': {'enabled': True}},
+        **extra,
+    ))
+    assert exp['raobs_enabled'] is True
 
 
 def test_ace2_defaults_to_ps_native(tmp_path):

@@ -434,7 +434,21 @@ class ACE2Model(forecast_model.LatentForecastModel):
             lo = (k - 1).clamp(0, nlay - 1)
             hi = k.clamp(0, nlay - 1)
             x_lo, x_hi = torch.gather(lnp_mid, 0, lo), torch.gather(lnp_mid, 0, hi)
-            w = torch.where(hi > lo, (lnp_t - x_lo) / (x_hi - x_lo), torch.zeros_like(lnp_t))
+            # hi == lo (target at/below the lowest or at/above the highest
+            # mid-level) makes (x_hi - x_lo) == 0 -- torch.where's forward
+            # value correctly discards that branch, but autograd still
+            # backprops through BOTH branches, so the 0/0 NaN in the
+            # discarded one poisons the gradient of the whole expression
+            # (confirmed via torch.autograd.set_detect_anomaly: DivBackward0
+            # returns NaN here whenever a 't'/'u'/'v'/'q' decode is
+            # differentiated -- e.g. raobs's forward operator, never
+            # exercised before since ps_operator='ps_native' only reads the
+            # native t_lowest/q_lowest, not this derived multi-level
+            # family). Substituting a safe nonzero denominator in the
+            # discarded branch keeps that branch finite everywhere, so no
+            # NaN ever enters the graph.
+            safe_denom = torch.where(hi > lo, x_hi - x_lo, torch.ones_like(x_hi))
+            w = torch.where(hi > lo, (lnp_t - x_lo) / safe_denom, torch.zeros_like(lnp_t))
             for b in need:
                 f = flat[self._layer_cols[self._derived_from[b]]]
                 v = (1 - w) * torch.gather(f, 0, lo) + w * torch.gather(f, 0, hi)

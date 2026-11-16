@@ -1,17 +1,19 @@
-# Parquet observations, starting with surface pressure (ps)
+# Parquet observations: surface pressure (ps) and radiosondes (raobs)
 
-Currently covers one observation type -- surface pressure, read from a
-normalized PREPBUFR parquet archive -- but the config schema and the
-`exp.observations` loading mechanism (see "Config schema" below) are the
-same ones a future parquet-backed observation type (radiosondes, aircraft,
-AMV, GPSRO, ...) would extend, which is why this doc is named for the
-general case rather than just `psobs`.
+Covers two observation types read from the same normalized PREPBUFR parquet
+archive -- surface pressure and radiosonde (temperature/wind/humidity)
+profiles -- but the config schema and the `exp.observations` loading
+mechanism (see "Config schema" below) are the same ones a future
+parquet-backed observation type (aircraft, AMV, GPSRO, ...) would extend,
+which is why this doc is named for the general case rather than just
+`psobs`/`raobs`.
 
-Read this when working on: the ps-obs parquet reader (`src/psobs_parquet.py`,
-`src/prepbufr_parquet_common.py`), `get_psobs`, the `exp.observations.psobs.*`
-config schema (or adding a new observation type to `exp.observations`), the
-mini-ACE2 CI fixture's synthetic obs, or the `pyarrow` dependency this
-introduces.
+Read this when working on: the ps-obs parquet reader (`src/psobs_parquet.py`),
+the radiosonde (raobs) parquet reader (`src/raobs_parquet.py`), their shared
+`src/prepbufr_parquet_common.py`, `get_psobs`/`get_raobs`, the
+`exp.observations.psobs.*`/`exp.observations.raobs.*` config schema (or
+adding a new observation type to `exp.observations`), the mini-ACE2 CI
+fixture's synthetic obs, or the `pyarrow` dependency this introduces.
 
 ## Status: parquet-only, ported from a sibling repo's draft (2026-11-10)
 
@@ -204,36 +206,118 @@ configs, 5h walltime instead of the original 1-day) -- was submitted
 ## Config schema: `exp.observations`, extensible to future obs types
 
 Observation settings are grouped under `exp.observations.<type>` on disk
-(`psobs` is the only type so far), each with its own `path` -- rather than
-flat, per-type-prefixed keys directly on `exp` -- specifically so a future
-observation type (radiosondes, aircraft, AMV, GPSRO, ...) can be added
-without renaming anything already here. This mirrors a convention already
-worked out and in active use on a sibling branch,
+(`psobs` and `raobs` so far), each with its own `path` -- rather than flat,
+per-type-prefixed keys directly on `exp` -- specifically so a future
+observation type (aircraft, AMV, GPSRO, ...) can be added without renaming
+anything already here. This mirrors a convention already worked out and in
+active use on a sibling branch,
 `/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/
-add-amv-gpsro/lw4dvar-torch` (branch `add-amv-gpsro`), which has `raobs`,
-`aircraft`, `amv`, and `gpsro` blocks alongside `psobs` -- see that branch's
+add-amv-gpsro/lw4dvar-torch` (branch `add-amv-gpsro`), which has `aircraft`
+and `gpsro` blocks in addition to `raobs`/`psobs` -- see that branch's
 `config_test_ace2_ps_raobs_aircraft_t3.yml` for a worked example with five
 types enabled at once, and its own `integrate_prepbufr_obs.md` for the
-per-type key tables and design notes on raobs/aircraft/amv/gpsro
-specifically (vertical matching, thinning, bias correction, etc. -- none of
-which apply to psobs and aren't duplicated here).
+per-type key tables and design notes on aircraft/amv/gpsro specifically
+(thinning, bias correction, etc. -- none of which apply to psobs/raobs and
+aren't duplicated here).
 
-`src/long_window_4dvar_utils.py`'s `_PSOBS_CONFIG_KEYS` (a `{nested_key:
-flat_exp_key}` table) and `_resolve_observations_config` (called from
-`load_config`, right after `path_output` is resolved) do the actual
-translation: `exp.observations.psobs.path` becomes `exp['obspath']`,
-`exp.observations.psobs.use_source_error` becomes
-`exp['psobs_use_source_error']`, and so on, raising `ValueError` on any key
-`_PSOBS_CONFIG_KEYS` doesn't recognize or on a missing `path`. **Everything
-downstream of `load_config` -- `get_psobs` included -- still reads the
-flat keys it always has**; this translation is the *only* place the nested
-schema exists. Adding a new type means adding its own `_<TYPE>_CONFIG_KEYS`
-table and a corresponding block in `_resolve_observations_config` (almost
-certainly with its own `enabled` flag, since unlike psobs a new type would
-normally be optional) -- copy the pattern from the sibling branch above
-rather than re-deriving it, and extend `_resolve_observations_config`'s
-`unknown = set(observations) - {'psobs'}` check to admit the new top-level
-key.
+`src/long_window_4dvar_utils.py`'s `_PSOBS_CONFIG_KEYS`/`_RAOBS_CONFIG_KEYS`
+(`{nested_key: flat_exp_key}` tables) and `_resolve_observations_config`
+(called from `load_config`, right after `path_output` is resolved) do the
+actual translation: `exp.observations.psobs.path` becomes `exp['obspath']`,
+`exp.observations.raobs.variables` becomes `exp['raobs_variables']`, and so
+on, raising `ValueError` on any key `_PSOBS_CONFIG_KEYS`/`_RAOBS_CONFIG_KEYS`
+doesn't recognize, on a missing `psobs.path`, or on an unsupported/empty
+`raobs.variables`. **Everything downstream of `load_config` --
+`get_psobs`/`get_raobs` included -- still reads the flat keys it always
+has**; this translation is the *only* place the nested schema exists.
+Adding a new type means adding its own `_<TYPE>_CONFIG_KEYS` table and a
+corresponding block in `_resolve_observations_config` (almost certainly with
+its own `enabled` flag, since unlike psobs a new type would normally be
+optional) -- copy the `raobs` block's pattern rather than re-deriving it,
+and extend `_resolve_observations_config`'s
+`unknown = set(observations) - {'psobs', 'raobs'}` check to admit the new
+top-level key.
+
+## Adding radiosonde (raobs) observations (2026-11-16)
+
+Ported from the mature, already-validated "ps + raobs from parquet" feature
+on the sibling branch above (`add-amv-gpsro/lw4dvar-torch`, ancestor commit
+`8fce498`, branch `add-raobs-parquet` -- that branch's own
+`integrate_prepbufr_obs.md` has the original design write-up, the
+sensible-temperature and q-error/background-check fixes, and the forecast-
+skill validation numbers), re-implemented against this repo's current
+`exp.observations` schema and backend set rather than patched in
+mechanically.
+
+- **New files**: `src/raobs_parquet.py` (`load_raobs_parquet`: ADPUPA
+  reports/levels joined per 6-hourly cycle directory, mandatory-level
+  matching against the MODEL's own pressure levels -- see below --
+  physical-height/non-monotonic-height/below-station/PREPBUFR-quality QC,
+  an optional humidity pressure floor). `src/prepbufr_parquet_common.py`
+  gained one addition, `sensible_temperature` (reads the archive's `events`
+  partition): the archive's `temperature_c` is virtual temperature wherever
+  humidity was reported (PREPBUFR's VIRTMP step), so `raobs_parquet.py`
+  takes `t` from the first non-VIRTMP event instead, falling back to the
+  input value when no such event exists. Everything else in `common.py`
+  (cycle-directory resolution, the `MASKSTID`/`SHIP` station-id dedup fix,
+  `station_key`) is shared unchanged with `psobs_parquet.py` and needed no
+  raobs-specific change.
+- **No vertical interpolation**: each requested variable (`temperature`,
+  `u_component_of_wind`, `v_component_of_wind`, `specific_humidity`, mapped
+  to packed-state base names `t`/`u`/`v`/`q` by `RAOBS_VARIABLE_MODEL_BASE`
+  in `long_window_4dvar_utils.py`) is matched against
+  `model.pressure_levels(base)` AT READ TIME (within
+  `pressure_match_tolerance_hpa`, default 0.05 hPa) -- so the forward
+  operator (`_compute_raobs_observation_diagnostics_at_time`) is horizontal
+  interpolation only, the same k-NN/bilinear `grid_interp` every backend
+  already builds for psobs, just evaluated at raobs's own station
+  locations (raobs stations are not psobs stations, so the horizontal
+  interpolation weights can't be shared -- only the *time*-slot grid is:
+  `get_raobs` reuses `get_psobs`'s exact `step_lo`/`alpha` obs-slot grid
+  rather than building an independent one, since real ADPUPA launches are
+  synoptic and match whatever `dt_obs` a window is normally configured
+  with anyway).
+- **Backend support**: `RAOBS_SUPPORTED_BACKENDS = ('aifs', 'aurora',
+  'ace2', 'ngcm', 'neuralgcm', 'graphcast')`. `aifs`/`aurora`/`ace2` were
+  validated with real runs on the sibling branch; `ngcm`/`neuralgcm`/
+  `graphcast` (added on this repo after that branch's base, so the sibling
+  branch's own guard never saw them) were confirmed to expose the same
+  `t`/`u`/`v`/`q` decode_state/`pressure_levels` base-name convention
+  (`ngcm_model.py`'s `DERIVED`, `neuralgcm_model.py`'s `DECODED`,
+  `graphcast_model.py`'s `SHORT` tables) and already get a generic grid
+  interpolator from `get_grid_interpolator`, so no backend-specific work
+  was needed to extend the guard to them. `fcn3`/`sfno` stay excluded --
+  never checked, same conservative-guard style as the existing
+  `ps_operator`/`reset_skt_ocean` guards elsewhere in `load_config`.
+- **Loss/diagnostics integration**: a `raobs_traj=None`-gated branch
+  parallel to the existing ps-obs one at every level -- `compute_loss_4dvar`
+  gained a `_raobs_term` closure accumulated into the total loss alongside
+  `_obs_term`'s; `compute_ps_observation_hx` gained a parallel
+  `_record_raobs` collector (no extra `decode_state` call -- it already
+  decodes every field unconditionally); `save_trajectory_diagnostics` gained
+  a `save_raobs_diagnostics` call writing a separate
+  `<date>_raobs_diagnostics_*.nc` (dims `time, level_<base>, station_slot`,
+  O-B/O-A/used/QC per variable, mirroring the ps diagnostics file's
+  conventions). Omitting `observations.raobs` (or `enabled: False`) leaves
+  every one of these `None`/skipped, so existing ps-only configs are
+  unaffected.
+- **Error specification**: `t`/`u`/`v` use a fixed absolute `error_std`
+  (K, m/s). `q` defaults to a fixed per-level table (`RAOBS_Q_ERROR_G_KG`,
+  Desroziers estimates from the sibling branch's own ps+raobs run) plus a
+  4-sigma background check (`RAOBS_Q_BG_CHECK`), rather than a flat
+  fraction-of-observed-value error -- the fraction scheme weights dry obs
+  most and pulls the analysis dry (see the sibling branch's own writeup for
+  the numbers that motivated this).
+- **Testing**: `tests/unit/test_raobs_parquet.py` (hand-crafted archives --
+  mandatory-level tolerance, each QC bit, the sensible-temperature
+  event-stack lookup and its fallback, the humidity pressure floor,
+  multiple variables/slots, station-capacity overflow), extensions to
+  `tests/unit/test_config.py` (unknown-key/backend-guard/empty-variable-list
+  rejection, the resolved-flat-keys check, acceptance for every backend in
+  `RAOBS_SUPPORTED_BACKENDS`), and a synthetic ADPUPA archive
+  (`tests/make_fixtures.py`'s `_write_raobs_parquet`, at ACE2's own 13
+  pressure levels) added to the mini-ACE2 fixture and exercised by
+  `tests/ace2/test_ace2_mini.py` alongside psobs.
 
 ## Why parquet-only (no `.txt`/parquet config switch)
 
@@ -288,14 +372,32 @@ comment did.
   tie-break, flat-vs-source error, multiple independent slots, and the
   missing-cycle-directory/invalid-error-std error paths.
 - `tests/unit/test_config.py`: `_resolve_observations_config`'s validation
-  (unknown `observations`/`observations.psobs` keys, missing
-  `observations.psobs.path`) and that a representative set of nested keys
-  resolve to the expected flat `exp` keys
-  (`test_observations_psobs_resolved_to_flat_keys`).
+  (unknown `observations`/`observations.psobs`/`observations.raobs` keys,
+  missing `observations.psobs.path`, the raobs backend guard and
+  unsupported/empty `variables`) and that a representative set of nested
+  keys resolve to the expected flat `exp` keys
+  (`test_observations_psobs_resolved_to_flat_keys`,
+  `test_observations_raobs_resolved_to_flat_keys`), plus acceptance for
+  every backend in `RAOBS_SUPPORTED_BACKENDS`.
+- `tests/unit/test_raobs_parquet.py`: `load_raobs_parquet` against tiny,
+  hand-crafted parquet archives (including an `events` partition for the
+  sensible-temperature cases), one behavior per test -- mandatory-level
+  pressure-match tolerance, each QC bit (physical height, non-monotonic
+  height, below-station, PREPBUFR quality mark), the sensible-temperature
+  event-stack lookup and its fallback to the raw TOB, the humidity
+  pressure floor, multiple variables/slots, unsupported-variable and
+  station-capacity-overflow errors.
 - `tests/ace2/test_ace2_mini.py` (`make check-ace2`): now reads the
   synthetic parquet fixture via the real `get_psobs` path, with
   `observations.psobs.use_source_error: True` added to its config to
   exercise that branch too (matching the production configs that needed
-  it, above).
+  it, above); also enables `observations.raobs` (temperature/u/v) against
+  `tests/make_fixtures.py`'s `_write_raobs_parquet`/
+  `_ace2_background_profiles` fixture (the real mini-ACE2 checkpoint's own
+  background + noise, not independent climatology -- see that function's
+  docstring and `MAX_FINAL_TO_FIRST`'s updated "observed" comment). Finding
+  and fixing this test's crash on ACE2 (a NaN-gradient bug in
+  `ace2_model.py`'s derived pressure-level 't'/'u'/'v'/'q', never exercised
+  before raobs) is its own write-up in `docs/integrate_multiple_backends.md`.
 - All pass locally with a from-scratch `.venv-ci` (`rdhpcs-python/3.12` +
   `envs/requirements-ci.txt`/`envs/requirements-ci-ace2.txt`) as of this writing.
