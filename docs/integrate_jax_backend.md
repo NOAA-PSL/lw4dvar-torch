@@ -189,11 +189,12 @@ after the increment (steps 0 -> 1 with `increment_at_start`, 1 h for
 neuralgcm), zstd_k the spatial std of the analysis z on level k (same
 weights), N_obs the obs available in the window. Unlike `jc_ps_weight` it
 penalizes the analysis' whole tendency, not the change of the increment.
-`jc_z_mean: area` (default) is the original's August 2026 form (cos lat
-weights); `uniform` is its July 2026 form, used for the GRL paper runs
-(`test_realpsobs_3hrly_4d_2015`, which also normalized by the ERA5 z std at
-window start rather than the analysis'). Needs decoded 'z' on pressure
-levels. Check: the original August code's first cycle printed epoch-1
+The grid mean and zstd_k are area (cos lat) weighted, the original's
+August 2026 form. Its July 2026 form, used for the GRL paper runs
+(`test_realpsobs_3hrly_4d_2015`), used a uniform grid mean and the ERA5 z
+std at window start; a `jc_z_mean: uniform` option reproducing it was
+dropped (2026-11-16) after the area form cycled well with neuralgcm.
+Needs decoded 'z' on pressure levels. Check: the original August code's first cycle printed epoch-1
 Jt = 325.95 before the factor lam (Jt = 4983.65 including lam = 20 in the
 July form).
 

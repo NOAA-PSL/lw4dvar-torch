@@ -427,8 +427,6 @@ def load_config(config_path='config.yml'):
         raise ValueError(f"jc_ps_weight must be > 0 (hPa^-2), got {exp['jc_ps_weight']!r}")
     if exp.get('jc_z_weight') and float(exp['jc_z_weight']) <= 0:
         raise ValueError(f"jc_z_weight must be > 0 (dimensionless), got {exp['jc_z_weight']!r}")
-    if exp.get('jc_z_mean', 'area') not in ('area', 'uniform'):
-        raise ValueError(f"jc_z_mean must be 'area' or 'uniform', got {exp['jc_z_mean']!r}")
     if exp.get('jb_samples'):
         if backend not in ('ace2', 'ngcm', 'neuralgcm'):
             raise ValueError("jb_samples (static-ensemble latent B) is only implemented for the ace2, ngcm and "
@@ -532,7 +530,7 @@ def log_window(exp, logger):
     logger.info('   jc_ps_weight: ' + (str(exp['jc_ps_weight']) + ' hPa^-2 (x N_obs)'
                                         if exp.get('jc_ps_weight') else '(off)'))
     logger.info('   jc_z_weight: ' + (str(exp['jc_z_weight']) + f" (x N_obs, first-step geopotential tendency, "
-                                       f"{exp.get('jc_z_mean', 'area')} grid mean)"
+                                       f"area grid mean)"
                                        if exp.get('jc_z_weight') else '(off)'))
     if exp.get('jb_samples'):
         logger.info(f"   jb_samples: {exp['jb_samples']} (static-ensemble latent B), jb_loc_km: "
@@ -1623,17 +1621,16 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     roughly fixed as obs counts change.
 
     `jcz_ref` (from `compute_optimal`, present iff `exp['jc_z_weight']` is
-    set): `(weights, factor)` -- grid weights summing to 1 (area weights, or
-    uniform with `jc_z_mean: uniform`) and factor = lam * N_obs. The original JAX NeuralGCM runs' (long-window-4dvar-psobs,
+    set): `(weights, factor)` -- area weights summing to 1 and
+    factor = lam * N_obs. The original JAX NeuralGCM runs' (long-window-4dvar-psobs,
     `lam`) penalty on the TOTAL geopotential tendency of the analysis over
     the first model step after injection, on every pressure level of 'z':
         Jz = lam * N_obs * sum_i weights_i * mean_k (dz_ki / zstd_k)^2,
         dz = z(first step after injection + 1) - z(first step after injection)
     with zstd_k the (same-weighted) spatial std of the analysis z on level k
-    at the first of those times. The original's August 2026 form uses
-    area (cos lat) weights; its July 2026 form (the GRL paper runs) a
-    uniform grid mean and the std of the ERA5 z at window start --
-    `jc_z_mean: uniform` gives that, up to analysis vs ERA5 in zstd. Unlike
+    at the first of those times. This is the original's August 2026 form
+    (area weights); its July 2026 form (the GRL paper runs) used a uniform
+    grid mean and the std of the ERA5 z at window start. Unlike
     Jc this penalizes the analysis' own tendency, not the change of the
     increment, so real tendencies (tides, moving systems) are penalized too.
 
@@ -1946,14 +1943,11 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     if exp.get('jc_z_weight'):
         if not model.is_known_variable('z'):
             raise ValueError("jc_z_weight needs decoded geopotential 'z' on pressure levels")
-        if exp.get('jc_z_mean', 'area') == 'uniform':
-            areaw = torch.ones(model.n_points, dtype=torch.float32, device=model.device)
-        else:
-            areaw = torch.as_tensor(model.area_weights, dtype=torch.float32, device=model.device)
+        areaw = torch.as_tensor(model.area_weights, dtype=torch.float32, device=model.device)
         n_obs = int(psobs_traj['n_valid'].sum())
         jcz_factor = float(exp['jc_z_weight']) * n_obs
         logger.info(f"jc_z_weight: {exp['jc_z_weight']} x N_obs={n_obs} -- first-step geopotential "
-                    f"tendency penalty (per-level std normalized, {exp.get('jc_z_mean', 'area')} grid mean)")
+                    f"tendency penalty (per-level std normalized, area grid mean)")
         jcz_ref = (areaw / areaw.sum(), jcz_factor)
 
     optimizer = torch.optim.AdamW([control], lr=lr, weight_decay=wd, betas=(beta1,beta2))

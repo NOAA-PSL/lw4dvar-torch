@@ -51,7 +51,6 @@ def test_missing_file_returns_none(tmp_path):
     ({'jc_ps_sigma': 0.1}, 'jc_ps_sigma has been removed'),
     ({'jc_ps_weight': -1}, 'jc_ps_weight must be > 0'),
     ({'jc_z_weight': -1}, 'jc_z_weight must be > 0'),
-    ({'jc_z_mean': 'cos'}, 'jc_z_mean must be'),
     ({'jb_samples': 'x.pt'}, r'jb_samples .*only implemented for the .*got .aifs.'),
     ({'jb_weight': 2.0}, 'jb_samples is not'),
     ({'obs_density_box_deg': -5}, 'obs_density_box_deg'),
