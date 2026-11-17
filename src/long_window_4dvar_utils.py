@@ -1249,6 +1249,21 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
 
     variables = exp['raobs_variables']
     bases = [RAOBS_VARIABLE_MODEL_BASE[v] for v in variables]
+    # ACE2-specific: the released checkpoint's native 'q' is
+    # specific_total_water (vapor + cloud condensate), not a pure
+    # water-vapor specific humidity like a real radiosonde reports --
+    # assimilating specific_humidity against it would silently compare two
+    # different physical quantities (see docs/integrate_multiple_parquetobs.md's
+    # ACE2-specific caveat). Checkpoints whose humidity family IS
+    # specific_humidity (CRTM+land) are unaffected -- getattr defaults to
+    # None for every other backend, which never has this ambiguity.
+    if 'q' in bases and getattr(model, 'humidity_family', None) == 'specific_total_water':
+        raise ValueError(
+            "observations.raobs.variables includes specific_humidity, but this ACE2 "
+            "checkpoint's humidity is specific_total_water (vapor + condensate), not a "
+            "comparable water-vapor specific humidity -- drop specific_humidity from "
+            "raobs.variables for this checkpoint (see docs/integrate_multiple_parquetobs.md)"
+        )
     levels_hpa = {base: model.pressure_levels(base) for base in bases}
 
     dt_obs = exp['dt_obs']

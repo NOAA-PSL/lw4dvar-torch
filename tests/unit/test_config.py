@@ -131,6 +131,38 @@ def test_raobs_enabled_backends_accepted(tmp_path, backend):
     assert exp['raobs_enabled'] is True
 
 
+def test_get_raobs_rejects_specific_humidity_for_total_water_checkpoint():
+    """get_raobs must reject raobs.variables including specific_humidity
+    against a checkpoint whose native humidity is specific_total_water
+    (vapor + cloud condensate) -- not comparable to a real radiosonde's
+    vapor-only specific humidity (the released ACE2-ERA5 checkpoint; see
+    docs/integrate_multiple_parquetobs.md's ACE2-specific caveat). Must
+    fire before any archive I/O, so a fake model with no other backend
+    behavior is enough."""
+    class FakeModel:
+        humidity_family = 'specific_total_water'
+
+    exp = {'raobs_enabled': True, 'raobs_variables': ['temperature', 'specific_humidity'],
+           'dt_obs': 6, 'date': '2015-01-01T00'}
+    with pytest.raises(ValueError, match='specific_total_water'):
+        utils.get_raobs(exp, FakeModel(), utils.get_logger(), None, {'step_lo': [0]})
+
+
+def test_get_raobs_allows_tuv_for_total_water_checkpoint():
+    """The same checkpoint must NOT be rejected for t/u/v-only raobs --
+    only specific_humidity is the problem. The guard passing through
+    cleanly is confirmed by failing later, on model.pressure_levels (which
+    a real backend would have, but FakeModel deliberately doesn't) --
+    not on the humidity_family check."""
+    class FakeModel:
+        humidity_family = 'specific_total_water'
+
+    exp = {'raobs_enabled': True, 'raobs_variables': ['temperature'],
+           'dt_obs': 6, 'date': '2015-01-01T00'}
+    with pytest.raises(AttributeError, match='pressure_levels'):
+        utils.get_raobs(exp, FakeModel(), utils.get_logger(), None, {'step_lo': [0]})
+
+
 def test_ace2_defaults_to_ps_native(tmp_path):
     exp, _ = utils.load_config(write_config(tmp_path, model_backend='ace2'))
     assert exp['ps_operator'] == 'ps_native'

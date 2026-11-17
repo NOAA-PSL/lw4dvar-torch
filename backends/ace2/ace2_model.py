@@ -339,6 +339,19 @@ class ACE2Model(forecast_model.LatentForecastModel):
         return list(range(len(self._prognostic), len(self._channel_names)))
 
     @property
+    def humidity_family(self) -> str:
+        """'specific_total_water' (the released ACE2-ERA5 checkpoint:
+        vapor + cloud condensate in one field) or 'specific_humidity'
+        (CRTM+land checkpoints, condensate carried separately) -- which
+        packed-state family the derived 'q'/specific_humidity alias
+        actually comes from (see `_humidity_family` above). ACE2-specific:
+        no other backend's native 'q' conflates condensate with vapor, so
+        callers that care (get_raobs, rejecting specific_humidity raobs
+        against a specific_total_water checkpoint) use
+        `getattr(model, 'humidity_family', None)`."""
+        return self._humidity_family
+
+    @property
     def surface_geopotential(self) -> torch.Tensor:
         """(n_points,) g * HGTsfc (m^2/s^2) -- ACE2's own static orography
         (from the HF forcing files, negatives clipped to 0 like fme does),
