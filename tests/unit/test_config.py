@@ -10,15 +10,19 @@ import yaml
 import long_window_4dvar_utils as utils
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TRACKED_CONFIGS = sorted(glob.glob(os.path.join(REPO_ROOT, 'config_test_*.yml'))
-                         + [os.path.join(REPO_ROOT, 'config.yml.template')])
+CONFIGS_DIR = os.path.join(REPO_ROOT, 'configs')
+TRACKED_CONFIGS = sorted(glob.glob(os.path.join(CONFIGS_DIR, 'config_test_*.yml'))
+                         + [os.path.join(CONFIGS_DIR, 'config.yml.template')])
 
 WINDOW = {'n_verif': 4, 'dt_verif': 6, 'learn_rate': 1e-3, 'weight_decay': 0.0, 'max_epoch': 10,
           'warmup_steps': 0, 'start_factor': 1.0, 'end_factor': 1.0, 'suffix': ''}
 
 
 def write_config(tmp_path, windows=None, **exp):
-    exp = {'model_backend': 'aifs', 'exp_name': 'unit', 'path_output': './output/', **exp}
+    exp = {
+        'model_backend': 'aifs', 'exp_name': 'unit', 'path_output': './output/',
+        'observations': {'psobs': {'path': './psobs'}}, **exp,
+    }
     path = tmp_path / 'config.yml'
     path.write_text(yaml.safe_dump({'exp': exp, 'windows': windows or {'1': dict(WINDOW)}}))
     return str(path)
@@ -56,10 +60,27 @@ def test_missing_file_returns_none(tmp_path):
     ({'model_backend': 'fcn3', 'autocast_dtype': 'bf16'}, 'not implemented'),
     ({'autocast_dtype': 'int8'}, 'must be one of'),
     ({'model_backend': 'ace2', 'dry_mass_fixer': True}, 'dry_mass_fixer'),
+    ({'observations': {'bogus': {}}}, "unknown keys \\['bogus'\\]"),
+    ({'observations': {'psobs': {'bogus': 1}}}, 'observations.psobs has unknown keys'),
+    ({'observations': {}}, 'observations.psobs.path is required'),
 ])
 def test_invalid_configs_rejected(tmp_path, exp, match):
     with pytest.raises(ValueError, match=match):
         utils.load_config(write_config(tmp_path, **exp))
+
+
+def test_observations_psobs_resolved_to_flat_keys(tmp_path):
+    exp, _ = utils.load_config(write_config(
+        tmp_path, observations={'psobs': {
+            'path': '/archive/root', 'nobs_max': 1234, 'use_source_error': True,
+            'quality_mark_max': 2,
+        }},
+    ))
+    assert exp['obspath'] == '/archive/root'
+    assert exp['nobs_max'] == 1234
+    assert exp['psobs_use_source_error'] is True
+    assert exp['psobs_quality_mark_max'] == 2
+    assert 'psobs_time_tolerance_hours' not in exp  # left unset -> get_psobs's own default applies
 
 
 def test_ace2_defaults_to_ps_native(tmp_path):

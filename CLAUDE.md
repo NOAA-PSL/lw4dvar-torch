@@ -15,27 +15,35 @@ in the config: `aifs` (AIFS-single 2.0 / 1.1), `fcn3` (FourCastNet3),
 `ngcm` (ngcm-train's JAX NeuralGCM-style model), `neuralgcm` (official
 NeuralGCM checkpoints) and `graphcast` (GraphCast_small), all via the
 torch/JAX bridge `backends/jax_bridge.py`. Shared driver/solver:
-`long_window_4dvar.py`, `long_window_4dvar_utils.py`; backend interface:
-`forecast_model.py`; backends: `backends/<name>/`; all config keys are
-documented in `config.yml.template`.
+`src/long_window_4dvar.py`, `src/long_window_4dvar_utils.py`; backend interface:
+`src/forecast_model.py`; backends: `backends/<name>/`; all config keys are
+documented in `configs/config.yml.template`. Env/checkpoint requirement
+files and spec dumps live under `envs/`; task documents under `docs/`;
+SLURM/PBS job scripts under `slurm/`. `src/` modules are run with the repo
+root as cwd (`python src/long_window_4dvar.py config.yml`) -- Python puts
+`src/` on `sys.path[0]`, so they import each other flatly
+(`import long_window_4dvar_utils`); `backends/<name>/` is NOT under `src/`
+-- `_ensure_backend_on_path` (`src/long_window_4dvar_utils.py`) adds it to
+`sys.path` separately, one backend at a time, so a process never needs
+another backend's dependencies.
 
 ## Rules that apply to every task
 
 - **One conda env per backend, never merged** -- run each backend in its
-  own env with its own launcher: `aifs2`/`aifs1` (`run_aifs.sh`), `aifs3`
-  (`run_aifs3.sh`; AIFS checkpoints on the multi-dataset anemoi API, e.g.
+  own env with its own launcher: `aifs2`/`aifs1` (`slurm/run_aifs.sh`), `aifs3`
+  (`slurm/run_aifs3.sh`; AIFS checkpoints on the multi-dataset anemoi API, e.g.
   the 1-degree `aifs2-1deg-ic1` -> `AIFS3Model`), `fcstnet3`
-  (`run_fcn3.sh`; also runs `sfno` via `run_sfno.sh`), `aurora` (`run_aurora.sh`),
-  `ace2` (`run_ace2.sh`), `ngcm-torch` (`run_ngcm.sh`; a venv on the
-  ngcm-sl env adding torch), `graphcast-torch` (`run_graphcast.sh`; the
+  (`slurm/run_fcn3.sh`; also runs `sfno` via `slurm/run_sfno.sh`), `aurora` (`slurm/run_aurora.sh`),
+  `ace2` (`slurm/run_ace2.sh`), `ngcm-torch` (`slurm/run_ngcm.sh`; a venv on the
+  ngcm-sl env adding torch), `graphcast-torch` (`slurm/run_graphcast.sh`; the
   same plus graphcast), all
   under `/scratch4/BMC/gsienkf/whitaker/conda/envs/`; `ace2-rocm` is the
   `ace2` env with ROCm torch, for ACE2 training on Ursa's AMD `u1-mi300x`
-  nodes (`run_ace2_train_mi300x.sh`; see `ace2-training.md`); `ace2ic` is a
+  nodes (`slurm/run_ace2_train_mi300x.sh`; see `docs/ace2-training.md`); `ace2ic` is a
   login-node-only env for ACE2 IC/verification fetching. Backend modules are
   imported lazily so a process never needs another backend's dependencies.
   Exception: `aifs2-1.0deg-v1.0` (a user-trained checkpoint, still
-  `model_backend: aifs`) needs its own env (`lwaifs2`, `run_aifs2-1.0deg-
+  `model_backend: aifs`) needs its own env (`lwaifs2`, `slurm/run_aifs2-1.0deg-
   v1.0.sh`) because of a dependency pin gap in the shared `aifs2` env that
   this account can't fix in place (not group-writable) -- see
   `integrate_aifs2-1deg-v1.0_backend.md`. The conda env is really keyed by
@@ -65,10 +73,12 @@ documented in `config.yml.template`.
 
 | Document | Read it when working on |
 |---|---|
-| `running_at_alcf.md` | running on ALCF Polaris (PBS): building envs there, `run_ace2_polaris.sh`, A100 memory limits, Eagle data paths |
-| `ace2-training.md` | training our own ACE2 checkpoint: building the training dataset from public ARCO-ERA5 (`backends/ace2/ace2_dataset.py`, `run_ace2_dataset_polaris.sh`), CO2, normalization stats, training configs and `run_ace2_train_polaris.sh` (fme, the checkpointing workaround `fme_train.py`), adding vertical layers for radiances |
-| `integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics, the AIFS dry-air mass fixer (`dry_mass_fixer`)|
-| `integrate_jax_backend.md` | the torch/JAX bridge (`backends/jax_bridge.py`), the `ngcm`, `neuralgcm` and `graphcast` backends, the `ngcm-torch` and `graphcast-torch` envs, `backends/hybrid_levels.py` |
+| `docs/running_at_alcf.md` | running on ALCF Polaris (PBS): building envs there, `slurm/run_ace2_polaris.sh`, A100 memory limits, Eagle data paths |
+| `docs/ace2-training.md` | training our own ACE2 checkpoint: building the training dataset from public ARCO-ERA5 (`backends/ace2/ace2_dataset.py`, `slurm/run_ace2_dataset_polaris.sh`), CO2, normalization stats, training configs and `slurm/run_ace2_train_polaris.sh` (fme, the checkpointing workaround `fme_train.py`), adding vertical layers for radiances |
+| `docs/integrate_multiple_backends.md` | anything backend-specific: adding or modifying a backend, backend dispatch, conda envs, checkpoints/submodules, IC/verification fetching, known backend bugs and pitfalls, validation and tuning results (learning rates, window lengths, checkpointing, `torch.compile`), the balance penalty (`jc_ps_weight`), obs-density weighted Jo (`obs_density_box_deg`), area weights, the z500 diagnostics, the AIFS dry-air mass fixer (`dry_mass_fixer`)|
+| `docs/integrate_multiple_parquetobs.md` | the ps-obs parquet reader (`src/psobs_parquet.py`, `src/prepbufr_parquet_common.py`), `get_psobs`, the `exp.observations.psobs.*` config schema (or adding a new observation type under `exp.observations`), the mini-ACE2 CI fixture's synthetic obs, or the `pyarrow` dependency |
+| `docs/structure_reorg.md` | where a file should live in this repo (`src/`/`configs/`/`envs/`/`docs/`/`slurm/` vs `backends/`/`diagnostics/`/`tests/`), why `_ensure_backend_on_path`/`diagnostics/*.py`/backend probe scripts compute two different "root" paths, or anything that looks like a stale reference to a file that used to live at the repo root |
+| `docs/integrate_jax_backend.md` | the torch/JAX bridge (`backends/jax_bridge.py`), the `ngcm`, `neuralgcm` and `graphcast` backends, the `ngcm-torch` and `graphcast-torch` envs, `backends/hybrid_levels.py` |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.

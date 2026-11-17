@@ -32,7 +32,7 @@ import numpy as np
 import torch
 import yaml
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 
 POINTS = [(45.0, 190.0, 'N Pacific 45N 170W'), (40.0, 265.0, 'central US 40N 95W'),
           (-50.0, 90.0, 'S Indian Ocean 50S 90E'), (5.0, 190.0, 'tropical Pacific 5N 170W')]

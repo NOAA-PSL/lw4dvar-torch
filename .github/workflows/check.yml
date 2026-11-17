@@ -20,12 +20,12 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements-ci.txt
-      - run: pip install -r requirements-ci.txt
+          cache-dependency-path: envs/requirements-ci.txt
+      - run: pip install -r envs/requirements-ci.txt
       - run: make check
 
   # The solver end to end with a real (tiny) model: tests/ace2/test_ace2_mini.py.
-  # Separate job: it needs fme (requirements-ci-ace2.txt) and a 22 MB
+  # Separate job: it needs fme (envs/requirements-ci-ace2.txt) and a 22 MB
   # checkpoint, a release asset pinned in tests/data/mini_ace2/manifest.json
   # and cached between runs under its sha256.
   ace2-mini:
@@ -43,13 +43,13 @@ jobs:
           python-version: "3.12"
           cache: pip
           cache-dependency-path: |
-            requirements-ci.txt
-            requirements-ci-ace2.txt
+            envs/requirements-ci.txt
+            envs/requirements-ci-ace2.txt
       - id: ckpt
         run: echo "sha=$(python -c "import json; print(json.load(open('tests/data/mini_ace2/manifest.json'))['checkpoint']['sha256'])")" >> "$GITHUB_OUTPUT"
       - uses: actions/cache@v4
         with:
           path: .fixture-cache
           key: mini-ace2-${{ steps.ckpt.outputs.sha }}
-      - run: pip install -r requirements-ci-ace2.txt
+      - run: pip install -r envs/requirements-ci-ace2.txt
       - run: make check-ace2

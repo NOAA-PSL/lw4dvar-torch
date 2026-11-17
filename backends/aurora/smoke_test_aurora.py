@@ -22,7 +22,7 @@ import sys
 import numpy as np
 import torch
 
-sys.path.insert(0, ".")  # forecast_model.py (repo root) -- not on sys.path when
+sys.path.insert(0, "src")  # forecast_model.py (src/) -- not on sys.path when
                           # running `python backends/aurora/smoke_test_aurora.py`
                           # directly (sys.path[0] is the script's own directory,
                           # not cwd); the real driver runs from the repo root so

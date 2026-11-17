@@ -1,8 +1,0 @@
-# CPU environment for the mini-ACE2 smoke test (`make check-ace2`, the CI
-# job `ace2-mini` in .github/workflows/check.yml): requirements-ci.txt plus
-# fme and torch-harmonics at the versions the ace2 env pins
-# (ace2-requirements.txt), with the CPU build of torch.
-#   python -m venv .venv-ci && .venv-ci/bin/pip install -r requirements-ci-ace2.txt
--r requirements-ci.txt
-fme==2026.5.1
-torch-harmonics==0.8.0

@@ -19,7 +19,7 @@ conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/aurora
 # surface pressure observation files, organized by date-stamped text files --
 # grid/model-independent, shared between backends.
 #ln -sfnT /scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs psobs
-#ln -sfnT config.yml.template config.yml
+#ln -sfnT configs/config.yml.template config.yml
 
 # ERA5 initial-condition/verification fetches (backends/aurora/aurora_ic.py)
 # need internet access, which this H100 node does not have -- the

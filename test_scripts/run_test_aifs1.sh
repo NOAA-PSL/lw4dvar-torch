@@ -18,4 +18,4 @@ module load cuda/12.8.1
 module load rdhpcs-conda
 conda activate /scratch4/BMC/gsienkf/whitaker/conda/envs/aifs1
 
-python -u long_window_4dvar.py config_test_aifs1.yml
+python -u src/long_window_4dvar.py configs/config_test_aifs1.yml

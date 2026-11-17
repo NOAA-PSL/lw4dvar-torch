@@ -1,0 +1,43 @@
+exp:
+  model_backend: aifs
+  nhrs_back: 48
+  restart: False
+  rpath: './output/<previous_exp_name>/'
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      # no oberrstart key -> defaults to 0 -> uses the ob's own error;
+      # preserve the legacy .txt reader's per-ob error (now parquet
+      # pressure_error_mb)
+      use_source_error: True
+  ic_suffix: '12h_5it'
+  sdate: '2015-01-01T00'
+  n_init: 1
+  dt_init: 12
+  save_levs: [500]
+  cycle: False
+  exp_name: 'smoke_test_aifs1'
+
+  model_name: 'aifs-single-mse-1.1.ckpt'
+  path_model: './backends/aifs/aifs-single-1.1/'
+  aifs_config: 'backends/aifs/aifs_inference_v1p1.yaml'
+  device: 'cuda'
+  path_output: './output/'
+  ic_cache: './ic_cache_aifs1/'
+  print_every: 1
+
+windows:
+  '1':
+    n_verif: 2
+    dt_verif: 6
+    learn_rate: 1.0e-2
+    weight_decay: 1.0e-3
+    max_epoch: 5
+    warmup_steps: 1
+    start_factor: 0.5
+    end_factor: 0.5
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''
