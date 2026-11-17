@@ -21,8 +21,9 @@ VARIANTS = {
     'control_variables': {'control_variables': ['z', 'sp']},
     'jc_ps_weight': {'jc_ps_weight': 30.0},
     'obs_density': {'obs_density_box_deg': 10.0},
+    'jc_z_weight': {'jc_z_weight': 20.0},
     'all': {'control_variables': ['z', 't', 'sp'], 'jc_ps_weight': 30.0,
-            'obs_density_box_deg': 10.0, 'checkpoint_stride': 2},
+            'obs_density_box_deg': 10.0, 'jc_z_weight': 20.0, 'checkpoint_stride': 2},
 }
 
 
@@ -109,3 +110,32 @@ def test_planted_bug_gradient_off_by_a_factor(x0):
     p = Problem()
     _, g = p.cost_and_grad(x0)
     assert taylor_order(p.cost_and_grad, p.cost, x0, grad=1.01 * g) < 1.5
+
+
+def test_jc_z_penalty_value():
+    # z1 - z0 = c_k * (level k's w-weighted spatial std of z0) everywhere:
+    # the penalty is factor * mean_k c_k^2, whatever z0 and w are
+    g = torch.Generator().manual_seed(3)
+    z0 = 5000.0 + 300.0 * torch.randn(3, 40, generator=g, dtype=torch.float64)
+    w = torch.rand(40, generator=g, dtype=torch.float64)
+    w = w / w.sum()
+    std = torch.sqrt((w * (z0 - (w * z0).sum(1, keepdim=True)) ** 2).sum(1, keepdim=True))
+    c = torch.tensor([[0.1], [0.2], [0.4]], dtype=torch.float64)
+    Jz = utils._jc_z_penalty(z0, z0 + c * std, w, 7.0)
+    assert float(Jz) == pytest.approx(7.0 * float((c ** 2).mean()), rel=1e-12)
+
+
+def test_planted_bug_jc_z_detached_normalization(x0, monkeypatch):
+    # the penalty's normalization (z0's spatial std) depends on the
+    # increment too; detaching it leaves the value unchanged
+    def detached_std(z0, z1, w, factor):
+        z0r = z0.reshape(-1, w.shape[0])
+        zstd = torch.sqrt((w * (z0r - (w * z0r).sum(1, keepdim=True)) ** 2).sum(1, keepdim=True)).detach()
+        return factor * (w * (((z1.reshape(-1, w.shape[0]) - z0r) / zstd) ** 2).mean(dim=0)).sum()
+
+    p = Problem(**VARIANTS['jc_z_weight'])
+    J = float(p.cost(x0))
+    monkeypatch.setattr(utils, '_jc_z_penalty', detached_std)
+    assert float(p.cost(x0)) == pytest.approx(J, rel=1e-12)
+    monkeypatch.setattr(utils, '_jc_z_penalty', detached_std)
+    assert gradient_error(p.cost_and_grad, p.cost, x0) > 1e-3

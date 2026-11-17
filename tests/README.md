@@ -40,8 +40,9 @@ network access, in a few seconds. `make check` runs:
   an error measure:
   - `gradient_error`: the cost's gradient against central finite
     differences, for plain Jo, `checkpoint_stride` 0 / 2,
-    `control_variables`, `jc_ps_weight`, `obs_density_box_deg` and all of
-    them together (~1e-9 to 2e-8; tolerance 1e-6);
+    `control_variables`, `jc_ps_weight`, `obs_density_box_deg`,
+    `jc_z_weight` and all of them together (~1e-9 to 2e-8; tolerance 1e-6);
+    `_jc_z_penalty`'s value is also checked against a hand-computed case;
   - `taylor_order`: the first-order Taylor remainder falls as eps^2 (order
     1.99; must exceed 1.9);
   - checkpointing (`checkpoint_stride` 1, 2, 3) leaves cost and gradient
@@ -53,7 +54,8 @@ network access, in a few seconds. `make check` runs:
   Each gate has a planted bug it must catch, with a wide margin: one
   term of `get_surface_pressure`'s interpolation weight detached (gradient
   error 0.26), a checkpoint wrapper that detaches its input (0.82), a
-  gradient 1 % too large (Taylor order 0.76), an advection whose backward
+  gradient 1 % too large (Taylor order 0.76), `jc_z_weight`'s per-level
+  std normalization detached (gradient error 0.32), an advection whose backward
   rolls the wrong way (dot-product error 0.33), and `_WeightedSampleSum`'s
   backward with its sign flipped. A new backend with a hand-written
   backward (a custom `autograd.Function` or VJP) should get the same

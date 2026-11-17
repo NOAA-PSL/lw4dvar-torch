@@ -24,6 +24,7 @@ jax.config.update('jax_enable_x64', True)
 import jax.numpy as jnp  # noqa: E402
 
 from backends import jax_bridge  # noqa: E402
+import gates  # noqa: E402
 
 N, STEPS = 6, 4
 CONSTANTS = {'forcing': np.full((N,), 0.01)}
@@ -44,32 +45,43 @@ def _inputs():
     return [torch.randn(*s, generator=g, dtype=torch.float64) for s in ((N,), (N,), (N, N))]
 
 
-def _directions(shapes, seed):
-    g = torch.Generator().manual_seed(seed)
-    return [torch.randn(*s, generator=g, dtype=torch.float64) for s in shapes]
+def _split(flat, shapes):
+    sizes = [int(np.prod(s)) for s in shapes]
+    return [p.reshape(s) for p, s in zip(torch.split(flat, sizes), shapes)]
+
+
+def bridge_tangent_and_adjoint(bridged, wrt=(0, 1, 2), outputs=(0, 1)):
+    """The rollout's tangent-linear A (from jax.jvp on the plain JAX
+    function) and adjoint A^T (torch autograd through `bridged`), as maps
+    between flat vectors of the inputs `wrt` and the `outputs`, linearized
+    about _inputs(). Returns (forward, adjoint, x_shape, y_shape) for
+    gates.dot_product_error."""
+    xs = _inputs()
+    primals = tuple(jnp.asarray(x.numpy()) for x in xs)
+    out_shapes = [o.shape for o in rollout(CONSTANTS, *primals)]
+    in_shapes = [xs[i].shape for i in wrt]
+    y_shapes = [out_shapes[k] for k in outputs]
+
+    def forward(v):
+        tangents = [jnp.zeros(x.shape) for x in xs]
+        for i, vi in zip(wrt, _split(v, in_shapes)):
+            tangents[i] = jnp.asarray(vi.numpy())
+        _, Av = jax.jvp(lambda *a: rollout(CONSTANTS, *a), primals, tuple(tangents))
+        return torch.cat([torch.from_numpy(np.array(Av[k])).reshape(-1) for k in outputs])
+
+    def adjoint(w):
+        args = [x.clone().requires_grad_(i in wrt) for i, x in enumerate(xs)]
+        outs = bridged(*args, constants=CONSTANTS)
+        loss = sum((outs[k] * wk).sum() for k, wk in zip(outputs, _split(w, y_shapes)))
+        ATw = torch.autograd.grad(loss, [args[i] for i in wrt])
+        return torch.cat([g.reshape(-1) for g in ATw])
+
+    size = lambda shapes: (sum(int(np.prod(s)) for s in shapes),)
+    return forward, adjoint, size(in_shapes), size(y_shapes)
 
 
 def dot_product_error(bridged, wrt=(0, 1, 2), outputs=(0, 1), seed=1):
-    """|<A v, w> - <v, A^T w>| / max(...) for the rollout's inputs `wrt` and
-    `outputs`; A from jax.jvp, A^T from torch autograd through `bridged`."""
-    xs = _inputs()
-    out_shapes = [o.shape for o in rollout(CONSTANTS, *(jnp.asarray(x.numpy()) for x in xs))]
-    v = _directions([xs[i].shape for i in wrt], seed)
-    w = _directions([out_shapes[k] for k in outputs], seed + 1)
-
-    tangents = [jnp.zeros(x.shape) for x in xs]
-    for i, vi in zip(wrt, v):
-        tangents[i] = jnp.asarray(vi.numpy())
-    _, Av = jax.jvp(lambda *a: rollout(CONSTANTS, *a), tuple(jnp.asarray(x.numpy()) for x in xs),
-                    tuple(tangents))
-    lhs = sum(float(jnp.vdot(Av[k], jnp.asarray(wk.numpy()))) for k, wk in zip(outputs, w))
-
-    args = [x.clone().requires_grad_(i in wrt) for i, x in enumerate(xs)]
-    outs = bridged(*args, constants=CONSTANTS)
-    loss = sum((outs[k] * wk).sum() for k, wk in zip(outputs, w))
-    ATw = torch.autograd.grad(loss, [args[i] for i in wrt])
-    rhs = sum(float((vi * gi).sum()) for vi, gi in zip(v, ATw))
-    return abs(lhs - rhs) / max(abs(lhs), abs(rhs), 1e-30)
+    return gates.dot_product_error(*bridge_tangent_and_adjoint(bridged, wrt, outputs), seed=seed)
 
 
 CASES = {
