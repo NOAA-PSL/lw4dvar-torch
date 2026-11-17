@@ -31,7 +31,8 @@ BASE_EXP = {
 class Problem:
     def __init__(self, model=None, seed=0, **exp):
         self.model = model if model is not None else ToyModel()
-        self.exp = {**BASE_EXP, **exp}
+        # a None value drops the key, so the solver applies its own default
+        self.exp = {k: v for k, v in {**BASE_EXP, **exp}.items() if v is not None}
         self.state = self.model.initial_state()
         rng = np.random.default_rng(seed)
         m = self.model
