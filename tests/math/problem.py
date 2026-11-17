@@ -90,19 +90,30 @@ class Problem:
         self.keep_mask = self.ref_state1 = None
         if self.exp.get('control_variables'):
             self.keep_mask = utils._resolve_control_mask(m, self.exp, len(m.mean.flatten()), m.device)
-            with torch.no_grad():
-                self.ref_state1 = m.advance(self.state, steps=1, use_checkpoint=False)
+            if m.increment_at_start:
+                self.ref_state1 = self.state
+            else:
+                with torch.no_grad():
+                    self.ref_state1 = m.advance(self.state, steps=1, use_checkpoint=False)
         self.jc_ref = None
         if self.exp.get('jc_ps_weight'):
             # as compute_optimal builds it
             with torch.no_grad():
                 bg1 = m.advance(self.state, steps=1, use_checkpoint=False)
-                bg2 = m.advance(bg1, steps=1, use_checkpoint=False)
+                if m.increment_at_start:
+                    bg1, bg2 = self.state, bg1
+                else:
+                    bg2 = m.advance(bg1, steps=1, use_checkpoint=False)
                 p1 = m.decode_state(bg1, only=['sp'])['sp']
                 p2 = m.decode_state(bg2, only=['sp'])['sp']
             w = torch.as_tensor(m.area_weights)
             factor = float(self.exp['jc_ps_weight']) * int(traj['n_valid'].sum())
             self.jc_ref = ('sp', p1, p2, w / w.sum(), factor)
+        self.jcz_ref = None
+        if self.exp.get('jc_z_weight'):
+            # as compute_optimal builds it
+            w = torch.as_tensor(m.area_weights)
+            self.jcz_ref = (w / w.sum(), float(self.exp['jc_z_weight']) * int(traj['n_valid'].sum()))
 
     def background_hx(self):
         """H(x) of the background at every slot, (n_slots, nobs_max)."""
@@ -128,7 +139,8 @@ class Problem:
         """The solver's Jo (+ Jc) for a latent increment."""
         J, _ = utils.compute_loss_4dvar(
             self.model, increment, 1.0, self.state, self.verif_ic, self.psobs_traj, 1, self.exp,
-            self.grid_interp, -1, self.interp_specs, self.keep_mask, self.ref_state1, self.jc_ref)
+            self.grid_interp, -1, self.interp_specs, self.keep_mask, self.ref_state1, self.jc_ref,
+            self.jcz_ref)
         return J
 
     def cost_and_grad(self, increment):

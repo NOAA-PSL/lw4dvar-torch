@@ -10,7 +10,7 @@ import torch
 import long_window_4dvar_utils as utils
 from gates import gradient_error, taylor_order
 from problem import Problem
-from toy_model import ToyModel
+from toy_model import ToyModel, ToyModelAtStart
 
 GRAD_TOL = 1e-6
 
@@ -21,8 +21,9 @@ VARIANTS = {
     'control_variables': {'control_variables': ['z', 'sp']},
     'jc_ps_weight': {'jc_ps_weight': 30.0},
     'obs_density': {'obs_density_box_deg': 10.0},
+    'jc_z_weight': {'jc_z_weight': 20.0},
     'all': {'control_variables': ['z', 't', 'sp'], 'jc_ps_weight': 30.0,
-            'obs_density_box_deg': 10.0, 'checkpoint_stride': 2},
+            'obs_density_box_deg': 10.0, 'jc_z_weight': 20.0, 'checkpoint_stride': 2},
 }
 
 
@@ -35,6 +36,29 @@ def x0():
 def test_gradient_matches_finite_differences(variant, x0):
     p = Problem(**VARIANTS[variant])
     assert gradient_error(p.cost_and_grad, p.cost, x0) < GRAD_TOL
+
+
+# increment_at_start (NeuralGCM's path): the increment and the control mask
+# apply to the step-0 state, and the Jc/Jz penalties span steps 0 -> 1
+AT_START_VARIANTS = ['plain', 'control_variables', 'jc_ps_weight', 'jc_z_weight', 'all']
+
+
+@pytest.mark.parametrize('variant', AT_START_VARIANTS)
+def test_gradient_matches_finite_differences_increment_at_start(variant, x0):
+    p = Problem(model=ToyModelAtStart(), **VARIANTS[variant])
+    assert gradient_error(p.cost_and_grad, p.cost, x0) < GRAD_TOL
+
+
+def test_jc_z_penalty_spans_steps_0_to_1_increment_at_start(x0):
+    m = ToyModelAtStart()
+    p = Problem(model=m, **VARIANTS['jc_z_weight'])
+    Jz = float(p.cost(x0)) - float(Problem(model=m).cost(x0))
+    with torch.no_grad():
+        s0 = m.apply_increment(p.state, x0)
+        s1 = m.advance(s0, steps=1, use_checkpoint=False)
+        expected = utils._jc_z_penalty(m.decode_state(s0)['z'], m.decode_state(s1)['z'], *p.jcz_ref)
+    assert Jz > 0
+    assert Jz == pytest.approx(float(expected), rel=1e-9)
 
 
 def test_taylor_remainder_is_second_order(x0):
@@ -109,3 +133,53 @@ def test_planted_bug_gradient_off_by_a_factor(x0):
     p = Problem()
     _, g = p.cost_and_grad(x0)
     assert taylor_order(p.cost_and_grad, p.cost, x0, grad=1.01 * g) < 1.5
+
+
+def test_jc_z_penalty_value():
+    # z1 - z0 = c_k * (level k's w-weighted spatial std of z0) everywhere:
+    # the penalty is factor * mean_k c_k^2, whatever z0 and w are
+    g = torch.Generator().manual_seed(3)
+    z0 = 5000.0 + 300.0 * torch.randn(3, 40, generator=g, dtype=torch.float64)
+    w = torch.rand(40, generator=g, dtype=torch.float64)
+    w = w / w.sum()
+    std = torch.sqrt((w * (z0 - (w * z0).sum(1, keepdim=True)) ** 2).sum(1, keepdim=True))
+    c = torch.tensor([[0.1], [0.2], [0.4]], dtype=torch.float64)
+    Jz = utils._jc_z_penalty(z0, z0 + c * std, w, 7.0)
+    assert float(Jz) == pytest.approx(7.0 * float((c ** 2).mean()), rel=1e-12)
+
+
+def test_planted_bug_jc_z_detached_normalization(x0, monkeypatch):
+    # the penalty's normalization (z0's spatial std) depends on the
+    # increment too; detaching it leaves the value unchanged
+    def detached_std(z0, z1, w, factor):
+        z0r = z0.reshape(-1, w.shape[0])
+        zstd = torch.sqrt((w * (z0r - (w * z0r).sum(1, keepdim=True)) ** 2).sum(1, keepdim=True)).detach()
+        return factor * (w * (((z1.reshape(-1, w.shape[0]) - z0r) / zstd) ** 2).mean(dim=0)).sum()
+
+    p = Problem(**VARIANTS['jc_z_weight'])
+    J = float(p.cost(x0))
+    monkeypatch.setattr(utils, '_jc_z_penalty', detached_std)
+    assert float(p.cost(x0)) == pytest.approx(J, rel=1e-12)
+    monkeypatch.setattr(utils, '_jc_z_penalty', detached_std)
+    assert gradient_error(p.cost_and_grad, p.cost, x0) > 1e-3
+
+
+@pytest.mark.parametrize('at_start, n_steps, ok', [(False, 1, False), (False, 2, True),
+                                                   (True, 0, False), (True, 1, True)])
+def test_first_step_penalties_reject_too_short_windows(at_start, n_steps, ok):
+    for key in ('jc_ps_weight', 'jc_z_weight'):
+        if ok:
+            utils._check_first_step_penalty_window({key: 1.0}, at_start, n_steps)
+        else:
+            with pytest.raises(ValueError, match='at least'):
+                utils._check_first_step_penalty_window({key: 1.0}, at_start, n_steps)
+    utils._check_first_step_penalty_window({}, at_start, n_steps)   # penalties off: anything goes
+
+
+def test_jc_z_diagnostic_with_no_obs(x0, capsys):
+    # an empty window makes the penalty's factor 0: the printed rms must not divide by it
+    p = Problem(**VARIANTS['jc_z_weight'])
+    J, _ = utils.compute_loss_4dvar(
+        p.model, x0, 1.0, p.state, p.verif_ic, p.psobs_traj, 1, p.exp, p.grid_interp, 1,
+        p.interp_specs, jcz_ref=(p.jcz_ref[0], 0.0))
+    assert 'Jz = 0.0' in capsys.readouterr().out
