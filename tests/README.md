@@ -43,6 +43,9 @@ network access, in a few seconds. `make check` runs:
     `control_variables`, `jc_ps_weight`, `obs_density_box_deg`,
     `jc_z_weight` and all of them together (~1e-9 to 2e-8; tolerance 1e-6);
     `_jc_z_penalty`'s value is also checked against a hand-computed case;
+    the same for a toy model with `increment_at_start` (NeuralGCM's path:
+    increment and control mask at step 0, the penalties over steps 0 -> 1),
+    whose Jz is also checked against the value from steps 0 and 1;
   - `taylor_order`: the first-order Taylor remainder falls as eps^2 (order
     1.99; must exceed 1.9);
   - checkpointing (`checkpoint_stride` 1, 2, 3) leaves cost and gradient
