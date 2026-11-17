@@ -76,3 +76,35 @@ def test_to_utc_datetime(backend, aware):
     dt = utils._to_utc_datetime('2015-01-02T18', backend)
     assert (dt.tzinfo is timezone.utc) == aware
     assert (dt.year, dt.month, dt.day, dt.hour) == (2015, 1, 2, 18)
+
+
+def _jcz_case(seed=0, nlev=3, npts=50):
+    g = torch.Generator().manual_seed(seed)
+    z0 = torch.randn(nlev, npts, generator=g, dtype=torch.float64) * torch.tensor([[1.], [10.], [100.]], dtype=torch.float64)
+    z1 = z0 + 0.1 * torch.randn(nlev, npts, generator=g, dtype=torch.float64)
+    w = torch.rand(npts, generator=g, dtype=torch.float64)
+    return z0, z1, w / w.sum()
+
+
+def test_jc_z_penalty_matches_hand_computation():
+    z0, z1, w = _jcz_case()
+    expected = 0.0
+    for k in range(z0.shape[0]):
+        m = float((w * z0[k]).sum())
+        sd = math.sqrt(float((w * (z0[k] - m) ** 2).sum()))
+        expected += float((w * ((z1[k] - z0[k]) / sd) ** 2).sum()) / z0.shape[0]
+    assert utils._jc_z_penalty(z0, z1, w, 7.0).item() == pytest.approx(7.0 * expected, rel=1e-12)
+
+
+def test_jc_z_penalty_scale_invariant_and_zero_without_tendency():
+    z0, z1, w = _jcz_case()
+    j = utils._jc_z_penalty(z0, z1, w, 1.0)
+    assert utils._jc_z_penalty(3.0 * z0, 3.0 * z1, w, 1.0).item() == pytest.approx(j.item(), rel=1e-12)
+    assert utils._jc_z_penalty(z0, z0.clone(), w, 1.0).item() == 0.0
+
+
+def test_jc_z_penalty_gradcheck():
+    z0, z1, w = _jcz_case(npts=8)
+    z0.requires_grad_(True)
+    z1.requires_grad_(True)
+    assert torch.autograd.gradcheck(lambda a, b: utils._jc_z_penalty(a, b, w, 2.0), (z0, z1))
