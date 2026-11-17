@@ -1542,6 +1542,18 @@ def _obs_density_weights(used, lat, lon, box_deg):
     return w * m.sum() / torch.clamp(w.sum(), min=1e-30)
 
 
+def _check_first_step_penalty_window(exp, increment_at_start, n_steps):
+    """`jc_ps_weight` and `jc_z_weight` penalize the change over the first
+    step after injection -- steps 0 -> 1 with `increment_at_start`, else
+    1 -> 2 -- so the window must reach its end."""
+    if not (exp.get('jc_ps_weight') or exp.get('jc_z_weight')):
+        return
+    need = 1 if increment_at_start else 2
+    if n_steps < need:
+        raise ValueError(f"jc_ps_weight/jc_z_weight need a window of at least {need} model steps "
+                         f"for this backend; this one has {n_steps}")
+
+
 def _jc_z_penalty(z0, z1, w, factor):
     """`jc_z_weight` penalty (see compute_loss_4dvar):
     factor * sum_i w_i * mean_k ((z1 - z0)_ki / zstd_k)^2, with zstd_k the
@@ -1747,8 +1759,8 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         Jz = _jc_z_penalty(jcz[jc_steps[0]], jcz[jc_steps[1]], jcz_w, jcz_factor)
         J = J + Jz
         if do_print:
-            print(f"epoch {epoch}, Jz = {Jz.item()} (first-step normalized z tendency "
-                  f"{(Jz.item() / jcz_factor) ** 0.5:.4g} rms)")
+            rms = (Jz.item() / jcz_factor) ** 0.5 if jcz_factor > 0 else float('nan')   # no obs: factor 0
+            print(f"epoch {epoch}, Jz = {Jz.item()} (first-step normalized z tendency {rms:.4g} rms)")
     if do_print:
         print(f"epoch {epoch}, Jtot = {J.item()}")
 
@@ -1901,6 +1913,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     # of the pressure increment -- see compute_loss_4dvar's docstring. Needs
     # the uncorrected background's pressure one and two steps in (no
     # gradient), computed once here.
+    _check_first_step_penalty_window(exp, model.increment_at_start, psobs_traj['n_steps'])
     jc_ref = None
     if exp.get('jc_ps_weight'):
         # Pressure field for the penalty: surface pressure where the backend

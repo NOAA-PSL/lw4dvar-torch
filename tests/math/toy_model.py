@@ -143,3 +143,14 @@ class ToyModel(LatentForecastModel):
             else:
                 x = self._step(x, inc)
         return ToyState(x, state.date + steps * self.timestep)
+
+
+class ToyModelAtStart(ToyModel):
+    """The toy model with the increment applied to the state at the window
+    start (`increment_at_start`, as the JAX backends -- NeuralGCM -- do), not
+    inside the first step: a nonlinear latent -> state map added to step 0."""
+    increment_at_start = True
+
+    def apply_increment(self, state, latent_increment):
+        dx = torch.einsum('cl,lhw->chw', self.w_dec, torch.tanh(latent_increment))[None]
+        return ToyState(state.state + self.spread * dx, state.date)
