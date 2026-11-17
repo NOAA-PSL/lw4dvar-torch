@@ -171,10 +171,11 @@ z500 rms 9.75 / 3.18 / 7.95 / 7.49 m (NH / tropics / SH / global) against the
 original's 9.75 / 3.16 / 7.95 / 7.48; first-cycle cost 528716 -> 205575
 (original 534874 -> 199026); ~5 min per cycle on an H100 (as the original).
 Analyses are 3-7 m worse than the original's (global 16.9, 13.1, 12.5, 11.9
-vs ~10.2, 9.0, 9.1, 9.1 m), narrowing each cycle. Known differences: the
-original's `lam: 20` penalty on the first-step (1 h) geopotential tendency
-at all levels (normalized per level by its spatial std, times N_obs) has no
-counterpart here (now `jc_z_weight`, below); and this solver reported the
+vs ~10.2, 9.0, 9.1, 9.1 m), narrowing each cycle. Known differences at
+the time: the original's `lam: 20` penalty on the first-step (1 h)
+geopotential tendency at all levels (normalized per level by its spatial
+std, times N_obs) had no counterpart in this solver until `jc_z_weight`
+(below), and this run has it off; and this solver reported the
 analysis at window start + dt_verif (+3 h), the original at the window
 start. Since the window-start increments (`increment_at_start`, 2026-11-06)
 the analysis is valid at window start here too.
@@ -189,8 +190,10 @@ after the increment (steps 0 -> 1 with `increment_at_start`, 1 h for
 neuralgcm), zstd_k the spatial std of the analysis z on level k (same
 weights), N_obs the obs available in the window. Unlike `jc_ps_weight` it
 penalizes the analysis' whole tendency, not the change of the increment.
-The grid mean and zstd_k are area (cos lat) weighted, the original's
-August 2026 form. Its July 2026 form, used for the GRL paper runs
+The grid mean and zstd_k are weighted by the backend's `model.area_weights`
+(cell areas, not cos(lat), which is wrong on reduced grids such as AIFS's;
+on neuralgcm's Gaussian grid the two agree closely), the original's August
+2026 (cos lat) form. Its July 2026 form, used for the GRL paper runs
 (`test_realpsobs_3hrly_4d_2015`), used a uniform grid mean and the ERA5 z
 std at window start; a `jc_z_mean: uniform` option reproducing it was
 dropped (2026-11-16) after the area form cycled well with neuralgcm.
