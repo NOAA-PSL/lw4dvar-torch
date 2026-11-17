@@ -572,7 +572,39 @@ def load_config(config_path='config.yml'):
             )
         if not variables:
             raise ValueError("observations.raobs.variables must be non-empty when observations.raobs.enabled is True")
+        if len(set(variables)) != len(variables):
+            # Not just redundant: raobs_traj['variables'] (== bases, see
+            # get_raobs) is iterated by several NON-idempotent per-base
+            # steps downstream (most notably save_trajectory_diagnostics's
+            # _pad_leading, which prepends leading rows every time it's
+            # called) -- a repeated entry silently pads/processes that base
+            # twice, corrupting its row count.
+            raise ValueError(f"observations.raobs.variables must not contain duplicates, got {list(variables)}")
         exp['raobs_variables'] = list(variables)
+
+        error_std = exp.get('raobs_error_std')
+        if error_std is not None:
+            bad_keys = set(error_std) - {'t', 'u', 'v'}
+            if bad_keys:
+                raise ValueError(
+                    f"observations.raobs.error_std keys must be a subset of ('t', 'u', 'v') "
+                    f"(the short base names, not e.g. 'temperature'), got {sorted(bad_keys)}"
+                )
+            for k, v in error_std.items():
+                if not (np.isfinite(v) and v > 0):
+                    raise ValueError(f"observations.raobs.error_std[{k!r}] must be positive and finite, got {v!r}")
+        for key in ('raobs_q_error_fraction', 'raobs_q_error_floor_kg_kg'):
+            v = exp.get(key)
+            if v is not None and not (np.isfinite(v) and v > 0):
+                raise ValueError(f"observations.raobs.{key[len('raobs_'):]} must be positive and finite, got {v!r}")
+        q_error_g_kg = exp.get('raobs_q_error_g_kg')
+        if q_error_g_kg is not None:
+            for p, e in q_error_g_kg.items():
+                if not (np.isfinite(p) and p > 0):
+                    raise ValueError(
+                        f"observations.raobs.q_error_g_kg has a non-positive/non-finite pressure key {p!r} (hPa)")
+                if not (np.isfinite(e) and e > 0):
+                    raise ValueError(f"observations.raobs.q_error_g_kg[{p!r}] must be positive and finite, got {e!r}")
     return exp, windows
 
 
@@ -2681,8 +2713,15 @@ def save_raobs_diagnostics(exp, raobs_traj, background, analysis, valid_times, l
             'history': 'Created by long_window_4dvar.py',
         },
     )
+    # station_slot beyond a time's actual station count is zero-padding
+    # (see get_raobs), not a real station at (0N, 0E) -- mask it with
+    # n_valid, same as the psobs diagnostics do for their own location
+    # fields via `available`.
+    n_valid = raobs_traj['n_valid'].detach().cpu().numpy()
+    station_valid = np.arange(capacity)[None, :] < n_valid[:, None]
     for name in ('lat', 'lon', 'elev'):
-        ds['station_'+name] = (('time', 'station_slot'), raobs_traj[name].detach().cpu().numpy().astype(np.float32))
+        values = raobs_traj[name].detach().cpu().numpy().astype(np.float32)
+        ds['station_'+name] = (('time', 'station_slot'), np.where(station_valid, values, np.nan))
 
     for base in raobs_traj['variables']:
         level_dim = 'level_'+base

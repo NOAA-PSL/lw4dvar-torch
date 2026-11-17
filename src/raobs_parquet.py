@@ -73,6 +73,9 @@ def _profile_records(
     prepbufr_classes,
     quality_mark_max,
     pressure_match_tolerance_hpa,
+    geopotential_height_min_m,
+    geopotential_height_max_m,
+    below_station_tolerance_m,
 ):
     """Return {(slot_index, station_key): record} before fixed-shape padding.
 
@@ -81,6 +84,20 @@ def _profile_records(
     `pressure_match_tolerance_hpa` of one of THAT variable's own levels (so
     `u`/`v` can share one level set while `q` uses a shorter one, matching
     each variable's actual model pressure-level axis).
+
+    Duplicate (variable, level_index) rows for the same station/slot are
+    ranked by actual QC eligibility, not just the raw PREPBUFR quality
+    mark: a row whose own quality fails `quality_mark_max`, OR whose
+    (quality-passing, non-category-4) height fails the physical-height-
+    bounds/below-station checks, ranks behind any row that passes both --
+    otherwise picking the single numerically-best-quality-mark duplicate
+    (the only criterion previously used) could retain a row with a
+    garbage height over an available row that would have passed every
+    check, which then wrongly fails height-based QC downstream. Within
+    the same pass/fail bucket, lower (better) quality mark still wins, so
+    an all-bad set of duplicates still keeps its best candidate
+    (`load_raobs_parquet` still flags it bad via its own QC pass over the
+    final selection -- this only changes WHICH duplicate gets selected).
     """
     variables = tuple(variables)
     unsupported = set(variables) - set(_VARIABLE_COLUMNS)
@@ -169,9 +186,10 @@ def _profile_records(
                     str(cycle)+':'+str(report_id),
                 )
                 key = (slot_index, station_key)
+                elevation_m = elevation[report_row]
                 record = records.setdefault(key, {
-                    'lat': lat, 'lon': lon, 'elev': elevation[report_row],
-                    'values': {}, 'quality': {}, 'height': {}, 'height_quality': {},
+                    'lat': lat, 'lon': lon, 'elev': elevation_m,
+                    'values': {}, 'quality': {}, 'height': {}, 'height_quality': {}, 'priority': {},
                 })
 
                 for variable in variables:
@@ -187,27 +205,46 @@ def _profile_records(
                     if convert is not None:
                         value = convert(value)
                     quality = level_quality[variable][level_row]
-                    existing_quality = record['quality'].get((variable, level_index), np.inf)
-                    if (
-                        (variable, level_index) not in record['values']
-                        or (np.isfinite(quality) and (
-                            not np.isfinite(existing_quality) or quality < existing_quality
-                        ))
-                    ):
+                    height_m = height[level_row]
+                    height_quality_value = height_quality[level_row]
+                    # Only a height that would actually be attached (see
+                    # fix below: category 4 / failing its own quality mark
+                    # never is) can count against this row -- an absent or
+                    # ineligible height can't be judged either way.
+                    height_eligible = (
+                        np.isfinite(height_m) and category[level_row] != 4
+                        and _quality_passes(height_quality_value, quality_mark_max)
+                    )
+                    height_bad = height_eligible and (
+                        not (float(geopotential_height_min_m) <= height_m <= float(geopotential_height_max_m))
+                        or (
+                            np.isfinite(elevation_m)
+                            and height_m < elevation_m - float(below_station_tolerance_m)
+                        )
+                    )
+                    quality_bad = not _quality_passes(quality, quality_mark_max)
+                    # (worse-bucket-first, then numeric quality mark -- a
+                    # non-finite quality sorts last within its bucket, same
+                    # as the pre-existing tie-break).
+                    priority = (quality_bad or height_bad, quality if np.isfinite(quality) else np.inf)
+
+                    existing_priority = record['priority'].get((variable, level_index))
+                    if existing_priority is None or priority < existing_priority:
                         record['values'][(variable, level_index)] = value
                         record['quality'][(variable, level_index)] = quality
+                        record['priority'][(variable, level_index)] = priority
                         # Clear any height left over from the row this one
                         # is replacing before conditionally attaching the
                         # new row's own -- otherwise a stale height from
                         # the discarded row survives whenever the
-                        # replacement itself has no eligible height (missing
-                        # or category 4), corrupting the physical-height/
-                        # monotonicity QC checks downstream.
+                        # replacement itself has no eligible height,
+                        # corrupting the physical-height/monotonicity QC
+                        # checks downstream.
                         record['height'].pop((variable, level_index), None)
                         record['height_quality'].pop((variable, level_index), None)
-                        if np.isfinite(height[level_row]) and category[level_row] != 4:
-                            record['height'][(variable, level_index)] = height[level_row]
-                            record['height_quality'][(variable, level_index)] = height_quality[level_row]
+                        if height_eligible:
+                            record['height'][(variable, level_index)] = height_m
+                            record['height_quality'][(variable, level_index)] = height_quality_value
     return records
 
 
@@ -249,6 +286,7 @@ def load_raobs_parquet(
     records = _profile_records(
         directory, verification_times, levels_hpa, variables, time_tolerance_hours,
         prepbufr_classes, quality_mark_max, pressure_match_tolerance_hpa,
+        geopotential_height_min_m, geopotential_height_max_m, below_station_tolerance_m,
     )
 
     by_slot = {}
