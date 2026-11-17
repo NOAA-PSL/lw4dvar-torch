@@ -99,7 +99,8 @@ python tests/make_fixtures.py golden          # the toy-model files
 python tests/make_fixtures.py golden --ace2   # also mini_ace2.json (needs fme)
 ```
 
-The toy runs' obs values are frozen in `toy_obs.json`; `--toy-obs` rewrites
+The toy runs' obs values are frozen in `toy_obs.json`, one set per forward
+operator (`logpinterp`, `ps`), each made with its own operator; `--toy-obs` rewrites
 them, only when the toy problem itself changes -- never to absorb a solver
 change (obs rebuilt from the current forward operator would move with it).
 
@@ -110,11 +111,12 @@ A failure lists the values that moved, with golden and new values.
   (control and AdamW state too), 20 epochs of AdamW with the warmup +
   cosine schedule, with QC active -- four obs carry gross errors the
   background check rejects, and the station-height check rejects a few
-  more. Five configs (`toy_golden.CONFIGS`): defaults; obs-density weights
+  more. Five configs (`toy_golden.CONFIGS`): defaults (no `ps_operator`
+  either, so the solver's own fallback); obs-density weights
   plus `jc_ps_weight`; `control_variables` plus `checkpoint_stride: 2`;
   `ps_operator: ps`; `jc_z_weight`. Frozen: the cost at every epoch, Jo per obs slot at
   the first and last epoch, the increment's statistics and a sample of its
-  values, the analysis' per-channel mean and std, and per-slot obs counts,
+  values, the analysis' area-weighted per-channel mean and std, and per-slot obs counts,
   mean and rms O-B and O-A. Deterministic, compared to 1e-8 relative. A
   planted change -- the learning rate 1% higher, `bg_check` 4 -> 3.5 -- must
   move the cost far outside that (`test_planted_change_is_caught`), and so

@@ -50,7 +50,8 @@ BASE = {
     'date': '2015010100', 'window_name': '1', 'suffix': '',
 }
 CONFIGS = {
-    'default': {},
+    # no ps_operator: the solver's own fallback (problem.py's BASE_EXP sets one)
+    'default': {'ps_operator': None},
     'obden_jcps': {'obs_density_box_deg': 10.0, 'jc_ps_weight': 0.01},
     'control_stride2': {'control_variables': ['z', 'sp'], 'checkpoint_stride': 2},
     # the MAPS reduction from a mid-level t, q (the toy model has no 700 hPa;
@@ -63,20 +64,31 @@ CONFIGS = {
 GROSS = [(0, 3, 40.0), (2, 17, -35.0), (5, 8, 60.0), (8, 20, -50.0)]
 
 
-def make_obs():
-    """The toy obs as problem.py builds them (the background's H(x) plus
-    noise), with the gross errors added: (n_slots, N_OBS), as the solver
-    reads them."""
-    ob = Problem(**BASE).psobs_traj['ob'][:, :N_OBS].clone()
+# One frozen obs set per forward operator, each made with that operator so
+# the obs are consistent with it (the 'ps' operator's H(x) differs from
+# logpinterp's by more than the background check allows at most stations).
+OBS_SETS = {'logpinterp': {'ps_operator': 'logpinterp'}, 'ps': CONFIGS['ps_operator']}
+
+
+def _obs_set(name):
+    return 'ps' if CONFIGS[name].get('ps_operator') == 'ps' else 'logpinterp'
+
+
+def make_obs(obs_set):
+    """The toy obs as problem.py builds them (the background's H(x), with
+    `obs_set`'s operator, plus noise), with the gross errors added:
+    (n_slots, N_OBS), as the solver reads them."""
+    ob = Problem(**{**BASE, **OBS_SETS[obs_set]}).psobs_traj['ob'][:, :N_OBS].clone()
     for slot, k, err in GROSS:
         ob[slot, k] += err
     return ob
 
 
 def write_obs():
+    obs = {k: make_obs(k).tolist() for k in OBS_SETS}   # before truncating the file
     os.makedirs(GOLDEN_DIR, exist_ok=True)
     with open(OBS_PATH, 'w') as f:
-        json.dump({'ob': make_obs().tolist()}, f, indent=1)
+        json.dump(obs, f, indent=1)
         f.write('\n')
     return OBS_PATH
 
@@ -84,7 +96,7 @@ def write_obs():
 def _problem(name):
     p = Problem(**{**BASE, **CONFIGS[name]})
     with open(OBS_PATH) as f:
-        ob = torch.tensor(json.load(f)['ob'], dtype=torch.float64)
+        ob = torch.tensor(json.load(f)[_obs_set(name)], dtype=torch.float64)
     assert ob.shape == p.psobs_traj['ob'][:, :N_OBS].shape, ob.shape
     p.psobs_traj['ob'][:, :N_OBS] = ob
     return p
@@ -140,6 +152,12 @@ def run(name):
 
     flat = inc.flatten()
     a = analysis.state[0].reshape(analysis.state.shape[1], -1)
+    # area-weighted, as the solver's grid statistics (toy rows: equal point
+    # counts, unequal cell areas)
+    w = torch.as_tensor(p.model.area_weights, dtype=a.dtype)
+    w = w / w.sum()
+    a_mean = (a * w).sum(dim=1)
+    a_std = (((a - a_mean[:, None]) ** 2) * w).sum(dim=1).sqrt()
     resolved = {k: v for k, v in exp.items() if k != 'path_output'}
     return {
         'config': resolved,
@@ -153,8 +171,8 @@ def run(name):
             'min': float(flat.min()), 'max': float(flat.max()),
             'sample': flat[::37].tolist(),
         },
-        'analysis_channel_mean': a.mean(dim=1).tolist(),
-        'analysis_channel_std': a.std(dim=1).tolist(),
+        'analysis_channel_mean': a_mean.tolist(),
+        'analysis_channel_std': a_std.tolist(),
         'background_obs': _diagnostics(p, p.state, None),
         'analysis_obs': _diagnostics(p, p.state, inc),
         'n_obs_per_slot': N_OBS,
@@ -166,8 +184,9 @@ def golden_path(name):
 
 
 def write(name):
+    summary = run(name)          # before truncating the file: a failed run keeps the old one
     os.makedirs(GOLDEN_DIR, exist_ok=True)
     with open(golden_path(name), 'w') as f:
-        json.dump(run(name), f, indent=1)
+        json.dump(summary, f, indent=1)
         f.write('\n')
     return golden_path(name)

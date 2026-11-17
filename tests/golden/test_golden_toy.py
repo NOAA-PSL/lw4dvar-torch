@@ -40,7 +40,8 @@ def test_planted_operator_bias_is_caught(monkeypatch):
     with open(toy_golden.golden_path('default')) as f:
         golden = json.load(f)
     orig = toy_golden.utils.get_surface_pressure
-    monkeypatch.setattr(toy_golden.utils, 'get_surface_pressure', lambda *a, **k: orig(*a, **k) + 50.0)
+    # get_surface_pressure works in the levels' units: hPa for the toy model
+    monkeypatch.setattr(toy_golden.utils, 'get_surface_pressure', lambda *a, **k: orig(*a, **k) + 0.5)
     mismatches = toy_golden.compare(golden, toy_golden.run('default'), toy_golden.RTOL)
     assert any(m[0].startswith('/loss[') for m in mismatches), 'an operator bias left the cost unchanged'
 
