@@ -473,6 +473,148 @@ but a future `git submodule update` in this checkout may try to re-sync
 this directory against the pinned commit and complain about or disturb the
 now-present, untracked-from-git's-perspective content.
 
+## ACE2 Tropics z500 degradation with raobs: diagnosed, not yet fixed (2026-11-17)
+
+Comparing the two long-cycling experiments above against their ps-only
+counterparts (the sibling `add-parquet-ps-dev` repo's own
+`-longcyc-obsint-1hour-t3` runs) via region-split z500 and raobs-fit
+comparison scripts (`plots/z500err_ts_txt_vs_parquet_cycle_compare.py`,
+`plots/obs_assimilated_ts_txt_vs_parquet_cycle_compare*.py`,
+`plots/raobs_tuv_profile_ps_raobs_cycle_compare*.py` -- one directory up
+from this repo, `add-parquet-raobs-dev/plots/`, left untracked by
+convention like every other analysis script; not part of this repo's own
+`plots/` output):
+
+- **AIFS-1deg**: z500 RMS error improves with ps+raobs vs. ps-only across
+  NH/Tropics/SH, as expected from adding more observations.
+- **ACE2**: improves in NH/SH but **gets WORSE in the Tropics specifically**
+  -- the opposite of what adding raobs should do.
+
+**Root cause, traced via the raobs fit itself (O-B/O-A bias+RMSE profiles,
+by region)**: ACE2's RMSE vs. raobs is jagged and spikes sharply above
+200 hPa for t/u/v (e.g. t: 0.84 K at 250 hPa -> 3.06 K at 150 hPa), while
+AIFS's grows smoothly toward the stratosphere at the same obs
+locations/times (t: 0.58 K -> 0.92 K over the same levels) -- confirming
+this is an ACE2 representativity problem, not a property of the obs
+themselves. Pulled the released ACE2-ERA5 checkpoint's own sigma
+coordinates directly (`sigma_coordinates['ak']`/`['bk']` in the
+checkpoint's `stepper` state): its 8 native hybrid layers have midpoints
+at only ~26/98/199/330/503/689/847/964 hPa, so the derived t/u/v above
+~200 hPa (`ace2_model.py`'s `_to_pressure_levels`) are coarse
+linear-in-ln(p) interpolations between just 2-3 widely-spaced native
+points -- genuinely poor vertical resolution there, not a bug. Meanwhile
+`observations.raobs.error_std` (`t: 1.0` K, `u`/`v: 2.0` m/s) is a single
+fixed value, the same regardless of level or backend, so at these levels
+the DA badly over-trusts obs the model can't actually resolve.
+
+**Why Tropics specifically**: splitting the same RMSE-by-level comparison
+by region (NH/Tropics/SH) shows the **temperature** spike above 200 hPa is
+global -- NH and SH jump almost as much as Tropics (SH slightly worse at
+150 hPa). But the **wind** spike is concentrated in the Tropics: at
+150 hPa, Tropics u-RMSE runs 60-80% higher than NH or SH (8.35 m/s vs.
+4.44/5.23 m/s for that cycle's window) -- consistent with the Tropical
+Easterly Jet (~150 hPa) and QBO (~50 hPa) being sharp, genuinely-tropical
+wind features with no extratropical analogue at levels ACE2's coarse grid
+can resolve, compounded by the Tropics' smaller baseline z500 variance
+(this repo's own z500 comparison plot: Tropics spans ~3-10 m vs. NH/SH's
+~10-25 m) making the same absolute noise injection show up as a much
+larger relative degradation.
+
+**Status**: diagnosed with data (level/region-resolved RMSE profiles,
+the checkpoint's own sigma coordinates), not yet fixed. Candidate fix,
+not yet tried: cap ACE2's `raobs.variables` assimilation to levels
+<=200 hPa, or use a level/backend-dependent `error_std` that reflects
+ACE2's actual (much coarser) skill above it -- analogous to the existing
+`specific_humidity` exclusion above, just for t/u/v's upper-level
+representativity instead of a whole-variable physical mismatch.
+
+## PR #29 (`add-parquet-raobs-dev` -> `main`): merge conflict and review fixes (2026-11-17)
+
+Before opening the PR, merged `main` into this branch
+(`git merge main`, commit `0e7275b`) to pick up `main`'s `jc_z_weight`
+feature (PR #27) first. Hit one real conflict:
+`compute_loss_4dvar`'s signature -- this branch had independently added a
+trailing `raobs_traj=None`, `main` a trailing `jcz_ref=None`. Resolved by
+appending `raobs_traj` AFTER `jcz_ref` (`..., jc_ref=None, jcz_ref=None,
+raobs_traj=None)`), not between `jc_ref` and `jcz_ref`: `tests/math/
+problem.py`'s `Problem.cost()` calls this function **positionally**,
+ending `..., self.jc_ref, self.jcz_ref` -- inserting `raobs_traj` any
+earlier would have silently routed `self.jcz_ref` into the wrong
+parameter with no error. Verified against the full suite (179 passed) and
+the real end-to-end `make check-ace2` run before pushing.
+
+[PR #29](https://github.com/NOAA-PSL/lw4dvar-torch/pull/29) then got two
+rounds of GitHub Copilot's automated review, both fully addressed:
+
+- **Round 1** (commit `a6ad7b9`, 5 issues): `backends/hybrid_levels.py` had
+  the SAME NaN-control-gradient bug as `ace2_model.py`'s
+  `_to_pressure_levels` (see "Found and fixed a real ACE2 backend bug" in
+  the raobs section above) -- a second, independent copy of the identical
+  derivation, newly reachable once `ngcm`/`neuralgcm`/`graphcast` were
+  added to `RAOBS_SUPPORTED_BACKENDS`; same safe-denominator fix applied.
+  Plus: `raobs_error_std` replaced the whole `{t, u, v}` default dict
+  instead of merging over it (a partial override like `{t: 1.5}` would
+  `KeyError('u')` on the first wind ob); a short/one-step window left a
+  raobs base's diagnostics as `{}` instead of a correctly shaped empty
+  array, `KeyError` in `_pad_leading`; the raobs loss term's per-base
+  `used.sum().item()` (a CUDA sync) ran every obs slot of every epoch
+  regardless of whether anything was printed; and the duplicate-observation
+  height-metadata staleness bug below.
+- **Round 2** (commit `a8efc6a`): enabling raobs with `specific_humidity`
+  against an ACE2 checkpoint whose humidity is `specific_total_water` is
+  now a hard `ValueError` (new `ACE2Model.humidity_family` accessor),
+  instead of relying on every config author remembering the exclusion
+  above by convention.
+- **Round 3** (commit `985a5a2`, the review's "previously missed" findings
+  on re-scan): duplicate `raobs.variables` entries are now rejected at
+  config-load time (silently corrupted saved NetCDF row counts via
+  `_pad_leading` being called twice for the same base); `raobs.error_std`/
+  `q_error_*` settings are now validated (positive, finite, valid keys) at
+  config-load time instead of producing a non-finite loss or a silently
+  ignored typo; padded `station_slot` lat/lon/elev in the saved
+  diagnostics are now masked with NaN instead of written as a literal
+  station at (0N, 0E); and `raobs_parquet.py`'s duplicate-observation
+  selection now ranks candidates by actual QC eligibility (own quality
+  mark AND, if a height is attached, the physical-height/below-station
+  checks) instead of quality mark alone, with heights that fail their own
+  quality mark excluded from attachment entirely (previously used for QC
+  regardless).
+
+**Real-world impact, checked against the actual archive, not just
+`make check`**: ran the pre-fix and post-fix `raobs_parquet.py` read logic
+side by side against the real PREPBUFR archive both long-cycling runs
+above actually use. The round-1 stale-height-metadata fix never fires in
+that data (0 of 8081 AIFS station-records, 0 of 7869 ACE2 station-records
+differ). The round-3 QC-ranking fix DOES fire: a handful to ~11 extra
+temperature observations recovered per 5-day window out of 65-76k accepted
+(e.g. AIFS 72438 -> 72441 t obs; ACE2 70109 -> 70112 first cycle, 65205 ->
+65216 last cycle), u/v unaffected in every window checked -- small, and
+strictly an improvement (recovers previously wrongly-rejected obs, never
+drops a good one).
+
+**Reproducibility implication**: because of that last fix, re-running
+either `-ps_raobs-t1` config with the current code would NOT reproduce the
+already-saved output bit-for-bit (the first round-3 item, after every
+earlier fix round proved exactly reproducible against the real archive) --
+expected to be within noise for any practical verification metric, but
+worth knowing before treating a fresh rerun and the already-saved cycles
+as identical.
+
+**ps-only reproducibility** (checked separately, for the sibling
+`add-parquet-ps-dev` repo's own `-t3` long-cycling runs): every change from
+this PR sits behind `raobs_enabled`/`raobs_traj is not None` guards
+(`get_raobs` returns `None` immediately when disabled; `raobs_parquet.py`
+is only imported lazily inside it), except the `jc_ps_weight`
+"reuse-the-loss-decode" refactor pulled in from `main` -- and that one is
+forward-value-identical by construction (`ACE2Model.decode_state`'s `'sp'`
+is a pure column slice of the packed state, unaffected by what else is
+requested alongside it in the same decode's `only=` set). `psobs_parquet.py`
+and `forecast_model.py` are byte-identical between the two repos, and
+`prepbufr_parquet_common.py`'s diff is purely additive (new raobs-only
+functions, zero changes to what `psobs_parquet.py` itself calls). A
+ps-only rerun from this branch's current code should reproduce the sibling
+repo's saved `-t3` results bit-for-bit.
+
 ## Why parquet-only (no `.txt`/parquet config switch)
 
 The sibling repo's draft made this same unconditional-replacement call, but
