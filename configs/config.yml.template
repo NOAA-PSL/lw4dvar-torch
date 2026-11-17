@@ -67,10 +67,29 @@ exp:
       # entry (e.g. drop specific_humidity) to turn just that one off
       # without disabling raobs entirely. Default (if enabled but this key
       # is omitted): all four, including specific_humidity.
-      #variables: [temperature, u_component_of_wind, v_component_of_wind, specific_humidity]
+      # model_backend: ace2 should DROP specific_humidity here: ACE2's 'q'
+      # is specific_total_water (vapor + cloud condensate), not a pure
+      # water-vapor specific humidity like AIFS/Aurora's native 'q' -- a
+      # confirmed, non-negligible bias (15-70% of ERA5's own spatial std,
+      # 850-250 hPa; see the add-amv-gpsro sibling branch's
+      # integrate_prepbufr_obs.md, "Known issue: ACE2 'q' is
+      # specific_total_water, not specific_humidity"), and structurally
+      # unresolvable (ACE2 has no separate condensate channel to subtract).
+      #variables: [temperature, u_component_of_wind, v_component_of_wind, specific_humidity]  # all backends except ace2
+      #variables: [temperature, u_component_of_wind, v_component_of_wind]  # ace2
       #path: same as observations.psobs.path by default -- the same parquet archive, ADPUPA class
       #prepbufr_classes: [ADPUPA]
-      #time_tolerance_hours: 3.0 # default dt_obs/2, same convention as observations.psobs.time_tolerance_hours
+      # Deliberately NOT the same convention as observations.psobs.
+      # time_tolerance_hours (0.5h, matching the legacy psobs1_*.txt
+      # generator's own 30-min window for surface obs): a radiosonde launch
+      # is scheduled relative to the synoptic hour but spans a multi-hour
+      # ascent, and only the two main synoptic hours (00/12Z) are launched
+      # densely -- checked directly against this archive (2015-01-01):
+      # 0.5h keeps 93-96% of 00/12Z stations but only 50-60% of the already
+      # much sparser 06/18Z ones (74 vs 124, 36 vs 72). dt_obs/2 (3h for a
+      # 6h cycle) is the default for a reason -- don't lower this to match
+      # psobs's 0.5h.
+      #time_tolerance_hours: 3.0 # default dt_obs/2
       #quality_mark_max: 3
       # Mandatory-level matching tolerance (hPa): an obs level is kept only
       # if its reported pressure is within this of one of the MODEL's own

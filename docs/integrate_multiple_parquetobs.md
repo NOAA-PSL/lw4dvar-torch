@@ -27,11 +27,12 @@ The reader (`src/psobs_parquet.py`, `src/prepbufr_parquet_common.py`) is ported
 near-verbatim from a sibling working copy
 (`/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/
 add-raobs-parquet/lw4dvar-torch`, branch `add-raobs-parquet`, which also adds
-radiosonde (raobs) observations -- NOT ported here; this repo stays ps-only).
-That branch itself ports from `greg-long-window-4dvar`'s JAX/NeuralGCM
-reference implementation (`prepbufr_parquet.py`); see that repo's own
-`integrate_prepbufr_obs.md` for the full archive-layout writeup and the
-raobs design this repo doesn't need.
+radiosonde (raobs) observations -- at the time this section was written, not
+yet ported here; this repo has since added raobs too, see "Adding
+radiosonde (raobs) observations" below). That branch itself ports from
+`greg-long-window-4dvar`'s JAX/NeuralGCM reference implementation
+(`prepbufr_parquet.py`); see that repo's own `integrate_prepbufr_obs.md` for
+the full archive-layout writeup.
 
 ## What changed
 
@@ -377,6 +378,33 @@ mechanically.
   fraction-of-observed-value error -- the fraction scheme weights dry obs
   most and pulls the analysis dry (see the sibling branch's own writeup for
   the numbers that motivated this).
+- **ACE2-specific caveat, confirmed real (2026-11-17)**: exclude
+  `specific_humidity` from `observations.raobs.variables` for
+  `model_backend: ace2`. ACE2's packed-state humidity prognostic is
+  `specific_total_water` (water vapor + cloud condensate), not a pure
+  water-vapor specific humidity the way AIFS/Aurora's native `'q'` is --
+  `ACE2Model.decode_state` derives the generic `'q'`/`specific_humidity`
+  alias straight from it with no separation of the condensate term, and
+  ACE2 has no separate cloud/liquid/ice-water channel to subtract it with.
+  The add-amv-gpsro sibling branch's `integrate_prepbufr_obs.md` quantified
+  this directly against real ERA5 (one column/date, F90 180x360): ACE2 is
+  0.1-0.6 g/kg DRIER than ERA5 at 1000/925 hPa, then 0.06-0.26 g/kg WETTER
+  from 850-250 hPa -- 15-70% of ERA5's own spatial std in that band, i.e. a
+  confirmed, non-negligible bias, not a "usually small" one. Workaround
+  (not a fix, since it's structurally unresolvable): `aifs`/`aurora`
+  configs are unaffected and keep `specific_humidity` by default; only
+  `ace2` configs need the explicit restriction.
+- **`time_tolerance_hours` is deliberately NOT the same value as
+  `observations.psobs`'s** (confirmed 2026-11-17): psobs defaults to 0.5h,
+  matching the legacy `.txt` generator's 30-minute window for essentially
+  instantaneous surface obs. Radiosondes are different -- a launch is
+  scheduled relative to the synoptic hour but the ascent itself spans
+  multiple hours, and only the two main synoptic hours (00/12Z) are
+  launched densely; checked directly against this archive (2015-01-01):
+  a 0.5h tolerance keeps 93-96% of 00/12Z stations but only 50-60% of the
+  already much sparser 06/18Z ones (74 vs 124, 36 vs 72 stations). The
+  default, `dt_obs / 2` (3h for a 6h cycle), is the right choice for raobs
+  specifically -- don't lower it to match psobs's 0.5h.
 - **Testing**: `tests/unit/test_raobs_parquet.py` (hand-crafted archives --
   mandatory-level tolerance, each QC bit, the sensible-temperature
   event-stack lookup and its fallback, the humidity pressure floor,
@@ -387,6 +415,63 @@ mechanically.
   (`tests/make_fixtures.py`'s `_write_raobs_parquet`, at ACE2's own 13
   pressure levels) added to the mini-ACE2 fixture and exercised by
   `tests/ace2/test_ace2_mini.py` alongside psobs.
+
+## First ps + raobs long-cycling experiments (2026-11-17)
+
+Two one-month (300 x 6h cycles, `sdate: 2015-01-01T00`) long-cycling smoke
+experiments, one per backend validated with real raobs runs so far:
+`configs/config_test_ace2-longcyc-obsint-1hour-t1.yml` /
+`slurm/run_ace2-longcyc-obsint-1hour-t1.sh` and
+`configs/config_test_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-t1.yml` /
+`slurm/run_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-t1.sh`. Both are gitignored
+(`configs/config*longcyc*.yml`, `slurm/*longcyc*.sh` -- see `CLAUDE.md`'s
+"left untracked by convention"), same as every prior `-t1`/`-t2`/`-t3`
+config in this family.
+
+Each is the sibling `add-parquet-ps-dev` repo's own ps-only long-cycling
+comparison (`config_test_ace2-longcyc-obsint-1hour-t3.yml` /
+`config_test_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-t3.yml`) plus an
+`observations.raobs` block, using the add-amv-gpsro sibling's established
+settings -- not the code-level 4-variable default -- with two deliberate
+departures from a naive copy, found while reviewing the first draft:
+
+- **ACE2's `raobs.variables` excludes `specific_humidity`**; AIFS2's keeps
+  all four. See the "ACE2-specific caveat" bullet above -- ACE2's `'q'` is
+  `specific_total_water`, a confirmed non-negligible bias against real
+  radiosonde specific humidity, not a backend AIFS/Aurora share.
+- **Both use `time_tolerance_hours: 3.0` (`dt_obs/2`), not psobs's `0.5`**,
+  despite the instinct to match the two observation types' settings for
+  consistency. See the `time_tolerance_hours` bullet above -- raobs and
+  psobs have genuinely different temporal reporting characteristics
+  (radiosonde ascents vs. near-instantaneous surface obs), not an
+  oversight to reconcile.
+- `-t1` (not `-t3`) because this repo has no prior `-t1`/`-t2` attempt at
+  this experiment to collide with -- the sibling's `-t3` numbering reflects
+  its own ps-only `-t1`/`-t2` history, not a shared sequence across repos.
+
+**Readiness check before submission** found a real blocker, since fixed:
+`backends/ace2/ACE2-ERA5` (the git submodule `path_model`/`model_name`
+point at) was completely uninitialized in this checkout (`git submodule
+status` showed the `-` "not initialized" prefix) -- the ACE2 job would have
+failed immediately opening a nonexistent `ace2_era5_ckpt.tar`. The
+documented fix (`README.md`'s "Getting the code":
+`GIT_LFS_SKIP_SMUDGE=1 git submodule update --init` +
+`backends/ace2/ace2_prefetch_checkpoint.py`) needs a login node; the
+checkpoint and `forcing_2014.nc`/`forcing_2015.nc` (the only years this
+run's `nhrs_back: 48`-from-`sdate`-forward span touches) were instead
+copied in directly from the sibling `add-parquet-ps-dev` checkout, which
+already had them. Verified byte-identical to that checkout's copies by
+SHA256 (all three files match exactly) plus a zip-integrity check on the
+checkpoint itself (112 entries, no corrupt members) -- not just a
+file-size/existence check. The AIFS2-1.0deg-v1.0 job needed no equivalent
+fix (its checkpoint is a plain file, not a submodule, and was already
+present). Not fixed: `git submodule status` still shows
+`backends/ace2/ACE2-ERA5` as uninitialized, since the files were copied in
+directly rather than via `git submodule update --init`/`lfs pull` --
+harmless for running the job (nothing in the code checks submodule state),
+but a future `git submodule update` in this checkout may try to re-sync
+this directory against the pinned commit and complain about or disturb the
+now-present, untracked-from-git's-perspective content.
 
 ## Why parquet-only (no `.txt`/parquet config switch)
 
