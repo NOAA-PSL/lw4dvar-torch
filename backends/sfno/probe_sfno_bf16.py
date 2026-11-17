@@ -14,7 +14,7 @@ import time
 import numpy as np
 import torch
 
-sys.path.insert(0, ".")
+sys.path.insert(0, "src")
 sys.path.insert(0, "backends/sfno")
 import sfno_ic  # noqa: E402
 from sfno_model import SFNOModel  # noqa: E402

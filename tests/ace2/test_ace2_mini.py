@@ -1,6 +1,6 @@
 """Smoke run of the full solver with a real (tiny) model: the mini ACE2
 (2.5 deg, 16-layer CRTM+land variables, SFNO embed_dim 64) on CPU, one 24 h
-window of ps obs, 50 epochs, through long_window_4dvar.py exactly as a user
+window of ps obs, 50 epochs, through src/long_window_4dvar.py exactly as a user
 runs it (tests/ace2/mini_ace2.py).
 
 Inputs are tests/data/mini_ace2 (tests/make_fixtures.py mini_ace2) plus the
@@ -8,7 +8,7 @@ checkpoint, a GitHub release asset pinned by sha256 in that directory's
 manifest.json: found at $LW4DVAR_MINI_ACE2_CKPT, else in the cache directory
 ($LW4DVAR_FIXTURE_CACHE, default ~/.cache/lw4dvar), else downloaded there.
 
-Needs fme (requirements-ci-ace2.txt); run with `make check-ace2`. It checks
+Needs fme (envs/requirements-ci-ace2.txt); run with `make check-ace2`. It checks
 that the code runs end to end, that the minimization works (a large, steady
 cost drop), and that the outputs match the golden summary
 tests/data/golden/mini_ace2.json (layer 4, issue #20); not analysis quality:
@@ -31,7 +31,8 @@ from golden_compare import compare, report  # noqa: E402
 
 pytestmark = [pytest.mark.ace2, pytest.mark.slow]
 
-# observed: 136175 -> 55741 (-59%); the margin absorbs CPU/BLAS differences
+# observed: 1979 -> 891 (-55%, synthetic parquet psobs fixture); the margin
+# absorbs CPU/BLAS differences
 MAX_FINAL_TO_FIRST = 0.6
 
 

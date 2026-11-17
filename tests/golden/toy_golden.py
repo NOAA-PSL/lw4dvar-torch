@@ -45,6 +45,8 @@ CONFIGS = {
     # the MAPS reduction from a mid-level t, q (the toy model has no 700 hPa;
     # the driver sets nlev700 from the model's levels)
     'ps_operator': {'ps_operator': 'ps', 'nlev700': 1},
+    # Jz ~20% of the first-epoch cost
+    'jc_z': {'jc_z_weight': 5.0},
 }
 # obs given a gross error (hPa), so the background check rejects them
 GROSS = [(0, 3, 40.0), (2, 17, -35.0), (5, 8, 60.0), (8, 20, -50.0)]

@@ -1,6 +1,6 @@
 """The mini-ACE2 solver run shared by tests/ace2/test_ace2_mini.py and
 `python tests/make_fixtures.py golden --ace2`: its config, the checkpoint
-lookup, the run itself (long_window_4dvar.py in a subprocess, as a user
+lookup, the run itself (src/long_window_4dvar.py in a subprocess, as a user
 runs it) and the golden summary of its outputs.
 
 The mini ACE2 runs in float32, so its summary compares with per-quantity
@@ -100,7 +100,9 @@ def config(tmp_path, ckpt):
         'model_name': os.path.basename(ckpt),
         'forcing_dir': os.path.join(DATA, 'forcing_data') + '/',
         'ic_cache': os.path.join(DATA, 'ic_cache') + '/',
-        'obspath': os.path.join(DATA, 'psobs'),
+        'observations': {'psobs': {
+            'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
+        }},
         'path_output': os.path.join(str(tmp_path), 'output') + '/',
         'exp_name': 'test_ace2_mini',
         'rpath': os.path.join(str(tmp_path), 'unused') + '/',
@@ -110,7 +112,6 @@ def config(tmp_path, ckpt):
         'nhrs_back': m['spinup_h'],
         'n_init': 1,
         'dt_init': 6,
-        'nobs_max': 15000,
         'ic_suffix': f"{m['window_h']}h_{EPOCHS}it",
         'save_levs': [1000, 850, 500, 250, 50],
         'print_every': 1,
@@ -137,7 +138,7 @@ def run(tmp_path, ckpt):
     cfg, exp, windows = config(tmp_path, ckpt)
     # one thread: the result must not depend on the machine's core count
     env = dict(os.environ, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
-    proc = subprocess.run([sys.executable, '-u', 'long_window_4dvar.py', cfg], cwd=REPO_ROOT, env=env,
+    proc = subprocess.run([sys.executable, '-u', 'src/long_window_4dvar.py', cfg], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=1800)
     out = os.path.join(exp['path_output'], exp['exp_name'])
     return proc.returncode, proc.stdout + proc.stderr, exp, windows, out
@@ -150,6 +151,15 @@ def epoch_losses(log):
 def _area_weights(lat):
     w = np.cos(np.radians(lat))
     return w / w.sum()
+
+
+def _portable(exp):
+    """The run's config without its machine-specific paths."""
+    exp = {k: v for k, v in exp.items() if not k.startswith('path') and k not in
+           ('forcing_dir', 'ic_cache', 'rpath')}
+    exp['observations'] = {name: {k: v for k, v in o.items() if k != 'path'}
+                           for name, o in exp['observations'].items()}
+    return exp
 
 
 def summarize(exp, windows, out):
@@ -191,9 +201,7 @@ def summarize(exp, windows, out):
             forecast[name] = {'mean': mean.tolist(), 'std': std.tolist()}
 
     return {
-        'config': {'exp': {k: v for k, v in exp.items() if not k.startswith('path') and k not in
-                           ('forcing_dir', 'ic_cache', 'obspath', 'rpath')},
-                   'windows': windows},
+        'config': {'exp': _portable(exp), 'windows': windows},
         'loss': [h['loss'] for h in history],
         'jo_per_slot_first': history[0]['all_loss'],
         'jo_per_slot_last': history[-1]['all_loss'],

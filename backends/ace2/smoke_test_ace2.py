@@ -27,7 +27,7 @@ import numpy as np
 import torch
 import xarray as xr
 
-sys.path.insert(0, ".")
+sys.path.insert(0, "src")
 sys.path.insert(0, "backends/ace2")
 from ace2_model import ACE2Model  # noqa: E402
 

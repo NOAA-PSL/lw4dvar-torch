@@ -24,7 +24,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from estimate_latent_b import LatentProbe, era5_state, l_power, utils, ace2_ic, th  # noqa: E402
 from check_latent_b_cov import POINTS, RD, FIELDS, geostrophic, geo_stats  # noqa: E402
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src'))
 from latent_b import EnsembleB  # noqa: E402
 
 
