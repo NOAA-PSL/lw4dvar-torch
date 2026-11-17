@@ -99,10 +99,15 @@ python tests/make_fixtures.py golden          # the toy-model files
 python tests/make_fixtures.py golden --ace2   # also mini_ace2.json (needs fme)
 ```
 
+The toy runs' obs values are frozen in `toy_obs.json`; `--toy-obs` rewrites
+them, only when the toy problem itself changes -- never to absorb a solver
+change (obs rebuilt from the current forward operator would move with it).
+
 A failure lists the values that moved, with golden and new values.
 
 - `tests/golden/` (in `make check`): the solver's `compute_optimal` on the
-  math gates' toy problem, float64, 20 epochs of AdamW with the warmup +
+  math gates' toy problem with frozen obs (`toy_obs.json`), float64
+  (control and AdamW state too), 20 epochs of AdamW with the warmup +
   cosine schedule, with QC active -- four obs carry gross errors the
   background check rejects, and the station-height check rejects a few
   more. Five configs (`toy_golden.CONFIGS`): defaults; obs-density weights
@@ -112,11 +117,14 @@ A failure lists the values that moved, with golden and new values.
   values, the analysis' per-channel mean and std, and per-slot obs counts,
   mean and rms O-B and O-A. Deterministic, compared to 1e-8 relative. A
   planted change -- the learning rate 1% higher, `bg_check` 4 -> 3.5 -- must
-  move the cost far outside that (`test_planted_change_is_caught`).
+  move the cost far outside that (`test_planted_change_is_caught`), and so
+  must a 0.5 hPa bias in the forward operator
+  (`test_planted_operator_bias_is_caught`).
 - `tests/data/golden/mini_ace2.json` (in `make check-ace2`): the mini-ACE2
   run's cost history, Jo per slot, obs diagnostics per slot (counts, QC
-  flags, mean and rms O-B and O-A) and area-weighted mean and std of h500,
-  TMP850 and PRESsfc in the analysis forecast. Float32, so tolerances are
+  flag counts, mean and rms O-B and O-A) and mean and std of h500,
+  TMP850 and PRESsfc in the analysis forecast, weighted by the solver's
+  cell areas (`forecast_model.area_weights_from_lats`). Float32, so tolerances are
   per quantity (`mini_ace2.tolerance`), set from running at 1 and at 4
   threads: everything from the background is bit-identical or within 1e-5,
   the cost agrees to ~5e-6 for the first epochs, and the minimization then

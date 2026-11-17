@@ -149,14 +149,19 @@ def epoch_losses(log):
 
 
 def _area_weights(lat):
-    w = np.cos(np.radians(lat))
+    # the solver's cell-area weights (not cos(lat)), summing to 1
+    from forecast_model import area_weights_from_lats
+    w = area_weights_from_lats(lat)
     return w / w.sum()
 
 
 def _portable(exp):
-    """The run's config without its machine-specific paths."""
+    """The run's config without its machine-specific paths; the checkpoint
+    under its manifest name ($LW4DVAR_MINI_ACE2_CKPT may name the same,
+    sha256-checked file differently)."""
     exp = {k: v for k, v in exp.items() if not k.startswith('path') and k not in
            ('forcing_dir', 'ic_cache', 'rpath')}
+    exp['model_name'] = manifest()['checkpoint']['name']
     exp['observations'] = {name: {k: v for k, v in o.items() if k != 'path'}
                            for name, o in exp['observations'].items()}
     return exp
@@ -187,8 +192,9 @@ def summarize(exp, windows, out):
                 'innov_rms': [float(np.sqrt((x ** 2).mean())) if len(x) else None for x in d],
             }
         obs['available'] = ds['surface_pressure_available'].values.astype(bool).sum(axis=1).tolist()
-        qc = ds['surface_pressure_qc_flag'].values
-        obs['qc_flag_counts'] = {str(f): int((qc == f).sum()) for f in np.unique(qc)}
+        # per slot, so a rejection moving between slots is caught
+        qc = ds['surface_pressure_qc_flag'].values           # (slot, obs)
+        obs['qc_flag_counts'] = {str(f): (qc == f).sum(axis=1).tolist() for f in np.unique(qc)}
 
     forecast = {}
     with xr.open_dataset(stem % 'optimal_forecast' + '.nc') as ds:
@@ -196,6 +202,7 @@ def summarize(exp, windows, out):
         w = _area_weights(lat)
         for name in FORECAST_FIELDS:
             v = ds[name].values.astype(np.float64)          # (time, values)
+            assert v.shape[-1] == w.shape[0], (name, v.shape, w.shape)
             mean = (v * w).sum(axis=-1)
             std = np.sqrt((((v - mean[:, None]) ** 2) * w).sum(axis=-1))
             forecast[name] = {'mean': mean.tolist(), 'std': std.tolist()}

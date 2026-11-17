@@ -4,9 +4,19 @@ a few configs. `run(name)` returns a JSON-able summary that
 tests/golden/test_golden_toy.py compares with tests/data/golden/toy_<name>.json
 and `python tests/make_fixtures.py golden` rewrites.
 
-Float64 and deterministic on CPU, so the comparison is tight (RTOL): any
-change to the numbers -- a default, a QC threshold, the optimizer or its
-schedule, a weighting -- shows up, whether or not the gradients stay right.
+Float64 (control and optimizer state included) and deterministic on CPU,
+so the comparison is tight (RTOL): any change to the numbers -- a default, a
+QC threshold, the optimizer or its schedule, a weighting, an operator --
+shows up, whether or not the gradients stay right.
+
+The obs values are frozen in tests/data/golden/toy_obs.json, not rebuilt
+from the solver's forward operator on each run: obs made from the current
+operator would move with it (a bias added to the operator would shift obs
+and H(x) alike and leave the innovations unchanged). The obs locations,
+errors and station heights come from a fixed numpy seed in problem.py,
+independent of the solver. `python tests/make_fixtures.py golden
+--toy-obs` rewrites the obs file -- only when the toy problem itself
+changes, never to absorb a solver change.
 """
 
 import copy
@@ -26,6 +36,7 @@ from problem import N_OBS, Problem  # noqa: E402
 from golden_compare import compare, report  # noqa: E402,F401
 
 GOLDEN_DIR = os.path.join(os.path.dirname(HERE), 'data', 'golden')
+OBS_PATH = os.path.join(GOLDEN_DIR, 'toy_obs.json')
 RTOL = 1e-8
 
 # The solver settings every config shares: a 24 h window, 3-hourly obs, the
@@ -52,10 +63,30 @@ CONFIGS = {
 GROSS = [(0, 3, 40.0), (2, 17, -35.0), (5, 8, 60.0), (8, 20, -50.0)]
 
 
+def make_obs():
+    """The toy obs as problem.py builds them (the background's H(x) plus
+    noise), with the gross errors added: (n_slots, N_OBS), as the solver
+    reads them."""
+    ob = Problem(**BASE).psobs_traj['ob'][:, :N_OBS].clone()
+    for slot, k, err in GROSS:
+        ob[slot, k] += err
+    return ob
+
+
+def write_obs():
+    os.makedirs(GOLDEN_DIR, exist_ok=True)
+    with open(OBS_PATH, 'w') as f:
+        json.dump({'ob': make_obs().tolist()}, f, indent=1)
+        f.write('\n')
+    return OBS_PATH
+
+
 def _problem(name):
     p = Problem(**{**BASE, **CONFIGS[name]})
-    for slot, k, err in GROSS:
-        p.psobs_traj['ob'][slot, k] += err
+    with open(OBS_PATH) as f:
+        ob = torch.tensor(json.load(f)['ob'], dtype=torch.float64)
+    assert ob.shape == p.psobs_traj['ob'][:, :N_OBS].shape, ob.shape
+    p.psobs_traj['ob'][:, :N_OBS] = ob
     return p
 
 
@@ -66,7 +97,12 @@ def _diagnostics(p, state, increment):
     m, traj = p.model, p.psobs_traj
     out = {'used': [], 'innov_mean': [], 'innov_rms': []}
     with torch.no_grad():
-        states = [state, m.advance(state, steps=1, use_checkpoint=False, latent_increment=increment)]
+        s1 = m.advance(state, steps=1, use_checkpoint=False, latent_increment=increment)
+        if increment is not None and p.keep_mask is not None:
+            # as the solver: uncontrolled columns revert to the background
+            s1 = m.wrap_state(utils._apply_control_mask(s1.state, p.keep_mask, p.ref_state1.state,
+                                                        m.state_layout), s1.date)
+        states = [state, s1]
         for _ in range(traj['n_steps'] - 1):
             states.append(m.advance(states[-1], steps=1, use_checkpoint=False))
         decoded = [m.decode_state(s) for s in states]
@@ -85,14 +121,22 @@ def _diagnostics(p, state, increment):
 def run(name):
     p = _problem(name)
     exp = copy.deepcopy(p.exp)
-    with tempfile.TemporaryDirectory() as tmp:
-        exp['path_output'] = tmp + '/'
-        analysis, lsave = utils.compute_optimal(exp, p.model, p.state, p.verif_ic, p.psobs_traj,
-                                                p.grid_interp, logging.getLogger('golden'))
-        stem = tmp + '/' + exp['date'] + '_%s_' + exp['window_name'] + 'h_' + str(exp['max_epoch']) + 'it'
-        with open(stem % 'loss_latent' + '.json') as f:
-            history = json.load(f)
-        inc = torch.load(stem % 'latent_increment' + '.pt')['increment']
+    # compute_optimal makes its control (and so AdamW's state) in the
+    # default dtype: float64 here, like the toy model
+    dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float64)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            exp['path_output'] = tmp + '/'
+            analysis, lsave = utils.compute_optimal(exp, p.model, p.state, p.verif_ic, p.psobs_traj,
+                                                    p.grid_interp, logging.getLogger('golden'))
+            stem = tmp + '/' + exp['date'] + '_%s_' + exp['window_name'] + 'h_' + str(exp['max_epoch']) + 'it'
+            with open(stem % 'loss_latent' + '.json') as f:
+                history = json.load(f)
+            inc = torch.load(stem % 'latent_increment' + '.pt')['increment']
+    finally:
+        torch.set_default_dtype(dtype)
+    assert inc.dtype == torch.float64, inc.dtype
 
     flat = inc.flatten()
     a = analysis.state[0].reshape(analysis.state.shape[1], -1)

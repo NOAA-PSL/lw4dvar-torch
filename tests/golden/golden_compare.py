@@ -10,7 +10,8 @@ def compare(golden, got, tol, path=''):
     `tol` is a relative tolerance for every number, or a function of the
     value's path (e.g. '/loss[3]') returning `(rtol, atol)`. Two numbers
     match if |golden - got| <= max(atol, rtol * max(|golden|, |got|)), so
-    integers (obs counts) match exactly unless atol >= 1. Strings, booleans,
+    integers (obs counts) match exactly unless atol >= 1; NaN matches only
+NaN, and an infinity only the same infinity. Strings, booleans,
     None and the tree's structure must match exactly."""
     out = []
     if isinstance(golden, dict) and isinstance(got, dict):
@@ -27,8 +28,13 @@ def compare(golden, got, tol, path=''):
                 out += compare(g, v, tol, f'{path}[{i}]')
     elif _number(golden) and _number(got):
         rtol, atol = tol(path) if callable(tol) else (tol, 0.0)
-        if math.isnan(golden) != math.isnan(got) or \
-                abs(golden - got) > max(atol, rtol * max(abs(golden), abs(got))):
+        # NaN matches only NaN; otherwise math.isclose, which (unlike a bare
+        # |a - b| <= tol) rejects finite vs infinite and opposite infinities
+        if math.isnan(golden) or math.isnan(got):
+            ok = math.isnan(golden) and math.isnan(got)
+        else:
+            ok = math.isclose(golden, got, rel_tol=rtol, abs_tol=atol)
+        if not ok:
             out.append((path, golden, got))
     elif golden != got or type(golden) is not type(got):
         out.append((path, golden, got))

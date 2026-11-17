@@ -32,13 +32,15 @@ the ace2 env:
 golden -- the golden outputs (layer 4; tests/golden/, tests/ace2/):
   data/golden/toy_<config>.json  the toy-model minimization for each config in
       tests/golden/toy_golden.py (float64; anywhere, in the CI env)
+  data/golden/toy_obs.json  the toy runs' frozen obs values: written only
+      with --toy-obs (or if missing), never to absorb a solver change
   data/golden/mini_ace2.json  with --ace2: the mini-ACE2 run's summary
       (tests/ace2/mini_ace2.py; needs fme and the checkpoint, as
       `make check-ace2` does)
 Regenerating is a deliberate change: run it in the CI env
 (envs/requirements-ci.txt, plus envs/requirements-ci-ace2.txt for --ace2), look at the
 diff, and say in the PR what moved and why.
-  python tests/make_fixtures.py golden [--ace2]
+  python tests/make_fixtures.py golden [--ace2] [--toy-obs]
 """
 
 import argparse
@@ -200,6 +202,8 @@ def mini_ace2(args):
 def golden(args):
     sys.path[:0] = [os.path.join(REPO_ROOT, 'src'), REPO_ROOT, os.path.join(HERE, 'golden'), os.path.join(HERE, 'ace2')]
     import toy_golden
+    if args.toy_obs or not os.path.exists(toy_golden.OBS_PATH):
+        print(f'wrote {toy_golden.write_obs()}')
     for name in toy_golden.CONFIGS:
         print(f'wrote {toy_golden.write(name)}')
     if args.ace2:
@@ -224,6 +228,8 @@ def main():
     ap.add_argument('--new_asset', action='store_true',
                     help='mini_ace2: record --weights_out as a new release asset in the manifest')
     ap.add_argument('--ace2', action='store_true', help='golden: also the mini-ACE2 golden output')
+    ap.add_argument('--toy-obs', action='store_true',
+                    help='golden: also rewrite the toy runs\' frozen obs (only if the toy problem changed)')
     args = ap.parse_args()
     {'mini_ace2': mini_ace2, 'golden': golden}[args.fixture](args)
 

@@ -32,3 +32,26 @@ def test_planted_change_is_caught(monkeypatch, change):
     losses = [m for m in mismatches if m[0].startswith('/loss[')]
     assert losses, 'a changed setting left the cost history unchanged'
     assert max(abs(g - v) / max(abs(g), abs(v)) for _, g, v in losses) > 1e3 * toy_golden.RTOL
+
+
+def test_planted_operator_bias_is_caught(monkeypatch):
+    """The obs are frozen, not rebuilt from the forward operator, so a
+    constant operator bias (0.5 hPa) moves the innovations and the cost."""
+    with open(toy_golden.golden_path('default')) as f:
+        golden = json.load(f)
+    orig = toy_golden.utils.get_surface_pressure
+    monkeypatch.setattr(toy_golden.utils, 'get_surface_pressure', lambda *a, **k: orig(*a, **k) + 50.0)
+    mismatches = toy_golden.compare(golden, toy_golden.run('default'), toy_golden.RTOL)
+    assert any(m[0].startswith('/loss[') for m in mismatches), 'an operator bias left the cost unchanged'
+
+
+@pytest.mark.parametrize('golden, got, match', [
+    (1.0, 1.0 + 1e-12, True),
+    (1.0, float('inf'), False),
+    (float('inf'), float('inf'), True),
+    (float('inf'), float('-inf'), False),
+    (float('nan'), float('nan'), True),
+    (1.0, float('nan'), False),
+])
+def test_compare_non_finite(golden, got, match):
+    assert (not toy_golden.compare({'x': [golden]}, {'x': [got]}, 1e-8)) == match
