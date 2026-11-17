@@ -104,7 +104,9 @@ operator (`logpinterp`, `ps`), each made with its own operator; `--toy-obs` rewr
 them, only when the toy problem itself changes -- never to absorb a solver
 change (obs rebuilt from the current forward operator would move with it).
 
-A failure lists the values that moved, with golden and new values.
+A failure lists the values that moved, with golden and new values. The
+comparator and the mini-ACE2 tolerance routing have their own unit tests
+(`tests/golden/test_golden_compare.py`), so loosening either fails too.
 
 - `tests/golden/` (in `make check`): the solver's `compute_optimal` on the
   math gates' toy problem with frozen obs (`toy_obs.json`), float64
@@ -116,12 +118,14 @@ A failure lists the values that moved, with golden and new values.
   plus `jc_ps_weight`; `control_variables` plus `checkpoint_stride: 2`;
   `ps_operator: ps`; `jc_z_weight`. Frozen: the cost at every epoch, Jo per obs slot at
   the first and last epoch, the increment's statistics and a sample of its
-  values, the analysis' area-weighted per-channel mean and std, and per-slot obs counts,
+  values, the analysis' area-weighted per-channel mean and std and a
+  spatial sample of it, and per-slot obs counts,
   mean and rms O-B and O-A. Deterministic, compared to 1e-8 relative. A
   planted change -- the learning rate 1% higher, `bg_check` 4 -> 3.5 -- must
   move the cost far outside that (`test_planted_change_is_caught`), and so
   must a 0.5 hPa bias in the forward operator
-  (`test_planted_operator_bias_is_caught`).
+  (`test_planted_operator_bias_is_caught`), and a one-point longitude
+  shift of the returned analysis (`test_planted_analysis_permutation_is_caught`).
 - `tests/data/golden/mini_ace2.json` (in `make check-ace2`): the mini-ACE2
   run's cost history, Jo per slot, obs diagnostics per slot (counts, QC
   flag counts, mean and rms O-B and O-A) and mean and std of h500,

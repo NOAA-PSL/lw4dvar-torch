@@ -173,6 +173,11 @@ def run(name):
         },
         'analysis_channel_mean': a_mean.tolist(),
         'analysis_channel_std': a_std.tolist(),
+        # a spatial sample of the returned analysis itself (every 7th point of
+        # every channel: the stride is coprime with the 16-point rows, so a
+        # shift or permutation in longitude or latitude moves it; the stats
+        # above and the O-A replay of the increment would not see that)
+        'analysis_sample': a[:, ::7].tolist(),
         'background_obs': _diagnostics(p, p.state, None),
         'analysis_obs': _diagnostics(p, p.state, inc),
         'n_obs_per_slot': N_OBS,

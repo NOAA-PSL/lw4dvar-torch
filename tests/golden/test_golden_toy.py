@@ -56,3 +56,20 @@ def test_planted_operator_bias_is_caught(monkeypatch):
 ])
 def test_compare_non_finite(golden, got, match):
     assert (not toy_golden.compare({'x': [golden]}, {'x': [got]}, 1e-8)) == match
+
+
+def test_planted_analysis_permutation_is_caught(monkeypatch):
+    """A longitude shift of the returned analysis keeps its channel means
+    and stds; the frozen spatial sample must catch it."""
+    with open(toy_golden.golden_path('default')) as f:
+        golden = json.load(f)
+    orig = toy_golden.utils.compute_optimal
+
+    def shifted(*args, **kwargs):
+        analysis, lsave = orig(*args, **kwargs)
+        return type(analysis)(analysis.state.roll(1, dims=-1), analysis.date), lsave
+
+    monkeypatch.setattr(toy_golden.utils, 'compute_optimal', shifted)
+    mismatches = toy_golden.compare(golden, toy_golden.run('default'), toy_golden.RTOL)
+    paths = {m[0].split('[')[0] for m in mismatches}
+    assert paths == {'/analysis_sample'}, paths
