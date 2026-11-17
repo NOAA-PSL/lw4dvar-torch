@@ -196,6 +196,15 @@ def _profile_records(
                     ):
                         record['values'][(variable, level_index)] = value
                         record['quality'][(variable, level_index)] = quality
+                        # Clear any height left over from the row this one
+                        # is replacing before conditionally attaching the
+                        # new row's own -- otherwise a stale height from
+                        # the discarded row survives whenever the
+                        # replacement itself has no eligible height (missing
+                        # or category 4), corrupting the physical-height/
+                        # monotonicity QC checks downstream.
+                        record['height'].pop((variable, level_index), None)
+                        record['height_quality'].pop((variable, level_index), None)
                         if np.isfinite(height[level_row]) and category[level_row] != 4:
                             record['height'][(variable, level_index)] = height[level_row]
                             record['height_quality'][(variable, level_index)] = height_quality[level_row]

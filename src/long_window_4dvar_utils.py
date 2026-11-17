@@ -1300,7 +1300,7 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     # per-level table (RAOBS_Q_ERROR_G_KG by default), or with the observed
     # value instead (a flat absolute error makes no physical sense across
     # q's full range) if the table is disabled.
-    error_std = exp.get('raobs_error_std', {'t': 1.0, 'u': 2.0, 'v': 2.0})
+    error_std = {'t': 1.0, 'u': 2.0, 'v': 2.0, **exp.get('raobs_error_std', {})}
     q_error_fraction = exp.get('raobs_q_error_fraction', 0.2)
     q_error_floor = exp.get('raobs_q_error_floor_kg_kg', 1.e-5)
 
@@ -1775,8 +1775,24 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
     }
     raobs_trajectory = None
     if raobs_traj is not None:
+        # No obs slot at or after step_start for a base (same corner case as
+        # `diagnostics` above -- e.g. a one-step window, dt_verif >=
+        # window length) leaves that base's dict missing its field keys
+        # entirely. Ensure all three are present (as empty lists) before
+        # stacking, so a caller that pads (`_pad_leading`, which needs
+        # `.shape[1:]`/`.dtype`) still finds correctly shaped empty arrays
+        # instead of a KeyError.
+        for base in raobs_traj['variables']:
+            for name in ('model_equivalent', 'effective_error', 'used'):
+                raobs_diagnostics[base].setdefault(name, [])
         raobs_trajectory = {
-            base: {name: np.stack(v, axis=0) for name, v in fields.items()}
+            base: {
+                name: (np.stack(v, axis=0) if v else np.empty(
+                    (0, raobs_traj['levels_hpa'][base].shape[0], raobs_traj['values_' + base].shape[-1]),
+                    dtype=(bool if name == 'used' else np.float32),
+                ))
+                for name, v in fields.items()
+            }
             for base, fields in raobs_diagnostics.items()
         }
     return obs_trajectory, model_trajectory, raobs_trajectory
@@ -1991,12 +2007,15 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     def _raobs_term(j, decoded_j):
         results = _compute_raobs_observation_diagnostics_at_time(model, decoded_j, raobs_traj, grid_interp, j)
         Jt = 0.
-        counts = {}
+        # used.sum().item() is a CUDA sync; only pay it when do_print will
+        # actually read counts, same as _obs_term's own diagnostic prints.
+        counts = {} if do_print else None
         for base, (innovation, model_equivalent, effective_error, used) in results.items():
             innov = torch.where(used, innovation, torch.zeros_like(innovation))
             err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
             Jt = Jt + ((innov / err) ** 2).sum()
-            counts[base] = int(used.sum().item())
+            if do_print:
+                counts[base] = int(used.sum().item())
         if do_print:
             print(f"epoch {epoch}, oind {j} (t+{j * dt_obs}h): raobs J "
                   f"{Jt.item() if torch.is_tensor(Jt) else Jt}, obs used {counts}")
