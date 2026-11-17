@@ -1710,12 +1710,22 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                 _apply_control_mask(f_state.state, keep_mask, ref_state1.state, model.state_layout),
                 f_state.date,
             )
-        if jc_ref is not None:
-            jc_sp[0] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
-        if jcz_ref is not None:
-            jcz[0] = model.decode_state(f_state, only=['z'])['z']
     # step 0: the uncorrected background unless increment_at_start
     decoded_prev = model.decode_state(f_state, only=loss_bases)
+
+    def _penalty_fields(s, f_state, decoded):
+        # Jc / Jz endpoints, reusing the loss decode (always has 'z'; has
+        # jc_ref's pressure field when the operator reads it) -- decoding
+        # again would repeat the backend's full decoder, forward and adjoint
+        if s not in jc_steps:
+            return
+        if jc_ref is not None:
+            f = jc_ref[0]
+            jc_sp[s] = decoded[f] if f in decoded else model.decode_state(f_state, only=[f])[f]
+        if jcz_ref is not None:
+            jcz[s] = decoded['z']
+
+    _penalty_fields(0, f_state, decoded_prev)
     for s in range(1, n_steps + 1):
         inj = scaled_increment if s == inj_step else None
         use_ckpt = (checkpoint_stride > 0) and (s % checkpoint_stride == 0)
@@ -1730,10 +1740,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                 f_state.date,
             )
         decoded_cur = model.decode_state(f_state, only=loss_bases)
-        if jc_ref is not None and s in jc_steps:
-            jc_sp[s] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
-        if jcz_ref is not None and s in jc_steps:
-            jcz[s] = model.decode_state(f_state, only=['z'])['z']
+        _penalty_fields(s, f_state, decoded_cur)
         for j in slots_by_step.get(s - 1, []):
             a = alpha[j]
             if a == 0.0:
