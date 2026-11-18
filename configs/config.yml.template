@@ -108,6 +108,29 @@ exp:
       # Observation-error standard deviations for temperature (K) and wind
       # components (m/s) -- NOT specific humidity, see below.
       #error_std: {t: 1.0, u: 2.0, v: 2.0}
+      # Default True: use each level's own archive source error instead of
+      # the configured flat/table one, falling back to it wherever the
+      # archive has none (e.g. a synthetic test fixture with no real error
+      # columns at all -- set False explicitly there). For t/u/v:
+      # temperature_error_c/wind_error_ms, the real PREPBUFR TOE/WOE value
+      # -- GSI's own per-type, per-pressure error-table number for that
+      # observation. For q: the archive's RH-based QOE converted to kg/kg
+      # via qsat at the archive's own STATIC background T/p (the
+      # historical GFS background at archive time, NOT this run's own
+      # model state -- a known simplification, flagged for follow-up; see
+      # docs/integrate_multiple_parquetobs.md).
+      #use_source_error: True
+      # Background check shared by t/u/v (like error_std above): reject
+      # |O-B| > tuv_bg_check * qc_error, at the current state (default
+      # 8.0, GSI's own 'gross' convinfo value for kx 120/220/221; null
+      # turns it off). Mirrors GSI's conventional-data gross check
+      # (errormod in read_prepbufr.F90) -- without this, a bad ob that
+      # still passes its PREPBUFR quality mark has no check against the
+      # background at all. When use_source_error is in effect, qc_error
+      # is the archive source error clamped into GSI's own ermin/ermax
+      # range for this comparison only (not configurable -- fixed GSI
+      # constants); the actual Jo weight stays the real, unclamped value.
+      #tuv_bg_check: 8.0
       # Specific humidity error: a fixed per-level table (g/kg; ln(p)-
       # interpolated between entries, nearest beyond them). Default below:
       # Desroziers estimates from a ps + raobs run. Set null to use instead
@@ -117,9 +140,12 @@ exp:
       #q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
       #q_error_fraction: 0.2
       #q_error_floor_kg_kg: 1.e-5
-      # Background check on q: reject |O-B| > q_bg_check * error, at the
-      # current state (default 4.0; null turns it off).
-      #q_bg_check: 4.0
+      # Background check on q: reject |O-B| > q_bg_check * qc_error, at
+      # the current state (default 8.0, GSI's own 'gross' convinfo value;
+      # null turns it off). Same use_source_error-only ermin/ermax clamp
+      # as tuv_bg_check above (fixed GSI constants, RH-percent converted
+      # to kg/kg via the same qsat used for the source error itself).
+      #q_bg_check: 8.0
       # Radiosonde humidity sensors are unreliable above the lower/mid
       # troposphere -- mask 'q' at any matched level with pressure below
       # this (set null to disable the floor entirely).

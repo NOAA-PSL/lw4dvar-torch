@@ -51,6 +51,68 @@ _VARIABLE_COLUMNS = {
 }
 _HEIGHT_COLUMNS = ('height_m', 'height_quality')
 
+# model-base-name -> source observation-error column in the archive's
+# `levels` table (the PREPBUFR TOE/WOE mnemonics -- the same per-type,
+# per-pressure GSI error table values `psobs_parquet.py`'s
+# `pressure_error_mb`/`use_source_error` already reads for ps, confirmed by
+# comparing real archive values against GSI's prepobs_errtable.global: both
+# land on 0.8-1.5 K for raob T and 1.4-3.2 m/s for raob wind). 'u' and 'v'
+# share one column -- GSI's wind error is one vector quantity, not separate
+# per component. 'q' is handled separately (see `_saturation_specific_humidity`
+# below): its source column is RH-based (percent/10, confirmed against
+# convert_prepbufr_to_parquet.py's own field metadata), not kg/kg, and needs
+# a qsat conversion -- using the archive's own static `background_*` fields
+# (the historical GFS background at archive time), not this run's own
+# model state; see docs/integrate_multiple_parquetobs.md for why that's a
+# known, deliberate simplification, not a GSI match.
+_VARIABLE_ERROR_COLUMNS = {
+    't': 'temperature_error_c',
+    'u': 'wind_error_ms',
+    'v': 'wind_error_ms',
+}
+
+# GSI's own x1.2 error inflation (read_prepbufr.F90), applied to the
+# source error itself (not just a gross-check comparison like the
+# ermin/ermax clamp in long_window_4dvar_utils.py) -- confirmed by
+# reading the source: `cdata_all(1,iout)=toe` writes out the ALREADY-
+# inflated value, which setupt/setupw/setupq.f90 then use directly for
+# both the Jo weight and (via errormod) the gross check. Two independent,
+# multiplicative triggers:
+# - quality mark 3 or 7 (suspect but not rejected): x1.2, t/u/v/q alike
+#   (`if (inflate_error) toe/woe/qoe=.../.../...*r1_2`).
+# - above a variable-specific pressure: x1.2 more, t only above 100 hPa,
+#   u/v only above 50 hPa (`if(ppb < r100)toe=toe*r1_2`,
+#   `if(obsdat(1,k) < r50)woe=woe*r1_2`) -- q has no pressure-based
+#   inflation in GSI.
+_RAOBS_INFLATE_QM = (3, 7)
+_RAOBS_INFLATE_PRESSURE_HPA = {'t': 100., 'u': 50., 'v': 50.}
+
+
+def _gsi_inflate_error(raw, quality, pressure=None, pressure_threshold=None):
+    factor = np.where(np.isin(quality, _RAOBS_INFLATE_QM), 1.2, 1.0)
+    if pressure_threshold is not None:
+        factor = factor * np.where(pressure < pressure_threshold, 1.2, 1.0)
+    return raw * factor
+
+# Saturation vapor pressure (Pa) from temperature (K): the ECMWF/IFS
+# Magnus-Tetens form, identical to backends/ace2/ace2_ic.py's
+# `_saturation_vapor_pressure` -- duplicated rather than imported, since
+# src/ must stay usable without any backend's dependencies (see
+# _ensure_backend_on_path in long_window_4dvar_utils.py).
+_SVP_A1, _SVP_A2, _SVP_A3, _SVP_A4 = 611.21, 273.16, 17.502, 32.19
+_EPS_RD_RV = 0.621981  # Rd/Rv
+
+
+def _saturation_specific_humidity(temperature_k, pressure_mb):
+    """Saturation specific humidity (kg/kg) from temperature (K) and total
+    pressure (hPa) -- same Magnus-Tetens + eps formula as
+    `backends/ace2/ace2_ic.py`'s `_saturation_vapor_pressure`/
+    `_specific_humidity_from_dewpoint`, with temperature standing in for
+    its own dewpoint (RH = 100%)."""
+    e_sat_pa = _SVP_A1 * np.exp(_SVP_A3 * (temperature_k - _SVP_A2) / (temperature_k - _SVP_A4))
+    pressure_pa = pressure_mb * 100.
+    return _EPS_RD_RV * e_sat_pa / (pressure_pa - (1. - _EPS_RD_RV) * e_sat_pa)
+
 # Unit conversions from the archive's native column units to the model's
 # decode_state units (Kelvin for 't', kg/kg for 'q' -- 'u'/'v' are already
 # m/s, matching the model, so no entry needed for them).
@@ -76,6 +138,7 @@ def _profile_records(
     geopotential_height_min_m,
     geopotential_height_max_m,
     below_station_tolerance_m,
+    use_source_error=False,
 ):
     """Return {(slot_index, station_key): record} before fixed-shape padding.
 
@@ -118,6 +181,15 @@ def _profile_records(
     level_columns = ['report_id', 'level_index', 'category', 'pressure_mb'] + list(_HEIGHT_COLUMNS)
     for variable in variables:
         level_columns.extend(_VARIABLE_COLUMNS[variable])
+    if use_source_error:
+        for variable in variables:
+            column = _VARIABLE_ERROR_COLUMNS.get(variable)
+            if column is not None:
+                level_columns.append(column)
+        if 'q' in variables:
+            level_columns.extend((
+                'humidity_error_tenths_percent', 'background_temperature_c', 'background_pressure_mb',
+            ))
     level_columns = list(dict.fromkeys(level_columns))
 
     records = {}
@@ -150,6 +222,35 @@ def _profile_records(
             level_quality = {
                 v: common.column(levels, _VARIABLE_COLUMNS[v][1]) for v in variables
             }
+            level_source_error = {
+                v: _gsi_inflate_error(
+                    common.column(levels, _VARIABLE_ERROR_COLUMNS[v]), level_quality[v],
+                    pressure, _RAOBS_INFLATE_PRESSURE_HPA.get(v))
+                for v in variables if use_source_error and v in _VARIABLE_ERROR_COLUMNS
+            }
+            level_source_qsat = {}
+            if use_source_error and 'q' in variables:
+                # RH-based source error (percent/10, per
+                # convert_prepbufr_to_parquet.py's own field metadata) ->
+                # absolute kg/kg via qsat at the archive's own STATIC
+                # background T/p (not this run's live model state -- see
+                # _VARIABLE_ERROR_COLUMNS's docstring above). qsat is also
+                # kept (per level) so the gross check can apply GSI's own
+                # RH-percent ermin/ermax bounds later (long_window_4dvar_
+                # utils.py) -- NOT inflated/clamped itself (it's a
+                # physical qsat value, not an error); only the error value
+                # below is. The ermin/ermax clamp is gross-check-only (see
+                # GSI's setupq.f90 -- its clamped `obserror` never feeds
+                # the Jo weight, confirmed by reading the source), unlike
+                # this x1.2 inflation, which GSI applies directly to the
+                # value it writes out and weights with.
+                rh_error_percent = common.column(levels, 'humidity_error_tenths_percent') * 10.
+                background_t_k = common.column(levels, 'background_temperature_c') + 273.15
+                background_p_mb = common.column(levels, 'background_pressure_mb')
+                qsat = _saturation_specific_humidity(background_t_k, background_p_mb)
+                raw_q_error = (rh_error_percent / 100.) * qsat
+                level_source_error['q'] = _gsi_inflate_error(raw_q_error, level_quality['q'])
+                level_source_qsat['q'] = qsat
             if 't' in level_values:
                 # current TOB is virtual temperature where moisture was
                 # reported (VIRTMP); the model's t is sensible temperature
@@ -190,6 +291,7 @@ def _profile_records(
                 record = records.setdefault(key, {
                     'lat': lat, 'lon': lon, 'elev': elevation_m,
                     'values': {}, 'quality': {}, 'height': {}, 'height_quality': {}, 'priority': {},
+                    'source_error': {}, 'source_qsat': {},
                 })
 
                 for variable in variables:
@@ -245,6 +347,16 @@ def _profile_records(
                         if height_eligible:
                             record['height'][(variable, level_index)] = height_m
                             record['height_quality'][(variable, level_index)] = height_quality_value
+                        if variable in level_source_error:
+                            record['source_error'][(variable, level_index)] = \
+                                level_source_error[variable][level_row]
+                        else:
+                            record['source_error'].pop((variable, level_index), None)
+                        if variable in level_source_qsat:
+                            record['source_qsat'][(variable, level_index)] = \
+                                level_source_qsat[variable][level_row]
+                        else:
+                            record['source_qsat'].pop((variable, level_index), None)
     return records
 
 
@@ -262,6 +374,7 @@ def load_raobs_parquet(
     pressure_match_tolerance_hpa=0.05,
     humidity_min_pressure_hpa=None,
     station_capacity=None,
+    use_source_error=False,
     logger=None,
 ):
     """Read mandatory-level radiosonde profiles into fixed per-slot arrays.
@@ -272,7 +385,26 @@ def load_raobs_parquet(
     bool arrays, shape `(len(levels_hpa[v]), n_stations_slot)`). `mask_<v>`
     is False for (level, station) pairs with no accepted observation, OR
     that failed QC -- callers must not read `values_<v>` where `mask_<v>`
-    is False (it is left at 0, not NaN).
+    is False (it is left at 0, not NaN). When `use_source_error` is True and
+    `v` is requested, also returns `source_error_<v>` (same shape, float32,
+    NaN where no valid source error is available): for 't'/'u'/'v', the
+    archive's own per-level PREPBUFR TOE/WOE value (the real GSI error-
+    table number for that observation); for 'q', that same archive's RH-
+    based QOE value converted to kg/kg via qsat at the archive's own
+    static background T/p (see `_saturation_specific_humidity` and
+    `_VARIABLE_ERROR_COLUMNS`'s docstring above -- NOT this run's live
+    model state). Either way, also inflated x1.2 per GSI's own rule(s)
+    (`_gsi_inflate_error`: quality mark 3/7 for all three; additionally
+    above 100/50 hPa for t/u,v) BEFORE the NaN/missing check, matching
+    what GSI itself writes out and weights with -- not the bare table
+    value. NaN wherever missing/non-positive, so the caller
+    (`get_raobs`) can fall back to its configured flat/table error there.
+    For 'q' specifically, also returns `source_qsat_q` (same shape, NaN
+    wherever `source_error_q` is NaN too): the qsat used for that
+    conversion, kept separately so the caller can derive GSI's own
+    RH-percent ermin/ermax gross-check bound in kg/kg WITHOUT clamping
+    `source_error_q` itself (which stays the real per-level table value,
+    used as the actual Jo weight -- see `_profile_records`'s comment).
 
     QC (physical height bounds, non-monotonic height-with-pressure,
     below-station-elevation, source PREPBUFR quality mark) is applied per
@@ -287,7 +419,18 @@ def load_raobs_parquet(
         directory, verification_times, levels_hpa, variables, time_tolerance_hours,
         prepbufr_classes, quality_mark_max, pressure_match_tolerance_hpa,
         geopotential_height_min_m, geopotential_height_max_m, below_station_tolerance_m,
+        use_source_error=use_source_error,
     )
+    error_bases = tuple(
+        v for v in variables
+        if use_source_error and (v in _VARIABLE_ERROR_COLUMNS or v == 'q')
+    )
+    # qsat, kept alongside q's source error so the gross check (long_window_
+    # 4dvar_utils.py) can convert GSI's own RH-percent ermin/ermax bounds
+    # into kg/kg for the clamp -- WITHOUT touching the source error value
+    # itself (see _profile_records's comment: the clamp must not flatten
+    # the real per-level table that's used as the actual Jo weight).
+    qsat_bases = ('q',) if use_source_error and 'q' in variables else ()
 
     by_slot = {}
     for (slot_index, station_key), record in records.items():
@@ -298,6 +441,10 @@ def load_raobs_parquet(
     for v in variables:
         result['values_'+v] = [None]*n_slots
         result['mask_'+v] = [None]*n_slots
+    for v in error_bases:
+        result['source_error_'+v] = [None]*n_slots
+    for v in qsat_bases:
+        result['source_qsat_'+v] = [None]*n_slots
     counts = {v: 0 for v in variables}
 
     for slot_index in range(n_slots):
@@ -314,6 +461,8 @@ def load_raobs_parquet(
         elev = np.full(capacity, np.nan, dtype=np.float32)
         values = {v: np.zeros((levels_hpa[v].size, capacity), dtype=np.float32) for v in variables}
         mask = {v: np.zeros((levels_hpa[v].size, capacity), dtype=bool) for v in variables}
+        source_error = {v: np.full((levels_hpa[v].size, capacity), np.nan, dtype=np.float32) for v in error_bases}
+        source_qsat = {v: np.full((levels_hpa[v].size, capacity), np.nan, dtype=np.float32) for v in qsat_bases}
 
         for station_index, station_key in enumerate(station_keys):
             record = stations[station_key]
@@ -348,6 +497,14 @@ def load_raobs_parquet(
                             continue  # not an obs at all here, not even QC-flagged
                     values[v][level_index, station_index] = record['values'][key]
                     mask[v][level_index, station_index] = (qc_flag == 0)
+                    if v in error_bases:
+                        source = record['source_error'].get(key)
+                        if source is not None and np.isfinite(source) and source > 0.:
+                            source_error[v][level_index, station_index] = source
+                    if v in qsat_bases:
+                        qsat = record['source_qsat'].get(key)
+                        if qsat is not None and np.isfinite(qsat) and qsat > 0.:
+                            source_qsat[v][level_index, station_index] = qsat
 
             # Non-monotonic height-with-pressure, checked per variable (each
             # variable's own level/height collocations), excluding category-4
@@ -373,6 +530,10 @@ def load_raobs_parquet(
         for v in variables:
             result['values_'+v][slot_index] = values[v]
             result['mask_'+v][slot_index] = mask[v]
+        for v in error_bases:
+            result['source_error_'+v][slot_index] = source_error[v]
+        for v in qsat_bases:
+            result['source_qsat_'+v][slot_index] = source_qsat[v]
 
     if logger is not None:
         logger.info(

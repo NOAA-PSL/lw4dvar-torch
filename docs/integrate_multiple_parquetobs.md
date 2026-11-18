@@ -697,3 +697,255 @@ comment did.
   before raobs) is its own write-up in `docs/integrate_multiple_backends.md`.
 - All pass locally with a from-scratch `.venv-ci` (`rdhpcs-python/3.12` +
   `envs/requirements-ci.txt`/`envs/requirements-ci-ace2.txt`) as of this writing.
+
+## raobs QC/thinning vs. GSI's actual implementation (2026-11-18)
+
+Compared `raobs_parquet.py`/`long_window_4dvar_utils.py`'s raobs QC against
+GSI's own ADPUPA (kx 120/220/221) handling, read directly from a
+`global-workflow` checkout's `sorc/gsi.fd/{read_prepbufr.F90,qcmod.f90}`
+and `fix/gsi/global_convinfo.txt` (not from memory/documentation of GSI --
+the actual source this repo should be consistent with where it claims to
+be).
+
+**Consistent, confirmed directly against the source:**
+- **No thinning**: `global_convinfo.txt`'s `ithin`/`ptime` columns are 0
+  for kx 120/220/221 -- GSI thins none of ADPUPA (thinning there is for
+  dense types like aircraft/profiler/mesonet). This repo does no raobs
+  thinning either.
+- **`time_tolerance_hours: 3.0`**: GSI's `twindow` column for 120/220/221
+  is exactly 3.0h, matching the value this repo already settled on
+  independently (see the `time_tolerance_hours` bullet above, derived from
+  station counts against the real archive, not from GSI).
+- **`quality_mark_max: 3`**: GSI's `lim_qm=4` (`read_prepbufr.F90`) means a
+  level is used only if its quality mark is `< 4` -- identical to this
+  repo's `value <= 3` convention.
+
+**Differences, now understood rather than accidental:**
+- **No vertical interpolation** (mandatory-level matching against the
+  model's own pressure levels) vs. GSI's continuous log-p interpolation to
+  each ob's exact reported pressure (`errormod`, every significant level
+  too, not just mandatory ones) -- a deliberate simplification tied to the
+  ML backends only exposing fixed pressure levels, not a bug.
+- **Virtual/sensible temperature**: this repo converts the OBSERVATION to
+  sensible T (event-stack walk to the first non-VIRTMP event,
+  `sensible_temperature`); GSI's global/GDAS path instead keeps the ob as
+  virtual T and converts the BACKGROUND to virtual space for the
+  comparison (our approach instead matches GSI's own regional/RTMA
+  branch). Same correction, opposite side of O-B -- appropriate here since
+  the ML backends' state is sensible T with no virtual-T operator.
+- **Height-bound/below-station/non-monotonicity QC is this repo's own
+  addition**, not a port of anything GSI's reader does -- GSI trusts the
+  quality marks already assigned upstream by NCEP's prepdata/complex-QC
+  programs instead of re-deriving height checks itself. Loose bounds, so
+  low risk of over-rejecting; kept as a defensive extra.
+- **q error/cutoff**: GSI uses a smooth pressure-dependent error table
+  (`setupq.f90`'s `ptablq`); this repo's fixed per-level table
+  (`RAOBS_Q_ERROR_G_KG`) plays the same role, plus an optional hard
+  `humidity_min_pressure_hpa` floor GSI has no equivalent of.
+- **`VIRTMP`'s program code is hardcoded to `8`** here vs. GSI reading it
+  from the BUFR table at runtime (`ufbqcd(lunin,'VIRTMP',ivtcd)`). Not
+  changed -- low risk, low value until an archive built with a different
+  BUFR table version is actually hit.
+
+**Fixed as a result**: GSI applies an O-B background/gross-error check to
+every conventional variable (`errormod` + convinfo's `gross`/`ermax`/
+`ermin`, plus flat error inflation for quality marks 3/7 and above 100/50
+hPa) -- t/u/v raobs here had NO such check at all, only the read-time
+PREPBUFR-quality-mark/height QC (`q` already had one, `q_bg_check`/
+`RAOBS_Q_BG_CHECK`, 4-sigma). In a strong-constraint 4D-Var minimizing a
+smooth cost, an outlier that still passes its PREPBUFR quality mark has
+more leverage than in GSI's iterative variational QC -- plausibly relevant
+to the still-open "ACE2 Tropics z500 degradation with raobs" investigation
+above. Added `tuv_bg_check`/`RAOBS_TUV_BG_CHECK` (default 4.0, one shared
+multiplier for t/u/v, mirroring how they already share one `error_std`
+dict) to `_compute_raobs_observation_diagnostics_at_time`, following the
+existing `q_bg_check` pattern exactly (`used = used & (|O-B| <= bg_check *
+error)`, `.detach()`ed, re-evaluated every epoch at the current state).
+Config keys/validation/template entry added alongside; not yet re-run
+against the longcyc ACE2/AIFS2 experiments to see whether it actually
+changes the z500 finding -- that's the natural next step.
+
+## raobs `use_source_error`: the archive's own GSI error, not hand-curated (2026-11-18)
+
+Following on from the GSI comparison above: rather than hand-curate GSI's
+`prepobs_errtable.global` values into Python constants (considered, judged
+not worth the parsing risk/maintenance for a legacy fixed-width Fortran
+format), checked whether the real archive already carries the per-
+observation error GSI itself would use -- it does. The `levels` table for
+every PREPBUFR class (confirmed via `/scratch4/BMC/gsienkf/Bo.Huang/
+expCodes/ML/lw4dvar-torch-dev/prepbufr_to_parquet/convert_prepbufr_to_parquet.py`)
+carries `temperature_error_c`/`wind_error_ms`/`humidity_error_tenths_percent`
+(the PREPBUFR TOE/WOE/QOE mnemonics), parallel to `pressure_error_mb`
+which `psobs_parquet.py`'s `use_source_error` already reads. Sampling a
+real 2015-01-07 00Z ADPUPA partition: `temperature_error_c` ranges
+0.8-1.5 K, `wind_error_ms` 1.4-3.2 m/s, `humidity_error_tenths_percent`
+flat 2.0 -- matching GSI's own `prepobs_errtable.global` type-120/220
+values exactly (see the GSI-comparison section above), because these
+fields are stamped onto each observation by NCEP's own operational
+prepdata processing using that same table.
+
+**Added `observations.raobs.use_source_error`** (`raobs_parquet.py`,
+`get_raobs`/`_compute_raobs_observation_diagnostics_at_time` in
+`long_window_4dvar_utils.py`), mirroring `psobs_parquet.py`'s existing
+flag:
+- **t/u/v**: `_VARIABLE_ERROR_COLUMNS` maps each base to its archive
+  column (`u`/`v` share `wind_error_ms` -- GSI's wind error is one vector
+  quantity, not separate per component) -- a direct per-level value, NaN
+  (missing/non-positive) falling back to the configured flat `error_std`.
+  `raobs_traj['error_<base>']` becomes a per-(level, station) tensor
+  instead of a flat float when source error is in use; `_compute_raobs_
+  observation_diagnostics_at_time`'s else branch now accepts either.
+- **q**: `humidity_error_tenths_percent` is RH-based (confirmed as
+  `percent/10` from the converter's own field metadata: a stored `2.0`
+  means 20% RH, not 2%), not kg/kg -- converted via saturation specific
+  humidity (`_saturation_specific_humidity`: the same Magnus-Tetens +
+  eps formula as `backends/ace2/ace2_ic.py`'s `_saturation_vapor_pressure`/
+  `_specific_humidity_from_dewpoint`, duplicated rather than imported
+  since `src/` must stay usable without any backend's dependencies) at
+  the archive's own `background_temperature_c`/`background_pressure_mb`.
+  `raobs_traj['source_error_q']` overrides the existing table/fraction
+  `effective_error` per element wherever finite, rather than being pre-
+  filled like t/u/v -- q already has a non-trivial fallback hierarchy
+  (`error_q_level` table, or fraction-of-observed-value) that isn't a
+  single flat value to pre-fill with.
+
+**Known limitation, flagged rather than fixed (decided 2026-11-18)**: the
+qsat conversion for q uses the archive's own STATIC `background_*`
+fields -- the historical GFS/GDAS background interpolated to the
+observation at archive-creation time -- not this run's own model state.
+GSI itself recomputes qsat fresh from its OWN live background every
+analysis (`setupq.f90`'s `genqsat(ges_qsat, ges_tsen, ges_prsl, ...)`,
+confirmed directly in the GSI source, not from any stored observation
+field). Doing the same here would mean moving the RH-to-kg/kg conversion
+out of `raobs_parquet.py`'s one-time read and into the per-epoch loss
+hot path (`_compute_raobs_observation_diagnostics_at_time`), needing a
+torch qsat implementation and careful `.detach()`-ing so the error
+denominator can't be gamed by the minimizer -- real complexity weighed
+against the static approach's small inaccuracy (a frozen, historical
+background standing in for the live one). Decision: ship the static
+version now; revisit the live-background version only if it turns out to
+matter in practice.
+
+**Testing**: `tests/unit/test_raobs_parquet.py` -- `use_source_error`
+disabled omits the `source_error_<v>` keys entirely; reads real
+`temperature_error_c`/`wind_error_ms` values and falls back to NaN when
+missing or non-positive; wind error shared between u and v; q's
+qsat conversion checked against `_saturation_specific_humidity` called
+directly (not a hand re-derivation of the physics -- that formula is
+already validated against `backends/ace2/ace2_ic.py`'s matching
+implementation) and against a missing-background NaN case.
+`tests/unit/test_solver_helpers.py` -- `_compute_raobs_observation_
+diagnostics_at_time` reads a per-station tensor `error_<base>` correctly
+(not broadcasting a single scalar) for t/u/v, and for q, overrides the
+fraction-based error per element while falling back to it wherever the
+source value is NaN. `tests/unit/test_config.py` -- the new
+`use_source_error` key resolves to `raobs_use_source_error`.
+
+**`use_source_error` now defaults to `True`** (`get_raobs`,
+`configs/config.yml.template`), rather than requiring it to be opted
+into -- the real archive value is the better default now that it exists.
+`tests/ace2/mini_ace2.py` explicitly sets `False` for its raobs block:
+the synthetic fixture (`tests/make_fixtures.py`'s `_write_raobs_parquet`)
+has none of `temperature_error_c`/`wind_error_ms`/
+`humidity_error_tenths_percent`/`background_*` -- `read_partition` would
+raise on the missing columns otherwise. Golden fixture regenerated to
+match (the config echo in `/config/exp/observations/raobs` now includes
+the key).
+
+## GSI's ermin/ermax gross-check clamp for raobs (2026-11-18)
+
+Following directly from `use_source_error`: now that the error itself is
+GSI's real value, GSI's own gross check -- a **clamped** ratio,
+`|O-B| / clip(error, ermin, ermax) > gross` (`global_convinfo.txt`, kx
+120/220/221: `gross=8.0` for t/uv/q, `ermin`/`ermax` per variable: t
+1.3/5.6 K, uv 1.4/6.1 m/s, q 10/100 %RH) -- is directly comparable, not
+just a borrowed threshold against an arbitrary error the way
+`tuv_bg_check`'s original `4.0` was. Bumped `RAOBS_TUV_BG_CHECK`/
+`RAOBS_Q_BG_CHECK` from `4.0` to GSI's actual `gross=8.0`
+(`long_window_4dvar_utils.py`) and added the `ermin`/`ermax` clamp.
+
+**Where the clamp applies -- confirmed, not assumed, by reading GSI's
+source**: initially implemented the clamp by baking it into the stored
+source error itself (in `raobs_parquet.py`, before it ever reaches the
+solver) -- simpler, but wrong. Real archive values at 850 hPa (T: 0.8 K)
+sit *below* GSI's own `ermin` (1.3 K), and clamping them up would have
+flattened exactly the per-level structure that `use_source_error` exists
+to capture. Checked GSI's `setupq.f90` directly: the `ermin`/`ermax`-
+clamped `obserror` computed there (`max(cermin*0.01, min(cermax*0.01,
+data(ier,i)))`) is never fed into the actual Jo weight -- that comes from
+the unclamped raw table value via `errorx=(data(ier,i)+dprpx)*qsges`. A
+*different*, later-computed `obserrlm` (clamped, but derived from the
+already-finalized weight) reads as a diagnostic-only quantity. So GSI's
+clamp bounds the gross-check *decision*, not the weight.
+
+**Fix**: moved the clamp out of `raobs_parquet.py` entirely --
+`source_error_<v>`/`source_error_q` stay the real, unclamped archive
+value (the actual Jo weight, via `effective_error`). The clamp now lives
+in `_compute_raobs_observation_diagnostics_at_time`, applied only to a
+local `qc_error` used for the gross-check comparison:
+- **t/u/v**: `RAOBS_TUV_ERMIN`/`ERMAX` are flat per-variable constants
+  (no archive dependency) -- `qc_error = clamp(effective_error, ermin,
+  ermax)`, only when `error_<base>` is a tensor (`use_source_error`); a
+  flat `error_std` is never clamped.
+- **q**: GSI's bounds are RH-percent, not kg/kg, so they vary with qsat
+  the same way the source error itself does. `raobs_parquet.py` now also
+  returns `source_qsat_q` (the qsat used for the RH->kg/kg conversion,
+  kept separately, NaN wherever `source_error_q` is too) so the gross
+  check can derive `ermin_kgkg = 0.10*qsat`, `ermax_kgkg = 1.00*qsat` at
+  the comparison point, without touching `source_error_q` itself. Where
+  no source qsat exists (table/fraction error in use), `qc_error` is just
+  `effective_error`, unclamped -- there's nothing GSI-sourced to bound
+  against.
+- Only applied when `use_source_error` is in effect, by construction --
+  never to this repo's own flat/table defaults (e.g. the mini-ACE2
+  fixture's deliberately inflated `error_std`, which must not be silently
+  overridden).
+
+**Testing**: `tests/unit/test_raobs_parquet.py` -- `source_error_t`
+confirmed to stay unclamped (0.8 K, below GSI's own ermin, passes
+through unmodified) and `source_qsat_q` exposed/NaN-propagated alongside
+`source_error_q`. `tests/unit/test_solver_helpers.py` -- for both t/u/v
+and q, `effective_error` (the Jo weight) stays unclamped while the gross-
+check decision flips because the comparison's `qc_error` is clamped; a
+flat `error_std` is confirmed untouched by the clamp.
+
+**Not yet done**: re-validate `RAOBS_Q_BG_CHECK`'s bump from `4.0` to
+`8.0` against the real 10-cycle AIFS experiment that originally
+validated `4.0` (for the older table/fraction q-error path, not
+`use_source_error`) -- changing it is a deliberate "mimic GSI" choice,
+not yet re-confirmed to help or hurt skill in that same experiment.
+
+## GSI's x1.2 error inflation for raobs (2026-11-18)
+
+The remaining piece from the GSI comparison: `read_prepbufr.F90` also
+inflates the error it writes out (`cdata_all(1,iout)=toe`, etc.) by x1.2,
+multiplicatively, on two independent triggers:
+- **Quality mark 3 or 7** (`inflate_error = qm==3 .or. qm==7`): applies
+  to t, u/v, AND q alike (`toe=toe*r1_2`, `woe=woe*r1_2`,
+  `qoe=qoe*r1_2` -- confirmed q gets this too by reading `read_prepbufr.F90`
+  directly; an earlier answer in this conversation wrongly said q doesn't).
+- **Above a variable-specific pressure**: t only, above 100 hPa
+  (`if(ppb < r100)toe=toe*r1_2`); u/v only, above 50 hPa
+  (`if(obsdat(1,k) < r50)woe=woe*r1_2`). q has no pressure-based trigger.
+
+Unlike the ermin/ermax clamp (gross-check only, see above), this
+inflation modifies the value GSI actually uses for weighting -- `toe`/
+`woe`/`qoe` in `cdata_all` is what `setupt`/`setupw`/`setupq.f90` read
+back as `data(ier,i)`, both for the Jo weight (`errorx=(data(ier,i)+
+dprpx)*qsges`-style) and for the later ermin/ermax-clamped gross check.
+So `_gsi_inflate_error` (`raobs_parquet.py`) is applied directly to
+`source_error_<v>`/`source_error_q` at read time, inflating the value
+itself -- not a separate gross-check-only quantity the way the clamp is.
+It composes correctly with the existing clamp with no changes needed on
+that side: the clamp already operates on `effective_error`, which now
+already includes this inflation, exactly mirroring GSI's own order of
+operations (inflate at read time, clamp only for the gross check later).
+
+Only applied when `use_source_error` is in effect (same reasoning as the
+clamp) -- this repo's own flat/table defaults are never touched.
+
+**Testing**: `tests/unit/test_raobs_parquet.py` -- each trigger checked
+independently (qm 3, qm 7 stacked with the pressure trigger, t's 100 hPa
+vs. wind's 50 hPa threshold not being interchangeable, q's qm-only
+inflation with no pressure trigger even at a very low pressure), plus a
+good-quality-mark case confirming no spurious inflation.

@@ -72,6 +72,10 @@ def test_missing_file_returns_none(tmp_path):
      r"observations.raobs.variables entries must be a subset of .*got unsupported entries \['bogus'\]"),
     ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'variables': []}}},
      'observations.raobs.variables must be non-empty'),
+    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'tuv_bg_check': -1.0}}},
+     'observations.raobs.tuv_bg_check must be positive and finite'),
+    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'q_bg_check': 0.0}}},
+     'observations.raobs.q_bg_check must be positive and finite'),
 ])
 def test_invalid_configs_rejected(tmp_path, exp, match):
     with pytest.raises(ValueError, match=match):
@@ -98,7 +102,8 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
             'psobs': {'path': './psobs'},
             'raobs': {
                 'enabled': True, 'variables': ['temperature', 'u_component_of_wind'],
-                'quality_mark_max': 2, 'q_bg_check': None,
+                'quality_mark_max': 2, 'q_bg_check': None, 'tuv_bg_check': 3.5,
+                'use_source_error': True,
             },
         },
     ))
@@ -106,6 +111,8 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
     assert exp['raobs_variables'] == ['temperature', 'u_component_of_wind']
     assert exp['raobs_quality_mark_max'] == 2
     assert exp['raobs_q_bg_check'] is None
+    assert exp['raobs_tuv_bg_check'] == 3.5
+    assert exp['raobs_use_source_error'] is True
     assert exp['raobs_path'] == exp['obspath']  # defaults to psobs's resolved path
 
 

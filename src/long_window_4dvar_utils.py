@@ -313,7 +313,38 @@ RAOBS_SUPPORTED_BACKENDS = ('aifs', 'aurora', 'ace2', 'ngcm', 'neuralgcm', 'grap
 # Default per-level raob q error (hPa: g/kg): Desroziers estimates from a
 # ps + raobs run (see docs/integrate_multiple_parquetobs.md).
 RAOBS_Q_ERROR_G_KG = {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
-RAOBS_Q_BG_CHECK = 4.0
+# GSI's own 'gross' convinfo value for kx 120/220/221 (t/uv/q all share
+# 8.0) -- the multiplier in the background check `|O-B| > bg_check *
+# qc_error`. Previously 4.0 (q_bg_check was independently validated at
+# that value, but only against the OLDER table/fraction q-error path --
+# see docs/integrate_multiple_parquetobs.md -- not yet re-validated at
+# 8.0 or against use_source_error).
+RAOBS_Q_BG_CHECK = 8.0
+# t/u/v share one background-check multiplier (unlike q, they share one
+# flat error_std too) -- GSI's conventional-data gross check (errormod,
+# read_prepbufr.F90) rejects/inflates on |O-B| similarly for raobs t/u/v;
+# this repo's raobs previously had no O-B check for them at all, relying
+# only on the read-time PREPBUFR-quality-mark/height QC (see
+# docs/integrate_multiple_parquetobs.md's GSI comparison).
+RAOBS_TUV_BG_CHECK = 8.0
+
+# GSI's own ermin/ermax gross-check bounds (global_convinfo.txt, kx
+# 120/220/221). These clamp ONLY the quantity the gross check (above)
+# compares against -- `qc_error`, computed fresh in
+# _compute_raobs_observation_diagnostics_at_time -- never the actual Jo
+# weight (`effective_error`/`error_<base>`/`source_error_q`), which stays
+# the real, unclamped per-level/per-ob table value. Confirmed directly in
+# GSI's setupq.f90: the ermin/ermax-clamped `obserror` there is computed
+# but never feeds the actual weight (`errorx`/`ratio_errors`, built from
+# the raw, unclamped table value) -- only a later, separately-clamped
+# `obserrlm` derived from the ALREADY-finalized weight, which reads as a
+# diagnostic-only quantity. Only applied when use_source_error is in
+# effect (never to this repo's own flat/table defaults, e.g. the
+# mini-ACE2 fixture's deliberately inflated error_std).
+RAOBS_TUV_ERMIN = {'t': 1.3, 'u': 1.4, 'v': 1.4}
+RAOBS_TUV_ERMAX = {'t': 5.6, 'u': 6.1, 'v': 6.1}
+RAOBS_Q_ERMIN_PERCENT = 10.0
+RAOBS_Q_ERMAX_PERCENT = 100.0
 
 _RAOBS_CONFIG_KEYS = {
     'path': 'raobs_path',
@@ -326,6 +357,8 @@ _RAOBS_CONFIG_KEYS = {
     'height_max_m': 'raobs_height_max_m',
     'below_station_tolerance_m': 'raobs_below_station_tolerance_m',
     'error_std': 'raobs_error_std',
+    'use_source_error': 'raobs_use_source_error',
+    'tuv_bg_check': 'raobs_tuv_bg_check',
     'q_error_fraction': 'raobs_q_error_fraction',
     'q_error_floor_kg_kg': 'raobs_q_error_floor_kg_kg',
     'q_error_g_kg': 'raobs_q_error_g_kg',
@@ -593,7 +626,9 @@ def load_config(config_path='config.yml'):
             for k, v in error_std.items():
                 if not (np.isfinite(v) and v > 0):
                     raise ValueError(f"observations.raobs.error_std[{k!r}] must be positive and finite, got {v!r}")
-        for key in ('raobs_q_error_fraction', 'raobs_q_error_floor_kg_kg'):
+        for key in (
+            'raobs_q_error_fraction', 'raobs_q_error_floor_kg_kg', 'raobs_q_bg_check', 'raobs_tuv_bg_check',
+        ):
             v = exp.get(key)
             if v is not None and not (np.isfinite(v) and v > 0):
                 raise ValueError(f"observations.raobs.{key[len('raobs_'):]} must be positive and finite, got {v!r}")
@@ -1320,6 +1355,7 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
         below_station_tolerance_m=exp.get('raobs_below_station_tolerance_m', 100.),
         pressure_match_tolerance_hpa=exp.get('raobs_pressure_match_tolerance_hpa', 0.05),
         humidity_min_pressure_hpa=exp.get('raobs_humidity_min_pressure_hpa', 300.),
+        use_source_error=exp.get('raobs_use_source_error', True),
         logger=logger,
     )
 
@@ -1378,8 +1414,46 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                 raobs_traj['error_q_level'] = torch.as_tensor(err, dtype=torch.float32, device=device)
             bgc = exp.get('raobs_q_bg_check', RAOBS_Q_BG_CHECK)
             raobs_traj['q_bg_check'] = float(bgc) if bgc else None
+            if 'source_error_q' in data:
+                # Per-(level, station) kg/kg error from the archive's own
+                # RH-based QOE, converted via qsat at ITS static background
+                # (see raobs_parquet.py) -- NaN (no valid source value)
+                # left as-is here; _compute_raobs_observation_diagnostics_
+                # at_time overrides the table/fraction error with this
+                # wherever it's finite, element-by-element (q's existing
+                # fallback isn't a single flat value the way t/u/v's is, so
+                # it can't be pre-filled the same way).
+                source = torch.full((n_obs, n_levels, capacity), float('nan'), dtype=torch.float32, device=device)
+                for j in range(n_obs):
+                    n = data['source_error_q'][j].shape[-1]
+                    source[j, :, :n] = torch.as_tensor(data['source_error_q'][j], device=device)
+                raobs_traj['source_error_q'] = source
+            if 'source_qsat_q' in data:
+                qsat = torch.full((n_obs, n_levels, capacity), float('nan'), dtype=torch.float32, device=device)
+                for j in range(n_obs):
+                    n = data['source_qsat_q'][j].shape[-1]
+                    qsat[j, :, :n] = torch.as_tensor(data['source_qsat_q'][j], device=device)
+                raobs_traj['source_qsat_q'] = qsat
         else:
-            raobs_traj['error_'+base] = float(error_std[base])
+            flat_error = float(error_std[base])
+            if 'source_error_'+base in data:
+                # Per-(level, station) GSI error-table value straight from
+                # the archive's own TOE/WOE field (see raobs_parquet.py's
+                # _VARIABLE_ERROR_COLUMNS), falling back to the flat
+                # error_std wherever the archive didn't have one (NaN).
+                source = torch.zeros((n_obs, n_levels, capacity), dtype=torch.float32, device=device)
+                for j in range(n_obs):
+                    n = data['source_error_'+base][j].shape[-1]
+                    source_j = torch.as_tensor(data['source_error_'+base][j], device=device)
+                    source[j, :, :n] = torch.where(
+                        torch.isfinite(source_j), source_j, torch.full_like(source_j, flat_error))
+                raobs_traj['error_'+base] = source
+            else:
+                raobs_traj['error_'+base] = flat_error
+            bgc = exp.get('raobs_tuv_bg_check', RAOBS_TUV_BG_CHECK)
+            raobs_traj['tuv_bg_check'] = float(bgc) if bgc else None
+            raobs_traj['ermin_'+base] = RAOBS_TUV_ERMIN[base]
+            raobs_traj['ermax_'+base] = RAOBS_TUV_ERMAX[base]
 
     # Shared k-NN horizontal interpolation (same mechanism as psobs, but
     # computed independently -- raobs stations are not at the same
@@ -1583,9 +1657,15 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
     one entry per `raobs_traj['variables']`. Unlike the ps forward
     operator, there is no orography QC and no elevation-based reduction --
     each variable is compared against the model's own native level directly.
-    QC is the read-time QC already folded into `mask_<base>`, plus, for q
-    only, an optional background check (`q_bg_check`: reject
-    |O-B| > q_bg_check * error, evaluated at the current state).
+    QC is the read-time QC already folded into `mask_<base>`, plus an
+    optional background check evaluated at the current state: reject
+    |O-B| > bg_check * qc_error -- `q_bg_check` for q, `tuv_bg_check`
+    (shared by t/u/v, like their shared `error_std`) for the rest.
+    `qc_error` is `effective_error` (the actual Jo weight) EXCEPT when
+    `use_source_error` is in effect, where it's additionally clamped into
+    GSI's own ermin/ermax range for this comparison only -- the real,
+    unclamped per-ob archive value still does the actual weighting (see
+    RAOBS_TUV_ERMIN/ERMAX/RAOBS_Q_ERMIN_PERCENT/ERMAX_PERCENT).
     """
     idx = raobs_traj['interp_idx'][oind]
     wts = raobs_traj['interp_wts'][oind]
@@ -1606,10 +1686,47 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
                     raobs_traj['error_q_fraction'] * observation.abs(),
                     min=raobs_traj['error_q_floor'],
                 )
+            if raobs_traj.get('source_error_q') is not None:
+                # Per-ob archive source error (use_source_error: True)
+                # overrides the table/fraction error wherever it's finite
+                # -- q has no single flat fallback value to pre-fill with
+                # (unlike t/u/v), so the override happens here instead.
+                source = raobs_traj['source_error_q'][oind]
+                effective_error = torch.where(torch.isfinite(source), source, effective_error)
             if raobs_traj.get('q_bg_check'):
-                used = used & (innovation.abs() <= raobs_traj['q_bg_check'] * effective_error).detach()
+                qc_error = effective_error
+                qsat = raobs_traj.get('source_qsat_q')
+                if qsat is not None:
+                    # GSI's own ermin/ermax clamp (RH-percent -> kg/kg via
+                    # the SAME qsat the source error itself used), applied
+                    # ONLY to this gross-check comparison -- effective_error
+                    # above (the actual Jo weight) stays the real,
+                    # unclamped per-level value. Only where qsat is valid
+                    # (a source value existed at this level/station);
+                    # elsewhere qc_error is the table/fraction error,
+                    # which has nothing GSI-sourced to clamp against.
+                    qsat_j = qsat[oind]
+                    ermin = (RAOBS_Q_ERMIN_PERCENT / 100.) * qsat_j
+                    ermax = (RAOBS_Q_ERMAX_PERCENT / 100.) * qsat_j
+                    clamped = torch.clamp(qc_error, min=ermin, max=ermax)
+                    qc_error = torch.where(torch.isfinite(qsat_j), clamped, qc_error)
+                used = used & (innovation.abs() <= raobs_traj['q_bg_check'] * qc_error).detach()
         else:
-            effective_error = torch.full_like(observation, raobs_traj['error_'+base])
+            error_spec = raobs_traj['error_'+base]
+            # A tensor here is the archive's own per-(level, station) source
+            # error (use_source_error: True), already pre-filled with the
+            # flat error_std wherever the archive had none -- see get_raobs.
+            effective_error = error_spec[oind] if torch.is_tensor(error_spec) else \
+                torch.full_like(observation, error_spec)
+            if raobs_traj.get('tuv_bg_check'):
+                qc_error = effective_error
+                if torch.is_tensor(error_spec):
+                    # GSI's own ermin/ermax clamp -- gross-check only, same
+                    # reasoning as q above (effective_error, the actual Jo
+                    # weight, stays the real unclamped archive value).
+                    qc_error = torch.clamp(
+                        qc_error, min=raobs_traj['ermin_'+base], max=raobs_traj['ermax_'+base])
+                used = used & (innovation.abs() <= raobs_traj['tuv_bg_check'] * qc_error).detach()
         results[base] = (innovation, safe_model_obspace, effective_error, used)
     return results
 
