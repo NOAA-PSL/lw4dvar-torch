@@ -38,6 +38,19 @@ a NEW release (ci-fixtures-vN) and update MINI_ACE2['release'] / ['url'].
 Ursa only (reads the training dataset, the checkpoint and the obs archive), in
 the ace2 env:
   python tests/make_fixtures.py mini_ace2 --weights_out /tmp/mini_ace2.tar
+
+golden -- the golden outputs (layer 4; tests/golden/, tests/ace2/):
+  data/golden/toy_<config>.json  the toy-model minimization for each config in
+      tests/golden/toy_golden.py (float64; anywhere, in the CI env)
+  data/golden/toy_obs.json  the toy runs' frozen obs values: written only
+      with --toy-obs (or if missing), never to absorb a solver change
+  data/golden/mini_ace2.json  with --ace2: the mini-ACE2 run's summary
+      (tests/ace2/mini_ace2.py; needs fme and the checkpoint, as
+      `make check-ace2` does)
+Regenerating is a deliberate change: run it in the CI env
+(envs/requirements-ci.txt, plus envs/requirements-ci-ace2.txt for --ace2), look at the
+diff, and say in the PR what moved and why.
+  python tests/make_fixtures.py golden [--ace2] [--toy-obs]
 """
 
 import argparse
@@ -349,14 +362,39 @@ def mini_ace2(args):
     print(f'wrote {out}')
 
 
+def golden(args):
+    sys.path[:0] = [os.path.join(REPO_ROOT, 'src'), REPO_ROOT, os.path.join(HERE, 'golden'), os.path.join(HERE, 'ace2')]
+    import toy_golden
+    if args.toy_obs or not os.path.exists(toy_golden.OBS_PATH):
+        print(f'wrote {toy_golden.write_obs()}')
+    for name in toy_golden.CONFIGS:
+        print(f'wrote {toy_golden.write(name)}')
+    if args.ace2:
+        import tempfile
+        import mini_ace2
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, log, exp, windows, out = mini_ace2.run(tmp, mini_ace2.checkpoint_path())
+            if rc != 0:
+                sys.exit(f'mini-ACE2 run failed:\n{log[-4000:]}')
+            summary = mini_ace2.summarize(exp, windows, out)
+        os.makedirs(os.path.dirname(mini_ace2.GOLDEN), exist_ok=True)
+        with open(mini_ace2.GOLDEN, 'w') as fh:
+            json.dump(summary, fh, indent=1)
+            fh.write('\n')
+        print(f'wrote {mini_ace2.GOLDEN}')
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('fixture', choices=['mini_ace2'])
+    ap.add_argument('fixture', choices=['mini_ace2', 'golden'])
     ap.add_argument('--weights_out', help='mini_ace2: also write the weights-only checkpoint here')
     ap.add_argument('--new_asset', action='store_true',
                     help='mini_ace2: record --weights_out as a new release asset in the manifest')
+    ap.add_argument('--ace2', action='store_true', help='golden: also the mini-ACE2 golden output')
+    ap.add_argument('--toy-obs', action='store_true',
+                    help='golden: also rewrite the toy runs\' frozen obs (only if the toy problem changed)')
     args = ap.parse_args()
-    {'mini_ace2': mini_ace2}[args.fixture](args)
+    {'mini_ace2': mini_ace2, 'golden': golden}[args.fixture](args)
 
 
 if __name__ == '__main__':
