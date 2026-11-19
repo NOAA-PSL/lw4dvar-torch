@@ -291,6 +291,30 @@ exp:
   #   latent increment inside the differentiable forward pass (rarely
   #   needed -- tune learn_rate first)
 
+  # synthetic_obs: OSSE -- ps and raob VALUES replaced by H(truth) + N(0, ob error) at the real
+  # locations/times/QC (make_synthetic_obs); radiances must be disabled. truth: 'era5' (training
+  # zarr: model error in play) or 'twin' (A2 forecast from ERA5 at the window start: perfect model).
+  #synthetic_obs: {truth: era5, noise: true, seed: 0}
+  # model_weights: fine-tuned weights loaded over the checkpoint's (aifs37 only; finetune/finetune_a2.py
+  # checkpoints, notes/adjoint_finetune_plan.md)
+  #model_weights: /scratch4/BMC/gsienkf/Sergey.Frolov/lwatms/output/finetune/C0/step_4000.pt
+  # hydrostatic_z: true -> hard hydrostatic constraint on every injected increment (window start and
+  # weak-constraint jumps; AIFS-family channels_last states): after the injection step, z above the lowest
+  # pressure level is replaced by z_b + dz(lowest) + sum_layers Rd d(Tv_mean) ln(p_lower/p_upper),
+  # Tv = T(1+0.608q), b = the same step without the increment -- the increment's z is diagnosed from its
+  # t, q, the background's own residual is kept. Applied in the loss, the saved analysis and all
+  # forecasts. Default false. (notes/plan_20261105.md "Hydrostatic z constraint")
+  #hydrostatic_z: true
+  # adjoint_filter: filter the GRADIENT only (forward model and Jo exact), like the extra diffusion that
+  # traditional 4D-Var puts in its TL/adjoint (adjoint_filter.py; notes/plan_20261105.md "Adjoint filter"):
+  #   diffusion: {scale_km, steps}  -- smooth the adjoint state (k-NN means) on window steps <= steps ('all')
+  #   balance: true                 -- at the injection step, transpose of the hydrostatic-z map (z adjoint -> t, q)
+  #   modes: {rank: 24, steps: 8, small_max: 0.5, imbalance_max: 0.7, amp_max: 19}  -- remove unrealistic leading
+  #     singular vectors (6 h -> 54 h, fp32) of A2 at the background from the injection-step adjoint; cached per
+  #     window as <date>_af_modes_<window>h.pt in path_output. AIFS (channels_last) only. Default off.
+  #adjoint_filter: {diffusion: {scale_km: 300, steps: 1}, balance: false}
+  # model_correction: learned correction g(x) added after every 6-h step (model_correction.py)
+  #model_correction: {path: output/colearn/g_A/best.pt}
   # weak_constraint: model-error jumps (weak-constraint 4D-Var) -- one latent
   # increment per jump time, injected on the step h -> h+6 at h = every_hours,
   # 2*every_hours, ... inside the window, like the window-start increment. The
@@ -479,6 +503,12 @@ windows:
     end_factor: 0.1 # end factor for learning rate at end of cosine decay
     beta1: 0.9 # beta factors for adamw
     beta2: 0.999
+    # optimizer: adamw   # adamw (default) | sgd. Window or exp key.
+    # adam_eps: 1.0e-8   # adamw eps; >> typical sqrt(v) removes Adam's per-element normalisation
+    #                    # (then a scaled gradient descent: rescale learn_rate by ~eps / sqrt(v))
+    # momentum: 0.9      # sgd only (nesterov: false). sgd's weight decay is torch's coupled L2:
+    #                    # per-step decay lr * weight_decay, so weight_decay ~ lr_adamw * wd_adamw / lr
+    #                    # keeps an AdamW run's decay
     bg_check: 4. # background check
     zthresh: 500. # orog diff threshold
     zconst: 0.003 # factor to boost ob error

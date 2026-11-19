@@ -62,7 +62,8 @@ import sfcobs_parquet  # noqa: E402
 ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
 ap.add_argument('config')
 ap.add_argument('label')
-ap.add_argument('source', help="'era5' or a run's output directory")
+ap.add_argument('source', help="'era5', a run's output directory, 'era5self' (ERA5 itself at every lead: its own fit "
+                "to the obs) or 'nudged:DIR' (ERA5 at T plus the window nudges DIR/<T>_nudges.pt of fit_window_nudges.py)")
 ap.add_argument('start', help='first init date, YYYY-MM-DDTHH')
 ap.add_argument('end', help='last init date, YYYY-MM-DDTHH')
 ap.add_argument('--out', default='output/forecast_skill')
@@ -359,8 +360,24 @@ def done(ofile):
         return False
 
 
+WINDOW = args.source.split(':', 1)[0] in ('window', 'windowbg')
+
+
 def initial_state(T):
-    if args.source == 'era5':
+    if WINDOW:
+        kind, run = args.source.split(':', 1)
+        t0 = utils.add_hours(T, -6)  # the cycle's window start; T = t0 + 6 h = the analysis time (window step 1)
+        name = 'optimal' if kind == 'window' else 'control'
+        files = glob.glob(f'{run}/{t0}_{name}_inputs_{args.window_hours}h_*it.pkl')
+        if len(files) != 1:
+            raise FileNotFoundError(f'expected one {run}/{t0}_{name}_inputs_{args.window_hours}h_*it.pkl, found {files}')
+        with open(files[0], 'rb') as fh:
+            state = model.prime_from_state(pickle.load(fh))
+        hours = (datetime.strptime(T, '%Y-%m-%dT%H') - state.date.replace(tzinfo=None)).total_seconds() / 3600
+        if hours:
+            state = model.advance(state, steps=int(round(hours / 6)), use_checkpoint=False)
+        return state
+    if args.source == 'era5' or args.source == 'era5self' or args.source.startswith('nudged:'):
         state, _ = utils.get_input(dict(exp, date=T, nhrs_back=0, restart_window=False), model, logger)
         return state
     t0 = utils.add_hours(T, -args.window_hours)
@@ -412,12 +429,28 @@ while T <= args.end:
     era = {}
     with torch.no_grad():
         state = initial_state(T)
+        wc = None
+        if args.source.startswith('window:'):
+            t0 = utils.add_hours(T, -6)
+            wf = glob.glob(f"{args.source[7:]}/{t0}_wc_forcing_{args.window_hours}h_*it.pt")
+            if wf:  # weak-constraint run: replay its jumps (window step s = k + 1), control mask and hydrostatic z
+                w = torch.load(wf[0], map_location=device, weights_only=False)
+                n_vars = state.state.shape[1] if model.state_layout == 'channels_first' else state.state.shape[-1]
+                wc = {'step_index': {s_: j for j, s_ in enumerate(w['steps'])},
+                      'forcing': w['forcing'].to(device).float() / w['latent_scale'],
+                      'keep_mask': utils._resolve_control_mask(model, exp, n_vars, device),
+                      'hydrostatic_z': bool(exp.get('hydrostatic_z'))}
+        if args.source.startswith('nudged:'):
+            w = torch.load(f"{args.source[7:]}/{T}_nudges.pt", map_location=device, weights_only=False)
+            wc = {'step_index': {s: j for j, s in enumerate(w['steps'])},
+                  'forcing': w['forcing'].to(device).float() / w['latent_scale'], 'keep_mask': None}
         for k in range(LEADS + 1):
             if k > 0:
-                state = model.advance(state, steps=1, use_checkpoint=False)
+                state = (utils._wc_step(model, state, k + 1 if WINDOW else k, wc) if wc
+                         else model.advance(state, steps=1, use_checkpoint=False))
             vt = utils.add_hours(T, 6 * k)
-            d_f = model.decode_state(state)
             d_e = utils.get_verif(e, model, logger, date_override=vt)
+            d_f = d_e if args.source == 'era5self' else model.decode_state(state)
             for key, val in era5_scores(fields(d_f), fields(d_e)).items():
                 era[key + (k,)] = val
             score_ps(acc, k, d_f, d_e, verif0, psobs, e, table)

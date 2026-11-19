@@ -219,7 +219,8 @@ for k in range(exp_config['n_init']):
         if is_new_analysis_time and exp_config.get('reset_skt_ocean', False):
             logger.info('resetting skt over ocean from ERA5 (reset_skt_ocean)...')
             input_encoded = utils.reset_skt_over_ocean(
-                model, input_encoded, verif_ic, lsm_threshold=exp_config.get('skt_ocean_lsm_threshold', 0.5)
+                model, input_encoded, verif_ic, lsm_threshold=exp_config.get('skt_ocean_lsm_threshold', 0.5),
+                extra_vars=exp_config.get('reset_ocean_vars', ()), logger=logger,
             )
         # get real ps observations
         logger.info('reading observations...')
@@ -232,12 +233,26 @@ for k in range(exp_config['n_init']):
         # None unless an observations.<sensor> block is enabled; same slot
         # grid as psobs.
         mw_trajs = utils.get_mwobs(exp_config, model, logger, grid_interp, psobs_traj)
+        if exp_config.get('synthetic_obs'):   # OSSE: obs values from a truth trajectory (make_synthetic_obs)
+            utils.make_synthetic_obs(exp_config, model, verif_ic, psobs_traj, raobs_traj, grid_interp, logger)
 
-        # call the optimization routine
-        analysis_state, lsave = utils.compute_optimal(
-            exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj,
-            mw_trajs=mw_trajs,
-        )
+        # call the optimization routine -- or, with free_rollout (opt-in, default off), skip the
+        # assimilation and advance the background by dt_verif: the uncorrected advance, dated
+        # window start + dt_verif like an analysis, so cycling (and reset_skt_ocean /
+        # reset_ocean_vars at each new analysis time) continues on the background and every
+        # consumer below works unchanged (O-A == O-B). Ported from lw4dvar-torch aifs-exp-rollout.
+        if exp_config.get('free_rollout', False):
+            logger.info('free_rollout: skipping assimilation, advancing the background only...')
+            with torch.no_grad():
+                analysis_state = model.advance(
+                    input_encoded, steps=steps_for_hours(exp_config['dt_verif']), use_checkpoint=False,
+                )
+            lsave = [float('nan')]
+        else:
+            analysis_state, lsave = utils.compute_optimal(
+                exp_config, model, input_encoded, verif_ic, psobs_traj, grid_interp, logger, raobs_traj,
+                mw_trajs=mw_trajs,
+            )
         # save initial and final trajectory in model and observation space.
         utils.save_trajectory_diagnostics(
             exp_config, model, input_encoded, analysis_state, verif_ic, psobs_traj,

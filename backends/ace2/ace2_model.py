@@ -393,7 +393,10 @@ class ACE2Model(forecast_model.LatentForecastModel):
             lo = (k - 1).clamp(0, nlay - 1)
             hi = k.clamp(0, nlay - 1)
             x_lo, x_hi = torch.gather(lnp_mid, 0, lo), torch.gather(lnp_mid, 0, hi)
-            w = torch.where(hi > lo, (lnp_t - x_lo) / (x_hi - x_lo), torch.zeros_like(lnp_t))
+            # safe denominator: where hi == lo the discarded branch is 0/0 and would put NaN into the gradient
+            same = hi <= lo
+            den = torch.where(same, torch.ones_like(x_hi), x_hi - x_lo)
+            w = torch.where(same, torch.zeros_like(lnp_t), (lnp_t - x_lo) / den)
             for b in need:
                 f = flat[self._layer_cols[_DERIVED_FROM[b]]]
                 v = (1 - w) * torch.gather(f, 0, lo) + w * torch.gather(f, 0, hi)

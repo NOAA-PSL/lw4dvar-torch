@@ -43,6 +43,13 @@ model = utils.get_model(exp)
 utils._ensure_backend_on_path('aifs')
 import aifs_model  # noqa: E402
 
+
+def _pre(model):
+    """input normalizer; A1/A2 (aifs37) keep their processors in a ModuleDict keyed by dataset"""
+    p = model.interface.pre_processors
+    ds = getattr(model, 'dataset', None)
+    return p[ds] if ds is not None and isinstance(p, __import__('torch').nn.ModuleDict) else p
+
 m = model.interface.model
 
 
@@ -50,7 +57,7 @@ def enc(state):
     """encoder hidden-mesh output for a model state, (n_hidden, n_channels), float32"""
     with torch.no_grad():
         xin = state.state[:, 0:model.multi_step, None, ...]
-        xin = model.interface.pre_processors(xin, in_place=False)
+        xin = _pre(model)(xin, in_place=False)
         with torch.autocast(device_type=model.device.type, dtype=model._autocast_dtype):
             x_data_latent, _, shard_shapes_data = aifs_model._assemble_input_compat(m, xin, xin.shape[0])
             x_hidden = m.node_attributes(m._graph_name_hidden, batch_size=xin.shape[0])

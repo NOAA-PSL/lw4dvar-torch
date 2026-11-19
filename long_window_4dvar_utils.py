@@ -134,6 +134,7 @@ import xarray
 import yaml
 
 GRAV = 9.80665  # m/s^2
+_ADJOINT_FILTER = None  # set per window by compute_optimal (exp.adjoint_filter)
 RD = 287.05  # J/(kg K), dry air gas constant
 RV = 461.5  # J/(kg K), water vapor gas constant
 FV = RV / RD - 1.0
@@ -344,6 +345,7 @@ _RAOBS_CONFIG_KEYS = {
     'q_error_g_kg': 'raobs_q_error_g_kg',
     'q_bg_check': 'raobs_q_bg_check',
     'humidity_min_pressure_hpa': 'raobs_humidity_min_pressure_hpa',
+    'min_pressure_hpa': 'raobs_min_pressure_hpa',
     'station_capacity': 'raobs_station_capacity',
 }
 # observations.<sensor> keys for every MW_SENSORS sensor, flattened to <sensor>_<key>
@@ -583,6 +585,8 @@ def get_window(exp, window, windows):
     exp['end_factor'] = windows[window]['end_factor']
     if 'beta1' in windows[window]: exp['beta1'] = windows[window]['beta1']
     if 'beta2' in windows[window]: exp['beta2'] = windows[window]['beta2']
+    for k in ('optimizer', 'adam_eps', 'momentum', 'nesterov'):
+        if k in windows[window]: exp[k] = windows[window][k]
     exp['window_name'] = str(exp['n_verif'] * dt_verif)
     exp['suffix'] = windows[window]['suffix']
     return exp
@@ -637,14 +641,18 @@ def get_model(exp):
     backend = exp['model_backend']
     if backend == 'aifs':
         _ensure_backend_on_path('aifs')
-        if exp.get('aifs37', False):
+        if exp.get('aifsml', False):
+            # hybrid-layer checkpoints (aifs-r2-l2): AIFS37Model + layers -> 37 pressure levels
+            import aifsml_model
+            cls = aifsml_model.AIFSMLModel
+        elif exp.get('aifs37', False):
             # 37-level A1/A2 checkpoints (anemoi-dev env; notes/integrate_aifs37_models.md)
             import aifs37_model as aifs_model
             cls = aifs_model.AIFS37Model
         else:
             import aifs_model
             cls = aifs_model.AIFSModel
-        return cls(
+        model = cls(
             checkpoint_path=exp['path_model'] + exp['model_name'],
             config_path=exp.get('aifs_config', 'aifs_inference.yaml'),
             device=exp.get('device', 'cuda'),
@@ -652,6 +660,27 @@ def get_model(exp):
             compile_wrapper=exp.get('compile_wrapper', False),
             attention=exp.get('aifs_attention'),
         )
+        mw = exp.get('model_weights')
+        if mw:
+            # fine-tuned weights (finetune/finetune_a2.py checkpoint: {'state_dict': ...}) over the checkpoint's
+            if not exp.get('aifs37', False):
+                raise ValueError('exp.model_weights is implemented for the aifs37 backend only')
+            sd = torch.load(mw, map_location='cpu', weights_only=False)
+            model.interface.model.load_state_dict(sd.get('state_dict', sd), strict=True)
+            for prm in model.interface.model.parameters():
+                prm.requires_grad_(False)
+            logging.getLogger(__name__).info(f"model_weights: {mw} (step {sd.get('step')}, arm {sd.get('arm')})")
+        mc = exp.get('model_correction')
+        if mc:
+            # learned model correction g_theta (model_correction.py, notes/colearn_plan.md)
+            if not hasattr(model, 'model_correction'):
+                raise ValueError('exp.model_correction is implemented for the aifs37 backend only')
+            from model_correction import ColumnCorrection
+            model.model_correction = ColumnCorrection.load(mc['path'], model).eval()
+            for prm in model.model_correction.parameters():
+                prm.requires_grad_(False)
+            logging.getLogger(__name__).info(f"model_correction: {mc['path']}")
+        return model
     elif backend == 'fcn3':
         _ensure_backend_on_path('fcn3')
         import fcn3_model
@@ -943,7 +972,7 @@ def get_verif(exp, model, logger, date_override=None):
     return verif_ic
 
 
-def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5):
+def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5, extra_vars=(), logger=None):
     """AIFS and Aurora only -- never called for FCN3 (load_config rejects
     `reset_skt_ocean: True` under `model_backend: 'fcn3'` up front, since
     FCN3 has no `skt`/`lsm` decode_state field at all).
@@ -983,6 +1012,18 @@ def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5):
     skt_era5 = verif_ic["skt"].to(device=state.device, dtype=state.dtype)
     skt_col = state[0, :, :, skt_idx]  # (multi_step, n_points)
     state[0, :, :, skt_idx] = torch.where(ocean_mask, skt_era5, skt_col)
+    # Optional (exp.reset_ocean_vars, e.g. [siconc] for the aifs37 checkpoints, which carry sea ice
+    # as a prognostic): the same ERA5 reset at ocean points for other fields. A field the model
+    # or verif_ic lacks is skipped with a warning.
+    for var in extra_vars:
+        try:
+            idx = model.resolve_columns(var)[0]
+            vals = verif_ic[var].to(device=state.device, dtype=state.dtype)
+        except (KeyError, IndexError, ValueError) as err:
+            if logger is not None:
+                logger.warning(f'reset_ocean_vars: {var} not reset ({err!r})')
+            continue
+        state[0, :, :, idx] = torch.where(ocean_mask, vals, state[0, :, :, idx])
     return model.wrap_state(state, model_state.date)
 
 
@@ -1209,6 +1250,11 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
             n = data['values_'+base][j].shape[-1]
             values[j, :, :n] = torch.as_tensor(data['values_'+base][j], device=device)
             mask[j, :, :n] = torch.as_tensor(data['mask_'+base][j], device=device)
+        # opt-in: no raob above min_pressure_hpa (e.g. 50 for a model whose top levels are derived from
+        # coarse layers, aifsml: the derived 10-50 hPa fields carry 1-3 K of interpolation error)
+        pmin = exp.get('raobs_min_pressure_hpa')
+        if pmin is not None:
+            mask[:, torch.as_tensor(np.asarray(levels_hpa[base], dtype=float) < float(pmin), device=device), :] = False
         raobs_traj['values_'+base] = values
         raobs_traj['mask_'+base] = mask
         if base == 'q':
@@ -1352,8 +1398,11 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
                 continue
             offset = h + d['dt_hours'].to_numpy()
             parts.append(d[(offset >= -tol) & (offset < tol)])
-        if not parts:
-            raise FileNotFoundError(f"no {sensor} obs file within 6h of {vdate} under {cfg('path')}")
+        if not parts:  # a gap in the archive (missing cycles): an empty slot, filled in below
+            logger.warning(f"no {sensor} obs file within 6h of {vdate} under {cfg('path')} -- empty slot")
+            slots.append(None)
+            vdate = add_hours(vdate, dt_obs)
+            continue
         d = pd.concat(parts, ignore_index=True)
         if cfg('sat_alias'):  # {from: to}: a satellite the decoder never saw in training -> its twin
             d['sat_id_orig'] = d['sat_id'].copy()
@@ -1363,6 +1412,10 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
         slots.append(d[d['scene'].isin(scene_codes)].reset_index(drop=True))
         vdate = add_hours(vdate, dt_obs)
 
+    if all(d is None for d in slots):
+        raise FileNotFoundError(f"no {sensor} obs files for the window starting {exp['date']} under {cfg('path')}")
+    template = next(d for d in slots if d is not None).iloc[0:0]
+    slots = [template.copy() if d is None else d for d in slots]
     counts = [len(d) for d in slots]
     capacity = cfg('capacity', max(max(counts), 1))
     if max(counts) > capacity:
@@ -2124,6 +2177,58 @@ def compute_ps_observation_hx(model, model_state, verif_ic, psobs_traj, exp, gri
     return obs_trajectory, model_trajectory, raobs_trajectory, mw_trajectories
 
 
+def make_synthetic_obs(exp, model, verif_ic, psobs_traj, raobs_traj, grid_interp, logger):
+    """exp.synthetic_obs (OSSE): replace the ps and raobs VALUES, in place, by H(truth) + Gaussian noise of the
+    assigned (effective) error, keeping the real locations, times, errors and availability masks.
+      truth: 'era5' -- ERA5 (the training zarr) at every 6-h step: the model's own error is in play
+             'twin' -- A2 forecast from ERA5 at the window start: a perfect model (identical twin)
+      noise: true (default) / false;  seed: int (default 0; offset by the date so windows differ)
+    Radiances are not simulated (disable them in synthetic runs). Returns the truth trajectory's decoded states."""
+    cfg = exp['synthetic_obs']
+    truth, noise = cfg.get('truth', 'era5'), cfg.get('noise', True)
+    if truth not in ('era5', 'twin'):
+        raise ValueError(f"synthetic_obs.truth {truth!r}: 'era5' or 'twin'")
+    if any(exp.get(f'{s}_enabled', False) for s in MW_SENSORS):
+        raise ValueError('synthetic_obs simulates ps and raobs only: disable the radiance observations')
+    gen = torch.Generator(device='cpu').manual_seed(int(cfg.get('seed', 0)) + int(get_YYYYMMDDHH(exp['date'])))
+    n_steps = psobs_traj['n_steps']
+    specs = _resolve_loss_interp_specs(model, exp)
+    e0 = dict(exp, nhrs_back=0, restart_window=False)
+    decoded = []
+    with torch.no_grad():
+        x, _ = get_input(dict(e0), model, logger)
+        decoded.append(model.decode_state(x))
+        for s in range(1, n_steps + 1):
+            if truth == 'twin':
+                x = model.advance(x, steps=1, use_checkpoint=False)
+            else:
+                x, _ = get_input(dict(e0, date=add_hours(exp['date'], 6 * s)), model, logger)
+            decoded.append(model.decode_state(x))
+        step_lo, alpha = psobs_traj['step_lo'].tolist(), psobs_traj['alpha'].tolist()
+        nps = nr = 0
+        for j in range(len(step_lo)):
+            s, a = step_lo[j], alpha[j]
+            if s + 1 > n_steps and a > 0:
+                continue
+            d = decoded[s] if a == 0.0 else decoded[s + 1] if a == 1.0 else \
+                _interp_decoded(decoded[s], decoded[s + 1], a, specs)
+            _, me, err, avail, _, _ = _compute_ps_observation_diagnostics_at_time(
+                model, d, verif_ic, psobs_traj, exp, j, grid_interp)
+            ok = avail & torch.isfinite(me)
+            eps = torch.randn(me.shape, generator=gen).to(me.device) if noise else torch.zeros_like(me)
+            psobs_traj['ob'][j] = torch.where(ok, me + eps * err, psobs_traj['ob'][j])
+            nps += int(ok.sum())
+            if raobs_traj is not None:
+                for base, (_, me_r, err_r, _) in _compute_raobs_observation_diagnostics_at_time(
+                        model, d, raobs_traj, grid_interp, j).items():
+                    m = raobs_traj['mask_' + base][j] & torch.isfinite(me_r)
+                    eps = torch.randn(me_r.shape, generator=gen).to(me_r.device) if noise else torch.zeros_like(me_r)
+                    raobs_traj['values_' + base][j] = torch.where(m, me_r + eps * err_r, raobs_traj['values_' + base][j])
+                    nr += int(m.sum())
+    logger.info(f'synthetic_obs: truth {truth}, noise {noise}: replaced {nps} ps and {nr} raob values')
+    return decoded
+
+
 # ---------------------------------------------------------------------------
 # rollout / loss / optimizer
 # ---------------------------------------------------------------------------
@@ -2151,6 +2256,55 @@ def _resolve_weak_constraint(exp, n_steps, timestep_h):
     return list(range(every, n_steps * timestep_h, every))
 
 
+def _hz_spec(model):
+    """Cached index spec for `_hydrostatic_z`: pressure levels carrying t, q and z, highest pressure first."""
+    spec = getattr(model, '_hz_spec_cache', None)
+    if spec is None:
+        if model.state_layout != 'channels_last':
+            raise NotImplementedError('hydrostatic_z: only channels_last packed states (AIFS family) are supported')
+        V = model.var_to_idx
+        levs = sorted({int(k.split('_')[1]) for k in V if k.startswith('z_') and k.split('_')[1].isdigit()
+                       and f"t_{k.split('_')[1]}" in V and f"q_{k.split('_')[1]}" in V}, reverse=True)
+        dev = model.device
+        idx = lambda v: torch.as_tensor([V[f'{v}_{p}'] for p in levs], device=dev)  # noqa: E731
+        lnr = torch.as_tensor(np.log(np.array(levs[:-1], float) / np.array(levs[1:], float)), device=dev)
+        spec = {'levels': levs, 'z': idx('z'), 't': idx('t'), 'q': idx('q'), 'lnr': lnr}
+        model._hz_spec_cache = spec
+    return spec
+
+
+def _hydrostatic_z(model, state, ref):
+    """exp.hydrostatic_z: make the increment of `state` over `ref` (the same step's uncorrected forecast)
+    hydrostatically consistent on its newest time level -- z above the lowest level becomes diagnostic:
+        z_a(p_k) = z_b(p_k) + dz(p_0) + sum_{j<k} Rd * d(Tv_mean_j) * ln(p_j / p_{j+1}),  Tv = T (1 + 0.608 q)
+    (z is geopotential; d() = state - ref; Tv_mean = mean of the layer's two levels), so the background's own
+    hydrostatic residual is kept and the lowest level's z increment (tied to sp) is kept. Gradient flows
+    through t and q (and the lowest z)."""
+    sp = _hz_spec(model)
+    x, r = state.state[:, -1], ref.state[:, -1]
+    tv = lambda y: y[..., sp['t']] * (1 + 0.608 * y[..., sp['q']])  # noqa: E731
+    dtv = tv(x) - tv(r)
+    dphi = RD * 0.5 * (dtv[..., 1:] + dtv[..., :-1]) * sp['lnr'].to(dtv.dtype)
+    z0 = x[..., sp['z'][:1]] - r[..., sp['z'][:1]]
+    znew = r[..., sp['z'][1:]] + z0 + torch.cumsum(dphi, -1)
+    last = x.clone()
+    last[..., sp['z'][1:]] = znew.to(last.dtype)
+    return model.wrap_state(torch.cat([state.state[:, :-1], last[:, None]], dim=1), state.date)
+
+
+def hydrostatic_residual_rms(model, state, ref):
+    """Area-weighted rms (m) of the hydrostatic residual of the increment state - ref on the newest level
+    (thickness increment minus the t,q-implied one), pooled over layers -- ~0 under exp.hydrostatic_z."""
+    sp = _hz_spec(model)
+    x, r = state.state[0, -1].double(), ref.state[0, -1].double()
+    tv = lambda y: y[:, sp['t']] * (1 + 0.608 * y[:, sp['q']])  # noqa: E731
+    dz = lambda y: y[:, sp['z'][1:]] - y[:, sp['z'][:-1]]  # noqa: E731
+    dtv = tv(x) - tv(r)
+    res = (dz(x) - dz(r)) - RD * 0.5 * (dtv[:, 1:] + dtv[:, :-1]) * sp['lnr'].double()
+    aw = torch.as_tensor(model.area_weights, dtype=torch.float64, device=res.device)
+    return float(torch.sqrt((aw[:, None] * res * res).sum() / (aw.sum() * res.shape[1]))) / GRAV
+
+
 def _wc_step(model, state, s, wc_state, use_checkpoint=False):
     """One 6h step to window step `s`, adding the weak-constraint jump
     injected on that step if there is one. `wc_state`: None (plain step) or
@@ -2162,10 +2316,14 @@ def _wc_step(model, state, s, wc_state, use_checkpoint=False):
     if k is None:
         return model.advance(state, steps=1, use_checkpoint=use_checkpoint)
     new = model.advance(state, steps=1, latent_increment=wc_state['forcing'][k], use_checkpoint=use_checkpoint)
-    if wc_state['keep_mask'] is not None:
+    hz = wc_state.get('hydrostatic_z', False)
+    if wc_state['keep_mask'] is not None or hz:
         ref = model.advance(state, steps=1, use_checkpoint=use_checkpoint)
+    if wc_state['keep_mask'] is not None:
         new = model.wrap_state(_apply_control_mask(new.state, wc_state['keep_mask'], ref.state, model.state_layout),
                                new.date)
+    if hz:   # exp.hydrostatic_z: the jump's z increment is diagnosed from its t, q increment
+        new = _hydrostatic_z(model, new, ref)
     return new
 
 
@@ -2473,6 +2631,11 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
                 _apply_control_mask(f_state.state, keep_mask, ref_state1.state, model.state_layout),
                 f_state.date,
             )
+        if s == 1 and exp.get('hydrostatic_z'):
+            # exp.hydrostatic_z: z above the lowest level diagnosed from the increment's t, q
+            f_state = _hydrostatic_z(model, f_state, ref_state1)
+        if _ADJOINT_FILTER is not None:   # exp.adjoint_filter: hook on the adjoint of this step's state
+            f_state = _ADJOINT_FILTER.apply(f_state, s)
         decoded_cur = model.decode_state(f_state, only=loss_bases)
         if jc_ref is not None and s in (1, 2):
             jc_sp[s] = model.decode_state(f_state, only=[jc_ref[0]])[jc_ref[0]]
@@ -2597,40 +2760,105 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     # L = E diag(sqrt(lam / mean(lam))) -- unit mean variance, so sigma_b stays the rms per
     # element. to_b / to_q map the optimized tensors to the latent_scale'd increments the rest
     # of this function works with.
+    #
+    # Per-class covariances (latent_eof.py --save_classes: eigvecs (9, ch, ch), eigvals (9, ch), classes
+    # band_surface): node n of class c(n) (latent_classes.NodeClasses on the window date) gets
+    # delta_n = sigma * L_c(n) u_n, L_c = E_c diag(sqrt(lam_c / m)), m the node-weighted mean of
+    # mean(lam_c) on this date -- the classes keep their relative sizes and sigma stays the rms per
+    # element. from_q is to_q's inverse (unit controls of given latent_scale'd jumps, for prior_dir).
     prior = exp.get('control_prior') or {}
-    to_b = to_q = lambda t: t  # noqa: E731
+    to_b = to_q = from_q = lambda t: t  # noqa: E731
     if prior:
         def _prior_map(sigma, cov_file):
+            c = sigma * latent_scale
             if not cov_file:
-                return lambda t: t * (sigma * latent_scale)
+                return (lambda t: t * c), (lambda t: t / c)
             ev = np.load(cov_file)
             lam = torch.as_tensor(ev['eigvals'], dtype=torch.float64).clamp(min=0)
-            L = torch.as_tensor(ev['eigvecs'], dtype=torch.float64) * (lam / lam.mean()).sqrt()
-            Lt = (L.T * (sigma * latent_scale)).to(device=device, dtype=torch.float32).contiguous()
-            return lambda t: t @ Lt
-        to_b = _prior_map(float(prior['sigma_b']), prior.get('b_cov'))
+            E = torch.as_tensor(ev['eigvecs'], dtype=torch.float64)
+            if E.ndim == 2:
+                s = (lam / lam.mean()).sqrt()
+                Lt = (E * s).T * c
+                Li = (E / s) / c
+                Lt, Li = (x.to(device=device, dtype=torch.float32).contiguous() for x in (Lt, Li))
+                return (lambda t: t @ Lt), (lambda t: t @ Li)
+            from latent_classes import NodeClasses
+            cls = NodeClasses(ev['lat'], ev['lon']).band_surface(exp['date'])
+            n_per = np.bincount(cls, minlength=E.shape[0])
+            m = float((lam.mean(1).numpy() * n_per).sum() / n_per.sum())
+            s = (lam / m).sqrt()
+            Lt = [((E[k] * s[k]).T * c).to(device=device, dtype=torch.float32) for k in range(E.shape[0])]
+            Li = [((E[k] / s[k]) / c).to(device=device, dtype=torch.float32) for k in range(E.shape[0])]
+            idx = [torch.as_tensor(np.flatnonzero(cls == k), device=device) for k in range(E.shape[0])]
+            logger.info(f'control_prior {cov_file}: per-class covariances, nodes per class {n_per.tolist()}, '
+                        f'class rms / sigma ' + ' '.join(f'{(lam[k].mean() / m).sqrt().item():.3g}'
+                                                         for k in range(E.shape[0])))
+
+            def apply(t, Ms):
+                out = torch.zeros_like(t)
+                for k, ik in enumerate(idx):
+                    if len(ik):
+                        out = out.index_copy(-2, ik, t.index_select(-2, ik) @ Ms[k])
+                return out
+            return (lambda t: apply(t, Lt)), (lambda t: apply(t, Li))
+        to_b, _ = _prior_map(float(prior['sigma_b']), prior.get('b_cov'))
         if eta is not None:
-            to_q = _prior_map(float(prior['sigma_q']), prior.get('q_cov'))
+            to_q, from_q = _prior_map(float(prior['sigma_q']), prior.get('q_cov'))
         logger.info(f"control_prior: sigma_b {prior['sigma_b']} ({prior.get('b_cov') or 'diagonal'})"
                     + (f", sigma_q {prior['sigma_q']} ({prior.get('q_cov') or 'diagonal'})" if eta is not None else '')
                     + ' (no weight decay)')
 
     # weak_constraint.warm_start (needs control_prior): the jumps' prior mean, and first guess,
     # is the previous cycle's jumps moved to the same valid times, Jq = sum (v - v_prior)^2
+    # weak_constraint.prior_dir (needs control_prior): the same, from fixed jumps fitted offline,
+    # PRIOR_DIR/<date>_nudges.pt (fit_window_nudges.py: the jumps that keep a forecast from ERA5
+    # at the window start on ERA5 through the window -- the warm start from ERA5)
     v_prior = None
-    if eta is not None and (exp['weak_constraint'] or {}).get('warm_start'):
+    wc_cfg0 = exp.get('weak_constraint') or {}
+    # weak_constraint.node_scale: state-dependent jump size (jump_sigma.py) -- the injected jump is S * to_q(eta),
+    # S per hidden node from the background state before each jump (fixed during the minimisation, mean S^2 = 1)
+    if eta is not None and wc_cfg0.get('node_scale'):
+        import jump_sigma
+        ns = wc_cfg0['node_scale']
+        with torch.no_grad():
+            x, states, s_at = input_encoded, [], 0
+            for s in wc_steps:
+                x = model.advance(x, steps=s - 1 - s_at, use_checkpoint=False) if s - 1 > s_at else x
+                s_at = s - 1
+                states.append(x.state)
+        S = jump_sigma.node_scale(model, states, ns['path'], clip=tuple(ns.get('clip', (0.25, 4.0))), logger=logger)
+        exp['wc_node_scale'] = S.cpu()
+        to_q0, from_q0 = to_q, from_q
+        to_q = lambda t: to_q0(t) * S  # noqa: E731
+        from_q = lambda t: from_q0(t / S)  # noqa: E731
+        logger.info(f"weak_constraint.node_scale: {ns['path']} on {len(states)} jumps")
+    if eta is not None and (wc_cfg0.get('warm_start') or wc_cfg0.get('prior_dir')):
         if not prior:
-            raise ValueError('weak_constraint.warm_start needs control_prior (a prior mean for the jumps)')
-        prev = _previous_wc_controls(exp, prev_wc_state, exp['max_epoch'], logger)
-        if prev is not None:
-            v_prior = _shift_wc_controls(prev[0].to(device), prev[1], wc_hours, int(exp['dt_init']))
+            raise ValueError('weak_constraint.warm_start / prior_dir need control_prior (a prior mean for the jumps)')
+        prev = None
+        if wc_cfg0.get('prior_dir'):
+            pf = os.path.join(wc_cfg0['prior_dir'], f"{exp['date']}_nudges.pt")
+            st = torch.load(pf, map_location='cpu', weights_only=False)
+            # files store forcing = injected * latent_scale (as *_wc_forcing_*.pt); to_q(v) = injected * latent_scale here
+            inj = st['forcing'].float().to(device) / float(st.get('latent_scale', 1.0))
+            prev = (from_q(inj * latent_scale), list(st['hours']))
+            if list(st['hours']) != list(wc_hours):
+                raise ValueError(f'{pf}: jumps at {st["hours"]} h, this window jumps at {wc_hours} h')
+            logger.info(f'weak_constraint.prior_dir: jumps prior mean from {pf}')
+            v_prior = prev[0]
+        else:
+            prev = _previous_wc_controls(exp, prev_wc_state, exp['max_epoch'], logger)
+            if prev is not None:
+                v_prior = _shift_wc_controls(prev[0].to(device), prev[1], wc_hours, int(exp['dt_init']))
+        if v_prior is not None:
             with torch.no_grad():
                 eta.copy_(v_prior)
             logger.info('weak_constraint.warm_start: prior-mean jump rms '
                         + ', '.join(f'{h} h {to_q(v_prior[k]).pow(2).mean().sqrt().item():.4g}'
                                     for k, h in enumerate(wc_hours)))
             exp['wc_prior_state'] = {'step_index': {s: k for k, s in enumerate(wc_steps)},
-                                     'forcing': (to_q(v_prior) / latent_scale).detach(), 'keep_mask': None}
+                                     'forcing': (to_q(v_prior) / latent_scale).detach(), 'keep_mask': None,
+                                     'hydrostatic_z': bool(exp.get('hydrostatic_z'))}
 
     # control_variables: restrict which packed-state columns the increment may
     # modify at the injection step (see _resolve_control_mask /
@@ -2656,6 +2884,14 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         model._prime_noise()  # no-op for AIFS
         with torch.no_grad():
             ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
+    if exp.get('hydrostatic_z'):
+        _hz_spec(model)   # fails early for unsupported state layouts
+        if ref_state1 is None:
+            model._prime_noise()
+            with torch.no_grad():
+                ref_state1 = model.advance(input_encoded, steps=1, use_checkpoint=False)
+        logger.info(f"hydrostatic_z: z diagnosed from t, q on {len(_hz_spec(model)['levels'])} levels "
+                    'above the lowest at every injection step')
 
     # jc_ps_weight (kappa, hPa^-2): balance penalty on the first-step change
     # of the pressure increment -- see compute_loss_4dvar's docstring. Needs
@@ -2719,7 +2955,20 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         zeta_groups.append(len(groups) - 1)
         logger.info(f"{sensor} emissivity control: per-ob zeta ({K} PCs) on {int(mw_traj['z_active'].sum())} "
                     f"land/snow/ice obs, lr {groups[-1]['lr']}, window channels {mw_traj['emis_channels']}")
-    optimizer = torch.optim.AdamW(groups, lr=lr, weight_decay=wd, betas=(beta1,beta2))
+    # exp.optimizer: 'adamw' (default; adam_eps optional -- a large eps makes Adam a scaled gradient descent
+    # without per-element normalisation) or 'sgd' (momentum, nesterov; torch's coupled weight decay = wd, so set
+    # weight_decay ~ lr_adamw * wd_adamw / lr to keep the per-step decay of an AdamW run)
+    opt_name = exp.get('optimizer', 'adamw')
+    if opt_name == 'adamw':
+        optimizer = torch.optim.AdamW(groups, lr=lr, weight_decay=wd, betas=(beta1, beta2),
+                                      eps=float(exp.get('adam_eps', 1e-8)))
+    elif opt_name == 'sgd':
+        optimizer = torch.optim.SGD(groups, lr=lr, weight_decay=wd, momentum=float(exp.get('momentum', 0.9)),
+                                    nesterov=bool(exp.get('nesterov', False)))
+    else:
+        raise ValueError(f"optimizer {opt_name!r}: 'adamw' or 'sgd'")
+    logger.info(f'optimizer {opt_name}' + (f", adam_eps {exp.get('adam_eps', 1e-8)}" if opt_name == 'adamw' else
+                                           f", momentum {exp.get('momentum', 0.9)}, nesterov {exp.get('nesterov', False)}"))
 
     # linear warmup/cosine decay
     # (parameters: warmup_steps, start_factor, end_factor)
@@ -2833,6 +3082,16 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
                     'background_date': input_encoded.date}, f)
         logger.info(f'saved optimizer state at epoch {epoch} to {f}')
 
+    # exp.adjoint_filter (adjoint_filter.py): filter the gradient flowing back through the window states
+    # (diffusion / hydrostatic balance / removal of unrealistic tangent-linear modes); forward model and Jo exact
+    global _ADJOINT_FILTER
+    _ADJOINT_FILTER = None
+    if exp.get('adjoint_filter'):
+        import adjoint_filter
+        _ADJOINT_FILTER = adjoint_filter.AdjointFilter(model, exp['adjoint_filter'], logger)
+        _ADJOINT_FILTER.compute_modes(
+            input_encoded, path=exp['path_output'] + exp['date'] + '_af_modes_' + exp['window_name'] + 'h.pt')
+
     while epoch < max_epoch:
         epoch += 1
         # Re-prime FCN3's stochastic noise state at the START of every
@@ -2846,7 +3105,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         wc = None
         if eta is not None:
             wc = {'step_index': {s: k for k, s in enumerate(wc_steps)}, 'forcing': to_q(eta) / latent_scale,
-                  'keep_mask': keep_mask}
+                  'keep_mask': keep_mask, 'hydrostatic_z': bool(exp.get('hydrostatic_z'))}
         loss, all_loss = compute_loss_4dvar(model, to_b(increment), latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, raobs_traj,
                                             mw_trajs=mw_trajs, wc=wc)
         Jb = Jq = None
@@ -2921,6 +3180,21 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             lsave.append(lsave[-1])
 
         torch.nn.utils.clip_grad_norm_([increment], max_norm=1.0)
+        if exp.get('log_grad_stats') and (epoch in (1, 10, 50) or epoch == max_epoch):
+            with torch.no_grad():   # per-element gradient / Adam second-moment scale, for choosing adam_eps
+                ga = increment.grad.abs().flatten()
+                q = torch.quantile(ga[torch.randperm(ga.numel(), device=ga.device)[:1000000]],
+                                   torch.tensor([0.1, 0.5, 0.9, 0.99], device=ga.device)).tolist()
+                msg = f'grad_stats epoch {epoch}: |g| rms {ga.pow(2).mean().sqrt():.3e} p10/50/90/99 ' + \
+                      '/'.join(f'{x:.2e}' for x in q)
+                st = optimizer.state.get(increment, {})
+                if 'exp_avg_sq' in st:
+                    sv = st['exp_avg_sq'].sqrt().flatten()
+                    q = torch.quantile(sv[torch.randperm(sv.numel(), device=sv.device)[:1000000]],
+                                       torch.tensor([0.1, 0.5, 0.9, 0.99], device=sv.device)).tolist()
+                    msg += '; sqrt(v) p10/50/90/99 ' + '/'.join(f'{x:.2e}' for x in q)
+                msg += f'; |increment| {increment.norm():.4g}'
+                logger.info(msg)
         if eta is not None:
             torch.nn.utils.clip_grad_norm_([eta], max_norm=1.0)
 
@@ -2959,6 +3233,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         exp['wc_state'] = {'hours': wc_hours, 'steps': wc_steps,
                            'step_index': {s: k for k, s in enumerate(wc_steps)},
                            'forcing': forcing / latent_scale, 'keep_mask': keep_mask,
+                           'hydrostatic_z': bool(exp.get('hydrostatic_z')),
                            'date': exp['date'], 'controls': eta_controls}
         wc_file = _wc_file(exp, exp['date'], max_epoch)
         torch.save({'hours': wc_hours, 'steps': wc_steps, 'forcing': forcing, 'latent_scale': latent_scale,
@@ -2992,22 +3267,28 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     scaled_increment_best = increment_best / latent_scale if increment_best is not None else None
     model._prime_noise()
     with torch.no_grad():
-        if keep_mask is None:
+        if keep_mask is None and not exp.get('hydrostatic_z'):
             analysis_state = model.advance(
                 input_encoded, steps=steps_per_verif, use_checkpoint=False,
                 latent_increment=scaled_increment_best,
             )
         else:
-            # Split the advance so the same control_variables mask the loss
-            # used is applied between the injection step and the rest.
+            # Split the advance so the same control_variables mask (and
+            # hydrostatic_z) the loss used is applied between the injection
+            # step and the rest.
             analysis_state = model.advance(
                 input_encoded, steps=1, use_checkpoint=False,
                 latent_increment=scaled_increment_best,
             )
-            analysis_state = model.wrap_state(
-                _apply_control_mask(analysis_state.state, keep_mask, ref_state1.state, model.state_layout),
-                analysis_state.date,
-            )
+            if keep_mask is not None:
+                analysis_state = model.wrap_state(
+                    _apply_control_mask(analysis_state.state, keep_mask, ref_state1.state, model.state_layout),
+                    analysis_state.date,
+                )
+            if exp.get('hydrostatic_z'):
+                analysis_state = _hydrostatic_z(model, analysis_state, ref_state1)
+                logger.info('hydrostatic_z: 6-h increment hydrostatic residual rms '
+                            f'{hydrostatic_residual_rms(model, analysis_state, ref_state1):.3g} m')
             if steps_per_verif > 1:
                 analysis_state = model.advance(
                     analysis_state, steps=steps_per_verif - 1, use_checkpoint=False,

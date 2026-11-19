@@ -46,6 +46,13 @@ documented in `config.yml.template`.
   `exp.observations` -- see `integrate_prepbufr_obs.md`.
 - One-off diagnostic/probe scripts and configs are left untracked by
   convention; commit only maintained code and tools.
+- **Experiment records live in the private repo
+  NOAA-PSL/lw4dvar-torch-experiments** (folder `frolovsa/<slug>/`, from its
+  `TEMPLATE.md`: question, prediction, setup with the code commit, results,
+  verdict). Results, run configs/scripts and figures go there, not in this
+  repo; cite code by commit. The pre-move state of this branch is tagged
+  `archive/lwatms-20261119`, and a raw copy of its experiment files is in
+  `frolovsa/_snapshot-lwatms-20261119/`.
 
 ## Task documents
 
@@ -61,6 +68,9 @@ documented in `config.yml.template`.
 | `notes/merge_plan.md` | merging to main of NOAA-PSL/lw4dvar-torch: agent rules (one `make check` gate, small PRs, agents open / humans merge, provenance, predictions before GPU jobs, candidate config and CAPABILITIES.md), the experiments repo layout, the 5-layer test strategy and fixtures, and the PR plan for carving feature/lwatms (exported from the Claude Doc; edit the doc and re-export) |
 | `notes/pr_strategy.md` | carving feature/lwatms into PRs to main: branch vs origin/main state, overlaps (raobs branch, latent Jb, aifs3), the ordered PR list with gates and owners, what stays off main |
 | `notes/integrate_aifs37_models.md` | the 37-level AIFS models A1 (top 1 hPa) and A2: their identity, the anemoi-dev env, ICs from the training zarr, the A1 ATMS decoder, and the experiment series (model alone, then stratospheric ATMS channels 8-14) |
+| `notes/colearn_plan.md` | co-learning a model correction g_theta with the PITA initial conditions: the evidence (strong vs weak, A2 drift, ERA5 literature biases), the column correction, steps A/R1/B/W with pre-registered gates |
+| `notes/adjoint_finetune_plan.md` | fine-tuning A2 for a better-behaved adjoint: the off-manifold sensitivity defect, how A2 was trained (single-step only, inference ckpt only), rollout vs denoising / Jacobian-hinge penalties, the evaluation ladder and gates, the first 4-arm experiment |
+| `notes/adjoint_quality.md` | the adjoint-quality battery (`diagnostics/adjoint_quality/`): gradient precision / smoothness / Taylor test, perturbation survival and 6->48 h singular values, the single-ob balance test; how to run it on a new model, the backend adapter, reading Q1-Q5 / S1-S5, the A2 reference values and `compare` |
 
 Add new task documents (e.g. `adding_new_observations.md`) to this table,
 with one line saying when to read them.

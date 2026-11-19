@@ -35,6 +35,13 @@ import torch
 
 import long_window_4dvar_utils as utils
 
+
+def _pre(model):
+    """input normalizer; A1/A2 (aifs37) keep their processors in a ModuleDict keyed by dataset"""
+    p = model.interface.pre_processors
+    ds = getattr(model, 'dataset', None)
+    return p[ds] if ds is not None and isinstance(p, __import__('torch').nn.ModuleDict) else p
+
 ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
 ap.add_argument('config')
 ap.add_argument('run')
@@ -80,7 +87,7 @@ def adv(state, hours):
 def norm_last(state):
     """the state's last time level, normalized as the model's input, (n_points, n_vars)"""
     x = state.state[:, -1:, None, ...]
-    return model.interface.pre_processors(x, in_place=False)[0, 0, 0]
+    return _pre(model)(x, in_place=False)[0, 0, 0]
 
 
 def fit(x, target):
@@ -163,7 +170,7 @@ np.savez(args.out, lat=lat, lon=lon, **{f'{k}_chan': np.sqrt(v.mean(0)) for k, v
          **{f'{k}_node': np.sqrt(v.mean(1)) for k, v in ms.items()},
          **{f'{k}_misfit': np.array(v) for k, v in stats.items()})
 bands = [(-90, -20), (-20, 20), (20, 90)]
-bch = np.sqrt(ms['B'].mean(0))
+bch = np.sqrt(ms['B' if 'B' in ms else next(iter(ms))].mean(0))   # corr vs B, or vs the first kind if no B was fitted
 print(f"\n{'kind':6s} {'n':>3s} {'removed':>8s} {'rms':>8s} {'chan p10':>9s} {'chan p90':>9s}  "
       + ' '.join(f'{a:>4d}..{b:<4d}' for a, b in bands) + '  corr(chan, B)')
 for k, v in ms.items():

@@ -118,11 +118,17 @@ def get_z500_truth(date_str, cache_dir, backend='aifs'):
     """ERA5 z (geopotential, m^2/s^2) at 500 hPa, raw (n_points,) array
     already on the model's native grid (see module docstring). Cached
     in-process since the same valid date is shared by many cycles/lead-times."""
-    key = (backend, date_str)
+    key = (backend, cache_dir, date_str)
     if key not in _verif_cache:
         date_dt = datetime.strptime(date_str, '%Y-%m-%dT%H')
         try:
-            if backend == 'ace2':
+            if cache_dir.startswith('zarr:'):  # a training zarr, physical_scorecard.TRUTHS (aifs37/r2: zarr:era5_37)
+                if _REPO_ROOT + '/diagnostics' not in sys.path:
+                    sys.path.insert(0, _REPO_ROOT + '/diagnostics')
+                import physical_scorecard as ps
+                f = ps.read_era5(date_dt, {'z': {500}, 't': set(), 'u': set(), 'v': set(), 'q': set()}, cache_dir[5:])  # z in m
+                _verif_cache[key] = GRAV * np.asarray(f[('z', 500)], dtype=np.float64)
+            elif backend == 'ace2':
                 truth = _backend_module('ace2', 'ace2_ic').load_verif(date_dt, cache_dir)
                 _verif_cache[key] = GRAV * np.asarray(truth['h500'], dtype=np.float64).reshape(-1)
             elif backend in ('fcn3', 'sfno'):
@@ -225,6 +231,11 @@ def experiment_mean_curves(expt_dir, cache_dir=None, suffix=None):
     backend = detect_backend(control_files[0]) if control_files else 'aifs'
     if cache_dir is None:
         cache_dir = DEFAULT_CACHE_DIR[backend]
+        # aifs37/r2 runs verify against their own training zarr, not Bo's ic_cache (= v8): the two
+        # differ by ~2.5 m z500 rms (2026-11-18 truth audit)
+        cfgs = sorted(glob.glob(os.path.join(expt_dir, 'config.yml*')))
+        if backend == 'aifs' and cfgs and 'aifs37: True' in open(cfgs[-1]).read():
+            cache_dir = 'zarr:era5_37'
     print(f'  backend={backend}, truth from {cache_dir}')
     regions = ['NH', 'Tropics', 'SH', 'Global']
     accum = {'control': {r: [] for r in regions}, 'optimal': {r: [] for r in regions}}

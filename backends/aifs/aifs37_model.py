@@ -184,6 +184,7 @@ class AIFS37Model(aifs_model.AIFSModel):
             raise ValueError("training-zarr grid differs from the checkpoint grid")
 
         self._latent_inc = None
+        self.model_correction = None   # model_correction.ColumnCorrection: x_{k+1} = M(x_k) + g(x_k)
         m.latent_aggregator.register_forward_hook(self._add_latent_increment)
 
     # ------------------------------------------------------------------
@@ -273,4 +274,7 @@ class AIFS37Model(aifs_model.AIFSModel):
             f = self.era5.fields(date)
             new_last[0, :, self._dyn_loaded_idx] = torch.as_tensor(
                 np.stack([f[v] for v in self._dyn_loaded], axis=-1), dtype=new_last.dtype, device=self.device)
+        if self.model_correction is not None:   # learned correction g(x_k) (model_correction.py)
+            g = self.model_correction
+            new_last = new_last.index_add(2, g.out_idx, g(state[:, -1]).to(new_last.dtype))
         return torch.cat([state[:, 1:], new_last[:, None]], dim=1)

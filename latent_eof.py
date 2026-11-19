@@ -35,37 +35,20 @@ ap.add_argument('out')
 ap.add_argument('--modes', default='0,4,19,99')
 ap.add_argument('--pairs', type=int, default=200000)
 ap.add_argument('--holdout', type=int, default=0)
+ap.add_argument('--shrink', default='1e-3', help='comma list of eps for C + eps*mean(lam)*I; the holdout scores each')
+ap.add_argument('--save_classes', default='', help='write band x surface channel covariances (all samples, first --shrink eps) '
+                'as eigvecs / eigvals (9, ch, ch) / (9, ch) for control_prior q_cov / b_cov')
 args = ap.parse_args()
 torch.set_num_threads(16)
 
 
 def surface_classes(files, lat, lon):
-    """Per sample file (<kind>_<YYYY-MM-DDTHH>.pt): each hidden node's class on that date, 0 ocean, 1 land,
-    2 ice/snow, from the O96 points nearest the node (lsm from the v8 zarr; siconc and snow depth sd from the
-    37-level zarr): ice/snow if the sea-ice + snow-covered (sd > 0.01 m w.e.) share >= 0.5, else land if lsm >= 0.5."""
+    """Per sample file (<kind>_<YYYY-MM-DDTHH>.pt): each hidden node's surface class on that date
+    (latent_classes.NodeClasses: 0 ocean, 1 land, 2 ice/snow)."""
     import os
-    import pandas as pd
-    import zarr
-    z37 = zarr.open('/scratch4/BMC/gsienkf/Sergey.Frolov/era5_o96_37lev/chunks/'
-                    'era5-o96-37lev-1979-01-01T00-2023-12-31T18-s4.zarr', 'r')
-    z8 = zarr.open('/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/aifs-single-mse-2.0-1deg/data/training/'
-                   'era5-o96-1979-2023-6h-v8.zarr', 'r')
-    v37, v8 = list(z37.attrs['variables']), list(z8.attrs['variables'])
-    glat, glon = np.radians(np.asarray(z37['latitudes'][:])), np.radians(np.asarray(z37['longitudes'][:]))
-    xyz = lambda la, lo: np.stack([np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)], -1)  # noqa: E731
-    _, near = cKDTree(xyz(np.radians(lat), np.radians(lon))).query(xyz(glat, glon))  # grid point -> node
-    cnt = np.bincount(near, minlength=len(lat)).clip(1)
-    t0 = pd.Timestamp(z37.attrs['start_date'])
-    lsm = np.bincount(near, np.asarray(z8['data'][0, v8.index('lsm'), 0]), len(lat)) / cnt
-    out = {}
-    for f in files:
-        T = pd.Timestamp(os.path.basename(f).split('_', 1)[1][:13])
-        i = int((T - t0) / pd.Timedelta('6h'))
-        a = np.asarray(z37['data'][i, :, 0, :])
-        cold = (np.nan_to_num(a[v37.index('siconc')]) >= 0.5) | (a[v37.index('sd')] > 0.01)
-        icy = np.bincount(near, cold.astype(float), len(lat)) / cnt
-        out[f] = np.where(icy >= 0.5, 2, np.where(lsm >= 0.5, 1, 0))
-    return out
+    from latent_classes import NodeClasses
+    nc = NodeClasses(lat, lon)
+    return {f: nc.surface(os.path.basename(f).split('_', 1)[1][:13]) for f in files}
 
 
 files = sorted(glob.glob(f'{args.samples}/{args.kind}_*.pt'))
@@ -174,18 +157,23 @@ if args.holdout:
     Ctr = cov(train)
     nch = Ctr.shape[0]
     I = torch.eye(nch, dtype=torch.float64)
-    reg = lambda c: c + 1e-3 * c.diagonal().mean() * I  # noqa: E731
+    eps_list = [float(e) for e in args.shrink.split(',')]
     covs = {}
     for name, part in partitions.items():
         ncls = 9 if 'x' in name else 3 if 'by' in name else 1
         Cs, m = cov_classes(train, part, ncls)
-        covs[name] = [reg(c) if c is not None else reg(Ctr) for c in Cs]  # thin classes fall back to the shared C
+        for eps in eps_list:
+            reg = lambda c: c + eps * c.diagonal().mean() * I  # noqa: E731
+            key = name if len(eps_list) == 1 else f'{name} eps {eps:g}'
+            covs[key] = [reg(c) if c is not None else reg(Ctr) for c in Cs]  # thin classes fall back to the shared C
         print(f'{name}: training nodes per class {m}')
+    partitions = {k: partitions[k.split(' eps ')[0]] for k in covs}
     res = {}
     for f in test:
         d = torch.load(f).double()
         Cd = torch.diag(torch.full((nch,), Ctr.diagonal().mean().item(), dtype=torch.float64))
         res.setdefault('diagonal', []).append(loglik(Cd, d))
+        res.setdefault('channel variances (diagonal)', []).append(loglik(torch.diag(Ctr.diagonal()), d))
         for name, part in partitions.items():
             c = torch.as_tensor(part(f))
             ll = sum(loglik(Ck, d[c == k]) * (c == k).sum().item()
@@ -194,6 +182,23 @@ if args.holdout:
     print(f'\nheld-out Gaussian log likelihood, nats per element ({len(train)} training / {len(test)} test samples):')
     for name, v in res.items():
         print(f'  {name:28s} {np.mean(v):8.4f}   (gain over diagonal {np.mean(v) - np.mean(res["diagonal"]):+.4f})')
+
+if args.save_classes:
+    surf = surface_classes(files, lat, lon)
+    band = np.digitize(lat, [-20, 20])
+    eps = float(args.shrink.split(',')[0])
+    S, m = [0.] * 9, [0] * 9
+    for f in files:
+        d, c = torch.load(f).double(), torch.as_tensor(band * 3 + surf[f])
+        for k in range(9):
+            dk = d[c == k]
+            S[k], m[k] = S[k] + dk.T @ dk, m[k] + dk.shape[0]
+    Cs = [S[k] / m[k] if m[k] > 2000 else C for k in range(9)]  # thin classes fall back to the shared C
+    ev = [torch.linalg.eigh(c + eps * c.diagonal().mean() * torch.eye(c.shape[0], dtype=c.dtype)) for c in Cs]
+    np.savez(args.save_classes, eigvals=np.stack([e[0].flip(0).numpy() for e in ev]),
+             eigvecs=np.stack([e[1].flip(1).float().numpy() for e in ev]), classes='band_surface',
+             nodes_per_class=np.array(m), lat=lat, lon=lon, shrink=eps, n_samples=len(files))
+    print('wrote', args.save_classes, 'class rms', ' '.join(f'{np.sqrt(np.mean(e[0].numpy())):.4g}' for e in ev))
 
 np.savez(args.out, eigvals=lam.numpy(), eigvecs=E.float().numpy(), lat=lat, lon=lon, modes=modes,
          corr=corr, edges=edges, n_samples=len(files))

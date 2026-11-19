@@ -6,7 +6,7 @@
 #SBATCH --qos=gpuwf
 #SBATCH --partition=u1-mi300x
 #SBATCH --gres=gpu:mi300x:1
-#SBATCH -c 16
+#SBATCH -c 12
 #SBATCH --mem=240g
 #SBATCH -t 08:00:00
 # Daily 5-day forecast skill (diagnostics/forecast_skill.py, see forecast_skill.md), from the repo root:
