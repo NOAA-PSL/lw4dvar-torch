@@ -100,9 +100,32 @@ def config(tmp_path, ckpt):
         'model_name': os.path.basename(ckpt),
         'forcing_dir': os.path.join(DATA, 'forcing_data') + '/',
         'ic_cache': os.path.join(DATA, 'ic_cache') + '/',
-        'observations': {'psobs': {
-            'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
-        }},
+        'observations': {
+            'psobs': {
+                'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
+            },
+            'raobs': {
+                'enabled': True, 'path': os.path.join(DATA, 'raobs'),
+                'variables': ['temperature', 'u_component_of_wind', 'v_component_of_wind'],
+                # The synthetic fixture's t/u/v aren't tied to this tiny
+                # model's own background climatology (unlike the psobs
+                # fixture, which is loose Gaussian noise around a plausible
+                # ps value) -- a larger, flat error than the default
+                # per-level JEDI/UFO table (RAOBS_TUV_ERROR_STD,
+                # long_window_4dvar_utils.py) keeps raobs Jo from swamping
+                # ps Jo + Jc.
+                'error_std': {'t': 5.0, 'u': 8.0, 'v': 8.0},
+                # use_source_error defaults False (see
+                # docs/integrate_multiple_parquetobs.md); explicit here for
+                # clarity since this synthetic fixture
+                # (tests/make_fixtures.py's _write_raobs_parquet) has no
+                # temperature_error_c/wind_error_ms/
+                # humidity_error_tenths_percent/background_* columns at
+                # all -- read_partition would raise on the missing columns
+                # if this were ever flipped True.
+                'use_source_error': False,
+            },
+        },
         'path_output': os.path.join(str(tmp_path), 'output') + '/',
         'exp_name': 'test_ace2_mini',
         'rpath': os.path.join(str(tmp_path), 'unused') + '/',

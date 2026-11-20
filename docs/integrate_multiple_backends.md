@@ -1847,6 +1847,47 @@ Sergey 299671 vs 293925). Not yet run: a multi-week cycling comparison with
 the unfixed runs. Alternatives not tried: `ps_operator: 'ps'` (observes `sp`
 directly, region by region) and `jc_ps_weight`.
 
+## ACE2 derived pressure-level 't'/'u'/'v'/'q': NaN gradient, found and fixed while adding raobs (2026-11-16)
+
+**Symptom:** the very first `compute_optimal` epoch for an ACE2 run with
+`observations.raobs.enabled: True` raised `RuntimeError: non-finite gradient
+in the control`, even though the loss itself (`Jtot`) was finite and of a
+sane magnitude.
+
+**Root cause:** `ace2_model.py`'s `_to_pressure_levels` (the derivation of
+the 't'/'u'/'v'/'q' pressure-level families from ACE2's native hybrid-sigma
+layers) computes an interpolation weight
+```python
+w = torch.where(hi > lo, (lnp_t - x_lo) / (x_hi - x_lo), torch.zeros_like(lnp_t))
+```
+Whenever a target pressure level is at or beyond the lowest/highest native
+layer midpoint, `hi == lo` and `x_hi - x_lo == 0` -- the forward value is
+correctly discarded by `torch.where`, but PyTorch's autograd still
+backpropagates through *both* branches of `torch.where`, so the 0/0 NaN in
+the discarded branch poisons the gradient of the whole expression (the
+well-known "NaN in the unselected `where` branch" autograd pitfall). This
+was never exercised before raobs: `ps_operator='ps_native'` (ACE2's
+default) only reads the native-level `t_lowest`/`q_lowest`/`p_lowest`
+fields, and `compute_ps_observation_hx` (the only other caller of the
+derived pressure-level decode) runs entirely under `@torch.no_grad()`.
+raobs's forward operator is the first thing in this repo to differentiate
+through ACE2's derived 't'/'u'/'v'/'q'.
+
+**Fix:** substitute a safe nonzero denominator in the discarded branch
+before dividing, so the NaN never enters the graph at all:
+```python
+safe_denom = torch.where(hi > lo, x_hi - x_lo, torch.ones_like(x_hi))
+w = torch.where(hi > lo, (lnp_t - x_lo) / safe_denom, torch.zeros_like(lnp_t))
+```
+**Verification:** `torch.autograd.set_detect_anomaly(True)` pinpointed the
+exact line (`DivBackward0` returning NaN) before the fix; after the fix, a
+standalone probe differentiating `decode_state(only=['z','t','u','v','q'])`
+through one real `model.advance` step on the mini-ACE2 checkpoint gets
+finite gradients for every family, and the full `tests/ace2/test_ace2_mini.py`
+(ps + raobs, 50 epochs) completes cleanly with a steady cost drop. See
+`docs/integrate_multiple_parquetobs.md`'s "Adding radiosonde (raobs)
+observations" section for how raobs itself was added.
+
 ## Known gaps / next steps
 
 - **`compile_wrapper: True` crashes on the second cycle of a multi-cycle

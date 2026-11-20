@@ -31,8 +31,10 @@ from golden_compare import compare, report  # noqa: E402
 
 pytestmark = [pytest.mark.ace2, pytest.mark.slow]
 
-# observed: 1979 -> 891 (-55%, synthetic parquet psobs fixture); the margin
-# absorbs CPU/BLAS differences
+# observed: 2722 -> 1465 (-46%, synthetic parquet psobs+raobs fixture, raobs
+# t/u/v sampled from the real background + noise -- see
+# tests/make_fixtures.py's _ace2_background_profiles); the margin absorbs
+# CPU/BLAS differences
 MAX_FINAL_TO_FIRST = 0.6
 
 
@@ -53,7 +55,10 @@ def test_ace2_mini_window(tmp_path, checkpoint):
         f'cost fell only {losses[1]:.0f} -> {losses[epochs]:.0f} in {epochs} epochs')
 
     stem = f"{exp['sdate']}_"
-    for kind in ('latent_increment', 'observation_diagnostics', 'control_forecast', 'optimal_forecast'):
+    for kind in (
+        'latent_increment', 'observation_diagnostics', 'control_forecast', 'optimal_forecast',
+        'raobs_diagnostics',
+    ):
         hits = [f for f in os.listdir(out) if f.startswith(stem + kind)]
         assert hits, f'no {kind} output in {out}: {sorted(os.listdir(out))}'
 
