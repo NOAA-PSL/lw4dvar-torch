@@ -310,9 +310,70 @@ RAOBS_VARIABLE_MODEL_BASE = {
 # other backend here. fcn3/sfno are excluded -- never checked.
 RAOBS_SUPPORTED_BACKENDS = ('aifs', 'aurora', 'ace2', 'ngcm', 'neuralgcm', 'graphcast')
 
-# Default per-level raob q error (hPa: g/kg): Desroziers estimates from a
-# ps + raobs run (see docs/integrate_multiple_parquetobs.md).
-RAOBS_Q_ERROR_G_KG = {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
+
+def _interp_level_table(table, levels_hpa_base):
+    """A `{pressure_hPa: value}` table interpolated in ln(p) between
+    entries, held constant (nearest entry) beyond the table's own range --
+    the convention every raobs per-level table uses (each `error_std`
+    entry; q's own RH-percent table uses the same formula but at each
+    observation's own real pressure, in raobs_parquet.py's
+    `_interp_rh_percent_table`, since it needs per-archive-row data this
+    function doesn't have access to). Returns a numpy array, one entry
+    per `levels_hpa_base`."""
+    tp = np.array(sorted(float(k) for k in table))
+    tv = np.array([float(table[k]) for k in sorted(table, key=float)])
+    lev = np.asarray(levels_hpa_base, dtype=float)
+    return np.interp(np.log(lev), np.log(tp), tv)
+
+
+# Default per-level raob t/u/v error_std (K, m/s) and q RH-error (percent):
+# GSI's own real prepobs_errtable.global table, posted directly by jswhit
+# (PR #29 review discussion, comment #6992427303) -- not a UFO test-
+# fixture's own numbers (sonde_gfs_qc.yaml's table was checked against
+# this and doesn't match exactly at every level, e.g. 900/100 hPa for T --
+# this table is the authoritative source). u and v share one column --
+# GSI's wind error is one vector quantity, not separate per component
+# (see use_source_error's own WOE column, which likewise shares one value
+# for u/v). The table's own columns, by pressure (hPa): T (K), RH/10
+# (-> RAOBS_Q_ERROR_RH_PERCENT below, x10 for percent), ps (hPa, not used
+# here -- that's for ADPSFC-type surface obs, not raobs t/u/v/q), uv (m/s).
+# See docs/integrate_multiple_parquetobs.md.
+_RAOBS_ERRTABLE_PRESSURES = (
+    1000, 950, 900, 850, 800, 750, 700, 650, 600, 550, 500, 450, 400, 350,
+    300, 250, 200, 150, 100, 70, 50, 30, 20, 10, 5,
+)
+_RAOBS_ERRTABLE_T = (
+    1.2, 1.1, 1.0, 0.9, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8,
+    0.9, 1.2, 1.2, 1.0, 1.0, 1.0, 1.0, 1.0, 1.3, 1.5, 1.5,
+)
+_RAOBS_ERRTABLE_UV = (
+    1.4, 1.5, 1.5, 1.5, 1.6, 1.6, 1.6, 1.7, 1.8, 1.9, 2.1, 2.3, 2.6, 2.8,
+    3.0, 3.2, 3.2, 2.8, 2.5, 2.2, 2.0, 2.1, 2.2, 2.5, 3.0,
+)
+_RAOBS_ERRTABLE_RH_TENTHS_PERCENT = (
+    1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.20, 1.30, 1.50,
+    1.70, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00, 2.00,
+)
+RAOBS_TUV_ERROR_STD = {
+    't': dict(zip(_RAOBS_ERRTABLE_PRESSURES, _RAOBS_ERRTABLE_T)),
+    'u': dict(zip(_RAOBS_ERRTABLE_PRESSURES, _RAOBS_ERRTABLE_UV)),
+    'v': dict(zip(_RAOBS_ERRTABLE_PRESSURES, _RAOBS_ERRTABLE_UV)),
+}
+# GSI's real q-error mechanism, per jswhit's own comment: "specific
+# humidity error computed using rh error * qsat (where qsat is saturation
+# specific humidity computed from background)" -- RH_fraction * qsat, NOT
+# a flat per-level kg/kg guess (the previous Desroziers-based
+# RAOBS_Q_ERROR_G_KG) and NOT a fraction of the observed value (JEDI's
+# sonde_gfs_qc.yaml's own ObsErrorModelStepwiseLinear+scale_factor_var
+# scheme -- confirmed, by reading UFO's actual source, to multiply by
+# ObsValue/specificHumidity, not qsat; the genuinely RH-based UFO function,
+# ObsErrorModelHumidity, isn't wired into that reference config at all).
+# Applied in raobs_parquet.py (not here), since it needs the archive's own
+# per-level background_temperature_c/background_pressure_mb -- see
+# get_raobs/_profile_records's own docstrings.
+RAOBS_Q_ERROR_RH_PERCENT = dict(zip(
+    _RAOBS_ERRTABLE_PRESSURES, [v * 10. for v in _RAOBS_ERRTABLE_RH_TENTHS_PERCENT]
+))
 # GSI's own 'gross' convinfo value for kx 120/220/221 (t/uv/q all share
 # 8.0) -- the multiplier in the background check `|O-B| > bg_check *
 # qc_error`. Previously 4.0 (q_bg_check was independently validated at
@@ -320,8 +381,8 @@ RAOBS_Q_ERROR_G_KG = {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 
 # see docs/integrate_multiple_parquetobs.md -- not yet re-validated at
 # 8.0 or against use_source_error).
 RAOBS_Q_BG_CHECK = 8.0
-# t/u/v share one background-check multiplier (unlike q, they share one
-# flat error_std too) -- GSI's conventional-data gross check (errormod,
+# t/u/v share one background-check multiplier (unlike error_std, which is
+# per-variable -- see RAOBS_TUV_ERROR_STD) -- GSI's conventional-data gross check (errormod,
 # read_prepbufr.F90) rejects/inflates on |O-B| similarly for raobs t/u/v;
 # this repo's raobs previously had no O-B check for them at all, relying
 # only on the read-time PREPBUFR-quality-mark/height QC (see
@@ -353,15 +414,17 @@ _RAOBS_CONFIG_KEYS = {
     'time_tolerance_hours': 'raobs_time_tolerance_hours',
     'quality_mark_max': 'raobs_quality_mark_max',
     'pressure_match_tolerance_hpa': 'raobs_pressure_match_tolerance_hpa',
+    'vertical_interpolation': 'raobs_vertical_interpolation',
     'height_min_m': 'raobs_height_min_m',
     'height_max_m': 'raobs_height_max_m',
     'below_station_tolerance_m': 'raobs_below_station_tolerance_m',
     'error_std': 'raobs_error_std',
     'use_source_error': 'raobs_use_source_error',
+    'use_drift_time': 'raobs_use_drift_time',
+    'use_drift_position': 'raobs_use_drift_position',
     'tuv_bg_check': 'raobs_tuv_bg_check',
-    'q_error_fraction': 'raobs_q_error_fraction',
-    'q_error_floor_kg_kg': 'raobs_q_error_floor_kg_kg',
-    'q_error_g_kg': 'raobs_q_error_g_kg',
+    'bg_check': 'raobs_bg_check',
+    'q_error_rh_percent': 'raobs_q_error_rh_percent',
     'q_bg_check': 'raobs_q_bg_check',
     'humidity_min_pressure_hpa': 'raobs_humidity_min_pressure_hpa',
     'station_capacity': 'raobs_station_capacity',
@@ -615,6 +678,21 @@ def load_config(config_path='config.yml'):
             raise ValueError(f"observations.raobs.variables must not contain duplicates, got {list(variables)}")
         exp['raobs_variables'] = list(variables)
 
+        vertical_interpolation = exp.get('raobs_vertical_interpolation', 'exact')
+        if vertical_interpolation not in ('exact', 'nearest', 'log-linear'):
+            raise ValueError(
+                "observations.raobs.vertical_interpolation must be 'exact', 'nearest', or "
+                f"'log-linear', got {vertical_interpolation!r}"
+            )
+        exp['raobs_vertical_interpolation'] = vertical_interpolation
+
+        def _check_level_table(table, name):
+            for p, v in table.items():
+                if not (np.isfinite(p) and p > 0):
+                    raise ValueError(f"observations.raobs.{name} has a non-positive/non-finite pressure key {p!r} (hPa)")
+                if not (np.isfinite(v) and v > 0):
+                    raise ValueError(f"observations.raobs.{name}[{p!r}] must be positive and finite, got {v!r}")
+
         error_std = exp.get('raobs_error_std')
         if error_std is not None:
             bad_keys = set(error_std) - {'t', 'u', 'v'}
@@ -624,22 +702,48 @@ def load_config(config_path='config.yml'):
                     f"(the short base names, not e.g. 'temperature'), got {sorted(bad_keys)}"
                 )
             for k, v in error_std.items():
-                if not (np.isfinite(v) and v > 0):
+                if isinstance(v, dict):
+                    # {hPa: value} table (same ln(p)-interpolation convention
+                    # as q_error_rh_percent), e.g. a UFO/GSI sonde error table --
+                    # see docs/integrate_multiple_parquetobs.md.
+                    _check_level_table(v, f'error_std[{k!r}]')
+                elif not (np.isfinite(v) and v > 0):
                     raise ValueError(f"observations.raobs.error_std[{k!r}] must be positive and finite, got {v!r}")
-        for key in (
-            'raobs_q_error_fraction', 'raobs_q_error_floor_kg_kg', 'raobs_q_bg_check', 'raobs_tuv_bg_check',
-        ):
+        for key in ('raobs_q_bg_check', 'raobs_tuv_bg_check'):
             v = exp.get(key)
             if v is not None and not (np.isfinite(v) and v > 0):
                 raise ValueError(f"observations.raobs.{key[len('raobs_'):]} must be positive and finite, got {v!r}")
-        q_error_g_kg = exp.get('raobs_q_error_g_kg')
-        if q_error_g_kg is not None:
-            for p, e in q_error_g_kg.items():
-                if not (np.isfinite(p) and p > 0):
+        q_error_rh_percent = exp.get('raobs_q_error_rh_percent')
+        if q_error_rh_percent is not None:
+            _check_level_table(q_error_rh_percent, 'q_error_rh_percent')
+
+        bg_check = exp.get('raobs_bg_check')
+        if bg_check is not None:
+            # Per-variable {threshold, absolute} override of tuv_bg_check/
+            # q_bg_check (e.g. UFO/GSI's T 7.0x+9.0K, wind 6.0x+19m/s, q
+            # 8.0x -- PR #29's review comment) -- optional; unlisted
+            # variables keep using the shared scalar default.
+            bad_keys = set(bg_check) - {'t', 'u', 'v', 'q'}
+            if bad_keys:
+                raise ValueError(
+                    f"observations.raobs.bg_check keys must be a subset of ('t', 'u', 'v', 'q'), "
+                    f"got {sorted(bad_keys)}"
+                )
+            for k, cfg in bg_check.items():
+                if not isinstance(cfg, dict) or 'threshold' not in cfg:
                     raise ValueError(
-                        f"observations.raobs.q_error_g_kg has a non-positive/non-finite pressure key {p!r} (hPa)")
-                if not (np.isfinite(e) and e > 0):
-                    raise ValueError(f"observations.raobs.q_error_g_kg[{p!r}] must be positive and finite, got {e!r}")
+                        f"observations.raobs.bg_check[{k!r}] must be a dict with a 'threshold' key, got {cfg!r}")
+                extra = set(cfg) - {'threshold', 'absolute'}
+                if extra:
+                    raise ValueError(f"observations.raobs.bg_check[{k!r}] has unknown keys {sorted(extra)}")
+                threshold = cfg['threshold']
+                if not (np.isfinite(threshold) and threshold > 0):
+                    raise ValueError(
+                        f"observations.raobs.bg_check[{k!r}].threshold must be positive and finite, got {threshold!r}")
+                absolute = cfg.get('absolute')
+                if absolute is not None and not (np.isfinite(absolute) and absolute > 0):
+                    raise ValueError(
+                        f"observations.raobs.bg_check[{k!r}].absolute must be positive and finite, got {absolute!r}")
     return exp, windows
 
 
@@ -1198,12 +1302,19 @@ def get_psobs(exp, model, logger, grid_interp):
         vdate = add_hours(vdate, dt_obs)
 
     from psobs_parquet import load_psobs_parquet
-    # Defaults match the legacy psobs1_*.txt archive's actual generator
-    # (/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs/read_ps_prepbufr1.py):
-    # halfwindow = 1800s (0.5h) and psqm <= 4 -- not independently derived
-    # for this archive, just carried over from the ported reference repo's
-    # own (unrelated) defaults until checked against it.
-    time_tolerance_hours = exp.get('psobs_time_tolerance_hours', 0.5)
+    # Default dt_obs/2 -- exactly half the obs-slot spacing, so consecutive
+    # slots' acceptance windows tile the whole window edge to edge with no
+    # gaps and no overlap, for ANY dt_obs (every raw report is captured by
+    # its single nearest slot; confirmed mathematically and by simulation,
+    # see docs/integrate_multiple_parquetobs.md). Matches raobs's own
+    # time_tolerance_hours default below. At the mainline dt_obs: 6 this is
+    # 3.0h, NOT the legacy psobs1_*.txt archive's generator (/scratch3/
+    # NCEPDEV/da/Jeffrey.Whitaker/psobs/read_ps_prepbufr1.py: halfwindow =
+    # 1800s = 0.5h) -- that narrower, dt_obs-independent value only captured
+    # obs within 0.5h of each cycle hour (~17% of each 6h cycle); pass
+    # observations.psobs.time_tolerance_hours: 0.5 explicitly to reproduce
+    # that legacy-matching behavior instead.
+    time_tolerance_hours = exp.get('psobs_time_tolerance_hours', dt_obs / 2.)
     parquet_data = load_psobs_parquet(
         obspath,
         verification_times,
@@ -1290,6 +1401,66 @@ def get_psobs(exp, model, logger, grid_interp):
     return psobs_traj
 
 
+def _raobs_vertical_interp_weights(levels_hpa_base, pressure):
+    """JEDI/UFO VertInterp's own 'log-linear' bracket (`vert_interp_weights`
+    in ufo/utils/vert_interp.F90): for each (model level L, station)
+    element of `pressure` -- the real reported pressure of whichever raw
+    observation `raobs_parquet.py`'s 'log-linear' mode assigned to model
+    level L -- find the ADJACENT model level (L-1 or L+1, whichever side
+    the real pressure actually falls on) and the ln(p) blend weight toward
+    it. `levels_hpa_base` is `model.pressure_levels(base)` (1D, any
+    monotonic order); `pressure` is 2D, shape `(len(levels_hpa_base),
+    n_stations)`, NaN where there is no observation at that cell.
+
+    Returns `(neighbor_idx, alpha)`, both shaped like `pressure`: alpha in
+    [0, 1] (0 = no correction needed, exactly at level L; 1 = fully at the
+    neighbor). Out of the model's own top/bottom level, or no observation
+    at this cell (NaN pressure): `neighbor_idx = L` (self), `alpha = 0` --
+    clamp-extrapolate to the edge level's own value, never reject, exactly
+    JEDI's own boundary rule. See docs/integrate_multiple_parquetobs.md.
+    """
+    levels_hpa_base = np.asarray(levels_hpa_base, dtype=np.float64)
+    n_levels = levels_hpa_base.size
+    level_idx = np.arange(n_levels)[:, None]
+    own_lnp = np.log(levels_hpa_base)[:, None]
+    finite = np.isfinite(pressure)
+    safe_pressure = np.where(finite, pressure, levels_hpa_base[:, None])
+    ob_lnp = np.log(safe_pressure)
+    cmp = ob_lnp - own_lnp
+    increasing = levels_hpa_base[-1] > levels_hpa_base[0]
+    same_direction = (cmp >= 0) if increasing else (cmp <= 0)
+    candidate_neighbor = level_idx + np.where(same_direction, 1, -1)
+    out_of_bounds = (candidate_neighbor < 0) | (candidate_neighbor >= n_levels)
+    skip = out_of_bounds | ~finite
+    neighbor_idx = np.where(skip, level_idx, candidate_neighbor)
+    neighbor_lnp = np.log(levels_hpa_base)[neighbor_idx]
+    denom = np.where(skip, 1., neighbor_lnp - own_lnp)  # avoid 0-division; discarded by `skip` below
+    alpha = np.where(skip, 0., np.clip(np.abs(cmp) / np.abs(denom), 0., 1.))
+    return neighbor_idx.astype(np.int64), alpha.astype(np.float32)
+
+
+def _raobs_gather_per_level(field, idx, wts):
+    """Horizontal k-NN/bilinear interpolation with PER-LEVEL weights
+    (`observations.raobs.use_drift_position`), vs. `grid_interp.interp`'s
+    own per-STATION-shared weights (`field[..., idx]`, broadcasting one
+    set of weights across every level of `field`).
+
+    `field`: (n_levels, n_points) -- the decoded model field. `idx`/`wts`:
+    (n_levels, capacity, k) -- level `L`'s own weights, e.g. from
+    `get_raobs`'s drift-corrected `grid_interp.weights` call at that
+    level's own position. Returns (n_levels, capacity).
+
+    Uses advanced indexing (two same-shaped index tensors) rather than
+    expanding `field` to (capacity, n_points) first -- that would
+    materialize a huge intermediate for a large unstructured grid (AIFS's
+    N320 mesh has 542080 points).
+    """
+    n_levels = field.shape[0]
+    level_rows = torch.arange(n_levels, device=field.device)[:, None, None].expand_as(idx)
+    gathered = field[level_rows, idx]          # (n_levels, capacity, k)
+    return (gathered * wts).sum(-1)             # (n_levels, capacity)
+
+
 def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     """Read radiosonde (ADPUPA) profile observations for the SAME obs-slot
     grid `get_psobs` already built (`psobs_traj['step_lo']`/`['alpha']`,
@@ -1304,11 +1475,30 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     never sets `raobs_enabled` assimilates surface pressure only, exactly as
     before.
 
-    Mandatory-level matching (see raobs_parquet.py and
-    docs/integrate_multiple_parquetobs.md): each requested variable is
-    matched against the MODEL's own pressure levels for that variable's
-    family (`model.pressure_levels(base)`), so the forward operator is a
-    plain horizontal-interp + level-index gather, no vertical interpolation.
+    Each requested variable is matched against the MODEL's own pressure
+    levels for that variable's family (`model.pressure_levels(base)`).
+    `observations.raobs.vertical_interpolation` ('exact' default, or
+    'nearest'/'log-linear') controls how: 'exact' keeps today's mandatory-
+    level matching (see raobs_parquet.py and docs/integrate_multiple_
+    parquetobs.md) -- a level is kept only within `pressure_match_
+    tolerance_hpa` of a model level, everything else discarded, forward
+    operator is a plain horizontal-interp + level-index gather, no vertical
+    interpolation. 'nearest'/'log-linear' keep every level (snapped to its
+    nearest model level, no distance cutoff -- so a model with few/coarse
+    levels still gets an observation at each one); 'log-linear' additionally
+    corrects the comparison for the level not sitting exactly at the
+    nearest model level (JEDI/UFO's own `log-linear` VertInterp method --
+    see docs/integrate_multiple_parquetobs.md).
+
+    `observations.raobs.use_drift_position` (default False, independent
+    of `vertical_interpolation` and `use_drift_time`): compares each
+    level against the model's state at that level's own balloon-drift-
+    corrected horizontal position instead of the station's single launch
+    position shared by every level -- JEDI's own `ProfileHorizontalDrift`
+    does the analogous correction (by overwriting MetaData per row,
+    rather than needing per-level interpolation weights the way this
+    repo's per-station weight-sharing design does). See
+    docs/integrate_multiple_parquetobs.md.
     """
     if not exp.get('raobs_enabled', False):
         return None
@@ -1342,6 +1532,15 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
         vdate = add_hours(vdate, dt_obs)
 
     time_tolerance_hours = exp.get('raobs_time_tolerance_hours', dt_obs / 2.)
+    # GSI's real q-error mechanism (RH_fraction * qsat(background), per
+    # jswhit's PR #29 review comment) -- needs the archive's own static
+    # background_temperature_c/background_pressure_mb, read in
+    # raobs_parquet.py, so the table is resolved and passed in here
+    # rather than applied afterward the way error_std's t/u/v tables are.
+    q_error_rh_percent = (
+        {**RAOBS_Q_ERROR_RH_PERCENT, **exp.get('raobs_q_error_rh_percent', {})}
+        if 'q' in bases else None
+    )
     data = load_raobs_parquet(
         exp.get('raobs_path', exp['obspath']),
         verification_times,
@@ -1355,9 +1554,31 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
         below_station_tolerance_m=exp.get('raobs_below_station_tolerance_m', 100.),
         pressure_match_tolerance_hpa=exp.get('raobs_pressure_match_tolerance_hpa', 0.05),
         humidity_min_pressure_hpa=exp.get('raobs_humidity_min_pressure_hpa', 300.),
-        use_source_error=exp.get('raobs_use_source_error', True),
+        # Default False: GSI's read_prepbufr.F90 reads this same embedded
+        # POE/QOE/TOE/WOE value (oestr/obserr, ufbint) but then, whenever
+        # the error-table fix file loaded (oberrflg, true operationally)
+        # and the type is conventional (kx<=300, true for all raob kx),
+        # unconditionally overwrites obserr with a value interpolated from
+        # prepobs_errtable.global/etabl -- the embedded archive value is
+        # never actually used in GSI's own Jo weighting. See
+        # docs/integrate_multiple_parquetobs.md.
+        use_source_error=exp.get('raobs_use_source_error', False),
+        # Default False, unlike use_source_error -- this changes WHICH
+        # slot (and so which background) a level is compared against, a
+        # more fundamental change than an error magnitude; introduced the
+        # same cautious way use_source_error itself was before its own
+        # default was flipped. See docs/integrate_multiple_parquetobs.md.
+        use_drift_time=exp.get('raobs_use_drift_time', False),
+        vertical_interpolation=exp.get('raobs_vertical_interpolation', 'exact'),
+        # Independent of use_drift_time: that corrects WHICH slot a level
+        # is compared against; this corrects WHERE, horizontally. See
+        # docs/integrate_multiple_parquetobs.md.
+        use_drift_position=exp.get('raobs_use_drift_position', False),
+        q_error_rh_percent=q_error_rh_percent,
         logger=logger,
     )
+    vertical_interpolation = exp.get('raobs_vertical_interpolation', 'exact')
+    use_drift_position = exp.get('raobs_use_drift_position', False)
 
     device = model.device
     n_obs = len(verification_times)
@@ -1372,6 +1593,8 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     raobs_traj = {
         'n_valid': torch.as_tensor(station_capacity, dtype=torch.int32, device=device),
         'levels_hpa': {base: torch.as_tensor(levels_hpa[base], dtype=torch.float32, device=device) for base in bases},
+        'vertical_interpolation': vertical_interpolation,
+        'use_drift_position': use_drift_position,
     }
     for name in ('lat', 'lon', 'elev'):
         padded = torch.zeros((n_obs, capacity), dtype=torch.float32, device=device)
@@ -1379,13 +1602,15 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
             padded[j, :data[name][j].size] = torch.as_tensor(data[name][j], device=device)
         raobs_traj[name] = padded
 
-    # t/u/v: a fixed absolute error (K, m/s). q: error scales with a
-    # per-level table (RAOBS_Q_ERROR_G_KG by default), or with the observed
-    # value instead (a flat absolute error makes no physical sense across
-    # q's full range) if the table is disabled.
-    error_std = {'t': 1.0, 'u': 2.0, 'v': 2.0, **exp.get('raobs_error_std', {})}
-    q_error_fraction = exp.get('raobs_q_error_fraction', 0.2)
-    q_error_floor = exp.get('raobs_q_error_floor_kg_kg', 1.e-5)
+    # t/u/v: a per-level table (RAOBS_TUV_ERROR_STD, GSI's own real
+    # prepobs_errtable.global, by default). q: RH_fraction * qsat(background)
+    # (RAOBS_Q_ERROR_RH_PERCENT by default, resolved above and already
+    # applied in raobs_parquet.py -- see `default_error_q` below).
+    error_std = {**RAOBS_TUV_ERROR_STD, **exp.get('raobs_error_std', {})}
+    # Per-variable {threshold, absolute} override of tuv_bg_check/
+    # q_bg_check (optional; see RAOBS_TUV_BG_CHECK's docstring and PR #29's
+    # review comment) -- unlisted variables keep using the shared scalar.
+    bg_check_cfg = exp.get('raobs_bg_check') or {}
 
     for base in bases:
         n_levels = levels_hpa[base].size
@@ -1397,23 +1622,66 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
             mask[j, :, :n] = torch.as_tensor(data['mask_'+base][j], device=device)
         raobs_traj['values_'+base] = values
         raobs_traj['mask_'+base] = mask
+        if vertical_interpolation != 'exact':
+            # The real reported pressure at each kept cell -- ignored by
+            # 'nearest', consumed below (and by the forward operator) for
+            # 'log-linear'. Computed once per window, like interp_idx/
+            # interp_wts/step_lo/alpha -- not per epoch.
+            pressure = torch.full((n_obs, n_levels, capacity), float('nan'), dtype=torch.float32, device=device)
+            if vertical_interpolation == 'log-linear':
+                neighbor_idx = torch.zeros((n_obs, n_levels, capacity), dtype=torch.int64, device=device)
+                alpha = torch.zeros((n_obs, n_levels, capacity), dtype=torch.float32, device=device)
+            for j in range(n_obs):
+                n = data['pressure_'+base][j].shape[-1]
+                pressure[j, :, :n] = torch.as_tensor(data['pressure_'+base][j], device=device)
+                if vertical_interpolation == 'log-linear':
+                    nb, a = _raobs_vertical_interp_weights(levels_hpa[base], data['pressure_'+base][j])
+                    neighbor_idx[j, :, :n] = torch.as_tensor(nb, dtype=torch.int64, device=device)
+                    alpha[j, :, :n] = torch.as_tensor(a, dtype=torch.float32, device=device)
+            raobs_traj['pressure_'+base] = pressure
+            if vertical_interpolation == 'log-linear':
+                raobs_traj['vert_neighbor_idx_'+base] = neighbor_idx
+                raobs_traj['vert_alpha_'+base] = alpha
+        if use_drift_position:
+            # Each kept level's own drift-corrected position -- different
+            # levels of the SAME station can now sit at different
+            # horizontal locations, so interpolation weights must be
+            # computed per (slot, level), not once per (slot, station)
+            # the way the shared interp_idx/interp_wts below are. Computed
+            # once per window, like everything else here -- not per epoch.
+            lat_level = torch.zeros((n_obs, n_levels, capacity), dtype=torch.float32, device=device)
+            lon_level = torch.zeros((n_obs, n_levels, capacity), dtype=torch.float32, device=device)
+            idx_level = torch.zeros((n_obs, n_levels, capacity, 4), dtype=torch.int64, device=device)
+            wts_level = torch.zeros((n_obs, n_levels, capacity, 4), dtype=torch.float32, device=device)
+            for j in range(n_obs):
+                n = data['lat_'+base][j].shape[-1]
+                lat_level[j, :, :n] = torch.as_tensor(data['lat_'+base][j], device=device)
+                lon_level[j, :, :n] = torch.as_tensor(data['lon_'+base][j], device=device)
+                for lev in range(n_levels):
+                    idx_lev, wts_lev = grid_interp.weights(
+                        data['lon_'+base][j][lev], data['lat_'+base][j][lev], k=4, device=device)
+                    idx_level[j, lev, :n] = idx_lev
+                    wts_level[j, lev, :n] = wts_lev
+            raobs_traj['lat_'+base] = lat_level
+            raobs_traj['lon_'+base] = lon_level
+            raobs_traj['interp_idx_'+base] = idx_level
+            raobs_traj['interp_wts_'+base] = wts_level
         if base == 'q':
-            raobs_traj['error_q_fraction'] = float(q_error_fraction)
-            raobs_traj['error_q_floor'] = float(q_error_floor)
-            # q_error_g_kg {hPa: g/kg}: a fixed per-level error instead of
-            # the fraction of the ob (which weights dry obs most and pulls
-            # the analysis dry); levels between table entries interpolate in
-            # ln(p), beyond them take the nearest entry; null falls back to
-            # the fraction-of-ob error.
-            table = exp.get('raobs_q_error_g_kg', RAOBS_Q_ERROR_G_KG)
-            if table:
-                tp = np.array(sorted(float(k) for k in table))
-                tv = np.array([float(table[k]) for k in sorted(table, key=float)])
-                lev = np.asarray(levels_hpa['q'], dtype=float)
-                err = np.interp(np.log(lev), np.log(tp), tv) * 1.e-3
-                raobs_traj['error_q_level'] = torch.as_tensor(err, dtype=torch.float32, device=device)
+            # The DEFAULT q error (GSI's RH_fraction * qsat(background),
+            # already computed per-(level, station) in raobs_parquet.py --
+            # see q_error_rh_percent above): the fallback wherever
+            # use_source_error's own archive value (below) is unavailable.
+            default = torch.full((n_obs, n_levels, capacity), float('nan'), dtype=torch.float32, device=device)
+            for j in range(n_obs):
+                n = data['default_error_q'][j].shape[-1]
+                default[j, :, :n] = torch.as_tensor(data['default_error_q'][j], device=device)
+            raobs_traj['default_error_q'] = default
             bgc = exp.get('raobs_q_bg_check', RAOBS_Q_BG_CHECK)
             raobs_traj['q_bg_check'] = float(bgc) if bgc else None
+            if 'q' in bg_check_cfg:
+                raobs_traj['bg_check_threshold_q'] = float(bg_check_cfg['q']['threshold'])
+                if bg_check_cfg['q'].get('absolute') is not None:
+                    raobs_traj['bg_check_absolute_q'] = float(bg_check_cfg['q']['absolute'])
             if 'source_error_q' in data:
                 # Per-(level, station) kg/kg error from the archive's own
                 # RH-based QOE, converted via qsat at ITS static background
@@ -1435,25 +1703,54 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                     qsat[j, :, :n] = torch.as_tensor(data['source_qsat_q'][j], device=device)
                 raobs_traj['source_qsat_q'] = qsat
         else:
-            flat_error = float(error_std[base])
-            if 'source_error_'+base in data:
+            # error_std[base]: a flat scalar, or a {hPa: value} table
+            # (same ln(p) interpolation convention as q's own RH-percent
+            # table) -- defaults to GSI's real prepobs_errtable.global
+            # (RAOBS_TUV_ERROR_STD).
+            raw = error_std[base]
+            if isinstance(raw, dict):
+                flat_error = torch.as_tensor(
+                    _interp_level_table(raw, levels_hpa[base]), dtype=torch.float32, device=device)
+            else:
+                flat_error = float(raw)
+
+            is_source_error = 'source_error_'+base in data
+            if is_source_error:
                 # Per-(level, station) GSI error-table value straight from
                 # the archive's own TOE/WOE field (see raobs_parquet.py's
-                # _VARIABLE_ERROR_COLUMNS), falling back to the flat
-                # error_std wherever the archive didn't have one (NaN).
+                # _VARIABLE_ERROR_COLUMNS), falling back to error_std
+                # (flat or per-level) wherever the archive didn't have one
+                # (NaN).
                 source = torch.zeros((n_obs, n_levels, capacity), dtype=torch.float32, device=device)
+                if torch.is_tensor(flat_error):
+                    fallback_full = flat_error[:, None].expand(n_levels, capacity)
+                else:
+                    fallback_full = torch.full((n_levels, capacity), flat_error, dtype=torch.float32, device=device)
                 for j in range(n_obs):
                     n = data['source_error_'+base][j].shape[-1]
                     source_j = torch.as_tensor(data['source_error_'+base][j], device=device)
-                    source[j, :, :n] = torch.where(
-                        torch.isfinite(source_j), source_j, torch.full_like(source_j, flat_error))
+                    source[j, :, :n] = torch.where(torch.isfinite(source_j), source_j, fallback_full[:, :n])
                 raobs_traj['error_'+base] = source
+            elif torch.is_tensor(flat_error):
+                # Per-level table, no archive source error available --
+                # broadcast across every obs slot/station (a view, not a
+                # copy).
+                raobs_traj['error_'+base] = flat_error[None, :, None].expand(n_obs, n_levels, capacity)
             else:
                 raobs_traj['error_'+base] = flat_error
+            # Only the genuine archive source value (not a user-configured
+            # error_std table, even the same UFO/GSI reference numbers)
+            # gets GSI's ermin/ermax gross-check clamp -- see
+            # _compute_raobs_observation_diagnostics_at_time.
+            raobs_traj['is_source_error_'+base] = is_source_error
             bgc = exp.get('raobs_tuv_bg_check', RAOBS_TUV_BG_CHECK)
             raobs_traj['tuv_bg_check'] = float(bgc) if bgc else None
             raobs_traj['ermin_'+base] = RAOBS_TUV_ERMIN[base]
             raobs_traj['ermax_'+base] = RAOBS_TUV_ERMAX[base]
+            if base in bg_check_cfg:
+                raobs_traj['bg_check_threshold_'+base] = float(bg_check_cfg[base]['threshold'])
+                if bg_check_cfg[base].get('absolute') is not None:
+                    raobs_traj['bg_check_absolute_'+base] = float(bg_check_cfg[base]['absolute'])
 
     # Shared k-NN horizontal interpolation (same mechanism as psobs, but
     # computed independently -- raobs stations are not at the same
@@ -1644,23 +1941,52 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
     return innovation, model_equivalent, effective_error, available, used, qc_flag
 
 
+def _raobs_gross_check_threshold(raobs_traj, base, shared_key):
+    """The resolved (threshold, absolute) gross-check pair for one raobs
+    variable: `bg_check_threshold_<base>`/`bg_check_absolute_<base>` if
+    `observations.raobs.bg_check` configured one (UFO/GSI's per-variable
+    form -- T 7.0x+9.0K, wind 6.0x+19m/s, q 8.0x, PR #29's review
+    comment), else the shared `shared_key` (`tuv_bg_check`/`q_bg_check`)
+    scalar with no absolute limit. `threshold` is `None` if neither is
+    configured (no gross check at all for this variable)."""
+    threshold = raobs_traj.get('bg_check_threshold_'+base, raobs_traj.get(shared_key))
+    return (float(threshold) if threshold else None), raobs_traj.get('bg_check_absolute_'+base)
+
+
 def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, grid_interp, oind):
     """Evaluate radiosonde H(x) for every configured variable at slot `oind`.
 
-    No vertical interpolation (see get_raobs/raobs_parquet.py's module
-    docstrings): `raobs_traj['values_<base>'][oind]`'s level axis was
-    matched against `model.pressure_levels(base)` AT READ TIME, in the same
-    order `decoded[base]`'s rows are in -- so the forward operator is just
-    horizontal interpolation, no level gather needed.
+    `raobs_traj['values_<base>'][oind]`'s level axis was matched against
+    `model.pressure_levels(base)` AT READ TIME, in the same order
+    `decoded[base]`'s rows are in. For `vertical_interpolation` ('exact'/
+    'nearest'), that's the whole story -- the forward operator is just
+    horizontal interpolation, no vertical correction. For 'log-linear',
+    one extra step blends in the adjacent model level
+    (`vert_neighbor_idx_<base>`/`vert_alpha_<base>`, precomputed once per
+    window by `get_raobs`/`_raobs_vertical_interp_weights`) so the
+    comparison is made at the observation's own real pressure instead of
+    pretending it sits exactly on the nearest model level -- JEDI/UFO's
+    own `log-linear` VertInterp method; see
+    docs/integrate_multiple_parquetobs.md.
 
     Returns `{base: (innovation, model_equivalent, effective_error, used)}`,
     one entry per `raobs_traj['variables']`. Unlike the ps forward
     operator, there is no orography QC and no elevation-based reduction --
     each variable is compared against the model's own native level directly.
+
+    `observations.raobs.use_drift_position`: if `raobs_traj['interp_idx_
+    <base>']` exists (per-(level, station) horizontal weights at that
+    level's own drift-corrected position, from `get_raobs`), horizontal
+    interpolation uses `_raobs_gather_per_level` instead of `grid_interp.
+    interp`'s single weight set shared across every level -- see
+    docs/integrate_multiple_parquetobs.md.
     QC is the read-time QC already folded into `mask_<base>`, plus an
     optional background check evaluated at the current state: reject
-    |O-B| > bg_check * qc_error -- `q_bg_check` for q, `tuv_bg_check`
-    (shared by t/u/v, like their shared `error_std`) for the rest.
+    |O-B| > threshold * qc_error, OR (if configured) |O-B| > an absolute
+    limit -- `threshold`/`absolute` resolved per variable by
+    `_raobs_gross_check_threshold` (UFO/GSI's per-variable form if
+    `observations.raobs.bg_check` configured one, else the shared
+    `q_bg_check`/`tuv_bg_check` scalar with no absolute limit).
     `qc_error` is `effective_error` (the actual Jo weight) EXCEPT when
     `use_source_error` is in effect, where it's additionally clamped into
     GSI's own ermin/ermax range for this comparison only -- the real,
@@ -1671,7 +1997,19 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
     wts = raobs_traj['interp_wts'][oind]
     results = {}
     for base in raobs_traj['variables']:
-        model_obspace = grid_interp.interp(idx, wts, decoded[base])  # (n_levels, capacity)
+        if 'interp_idx_'+base in raobs_traj:
+            model_obspace = _raobs_gather_per_level(
+                decoded[base], raobs_traj['interp_idx_'+base][oind], raobs_traj['interp_wts_'+base][oind])
+        else:
+            model_obspace = grid_interp.interp(idx, wts, decoded[base])  # (n_levels, capacity)
+        if raobs_traj.get('vertical_interpolation', 'exact') == 'log-linear':
+            # Blend in the adjacent model level toward the ob's own real
+            # pressure (alpha=0 leaves model_obspace unchanged -- the ob
+            # sits exactly on its assigned level, or there was none here).
+            neighbor_idx = raobs_traj['vert_neighbor_idx_'+base][oind]  # (n_levels, capacity)
+            alpha = raobs_traj['vert_alpha_'+base][oind]
+            neighbor_vals = torch.gather(model_obspace, 0, neighbor_idx)
+            model_obspace = (1. - alpha) * model_obspace + alpha * neighbor_vals
         observation = raobs_traj['values_'+base][oind]
         mask = raobs_traj['mask_'+base][oind]
         interpolation_failed = ~torch.isfinite(model_obspace)
@@ -1679,21 +2017,17 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
         safe_model_obspace = torch.where(interpolation_failed, torch.zeros_like(model_obspace), model_obspace)
         innovation = observation - safe_model_obspace
         if base == 'q':
-            if raobs_traj.get('error_q_level') is not None:
-                effective_error = raobs_traj['error_q_level'][:, None].expand_as(observation)
-            else:
-                effective_error = torch.clamp(
-                    raobs_traj['error_q_fraction'] * observation.abs(),
-                    min=raobs_traj['error_q_floor'],
-                )
+            # The default (RH_fraction * qsat(background), already
+            # computed per-(level, station) in raobs_parquet.py) --
+            # overridden wherever use_source_error's own archive value is
+            # finite. q has no single flat fallback value to pre-fill
+            # with (unlike t/u/v), so the override happens here instead.
+            effective_error = raobs_traj['default_error_q'][oind]
             if raobs_traj.get('source_error_q') is not None:
-                # Per-ob archive source error (use_source_error: True)
-                # overrides the table/fraction error wherever it's finite
-                # -- q has no single flat fallback value to pre-fill with
-                # (unlike t/u/v), so the override happens here instead.
                 source = raobs_traj['source_error_q'][oind]
                 effective_error = torch.where(torch.isfinite(source), source, effective_error)
-            if raobs_traj.get('q_bg_check'):
+            threshold, absolute = _raobs_gross_check_threshold(raobs_traj, 'q', 'q_bg_check')
+            if threshold:
                 qc_error = effective_error
                 qsat = raobs_traj.get('source_qsat_q')
                 if qsat is not None:
@@ -1710,23 +2044,38 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
                     ermax = (RAOBS_Q_ERMAX_PERCENT / 100.) * qsat_j
                     clamped = torch.clamp(qc_error, min=ermin, max=ermax)
                     qc_error = torch.where(torch.isfinite(qsat_j), clamped, qc_error)
-                used = used & (innovation.abs() <= raobs_traj['q_bg_check'] * qc_error).detach()
+                passes = innovation.abs() <= threshold * qc_error
+                if absolute is not None:
+                    passes = passes & (innovation.abs() <= absolute)
+                used = used & passes.detach()
         else:
             error_spec = raobs_traj['error_'+base]
-            # A tensor here is the archive's own per-(level, station) source
-            # error (use_source_error: True), already pre-filled with the
-            # flat error_std wherever the archive had none -- see get_raobs.
+            # A tensor here is either the archive's own per-(level,
+            # station) source error (use_source_error: True, already pre-
+            # filled with error_std wherever the archive had none), or a
+            # per-level error_std TABLE broadcast across every obs/station
+            # (no source error available) -- see get_raobs. Either way
+            # effective_error (the actual Jo weight) is read the same way.
             effective_error = error_spec[oind] if torch.is_tensor(error_spec) else \
                 torch.full_like(observation, error_spec)
-            if raobs_traj.get('tuv_bg_check'):
+            threshold, absolute = _raobs_gross_check_threshold(raobs_traj, base, 'tuv_bg_check')
+            if threshold:
                 qc_error = effective_error
-                if torch.is_tensor(error_spec):
+                if raobs_traj.get('is_source_error_'+base, False):
                     # GSI's own ermin/ermax clamp -- gross-check only, same
                     # reasoning as q above (effective_error, the actual Jo
-                    # weight, stays the real unclamped archive value).
+                    # weight, stays the real unclamped archive value) --
+                    # and only for the genuine archive source, never a
+                    # user-configured error_std table (even the same UFO/
+                    # GSI reference numbers -- re-clamping a table against
+                    # itself would be redundant at best, distorting at the
+                    # table's own extremes at worst).
                     qc_error = torch.clamp(
                         qc_error, min=raobs_traj['ermin_'+base], max=raobs_traj['ermax_'+base])
-                used = used & (innovation.abs() <= raobs_traj['tuv_bg_check'] * qc_error).detach()
+                passes = innovation.abs() <= threshold * qc_error
+                if absolute is not None:
+                    passes = passes & (innovation.abs() <= absolute)
+                used = used & passes.detach()
         results[base] = (innovation, safe_model_obspace, effective_error, used)
     return results
 
@@ -2809,11 +3158,23 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
 def save_raobs_diagnostics(exp, raobs_traj, background, analysis, valid_times, lead_hours, ofile, logger):
     """Save per-variable radiosonde O-B/O-A diagnostics, mirroring the ps
     obs diagnostics netCDF but with an extra per-variable pressure-level
-    dimension (no vertical interpolation -- see get_raobs) and no
-    cross-time station identity (`station_slot` is a plain index, same
-    convention as psobs's `observation_slot`).
+    dimension and no cross-time station identity (`station_slot` is a
+    plain index, same convention as psobs's `observation_slot`).
+
+    `level_<base>`'s coordinate is always the nominal MODEL level (see
+    get_raobs); when `vertical_interpolation` ('exact' default, or
+    'nearest'/'log-linear') is not 'exact', `<base>_real_pressure` is also
+    written -- the kept observation's own actual reported pressure at
+    that same (level, station) cell, which may differ from the nominal
+    coordinate (see docs/integrate_multiple_parquetobs.md).
     """
     n_obs, _, capacity = raobs_traj['values_'+raobs_traj['variables'][0]].shape
+    vertical_interpolation = raobs_traj['vertical_interpolation']
+    forward_operator_desc = {
+        'exact': 'horizontal interpolation only -- obs matched to model pressure levels at read time, no vertical interpolation',
+        'nearest': 'horizontal interpolation only -- obs snapped to the nearest model pressure level, no vertical correction',
+        'log-linear': 'horizontal interpolation plus log-linear vertical interpolation to the observation\'s own real pressure (JEDI/UFO VertInterp)',
+    }[vertical_interpolation]
     ds = xarray.Dataset(
         coords={
             'time': ('time', valid_times),
@@ -2826,7 +3187,7 @@ def save_raobs_diagnostics(exp, raobs_traj, background, analysis, valid_times, l
             'window_length_hours': int(exp['n_verif'] * exp['dt_verif']),
             'dt_obs_hours': int(exp['dt_obs']),
             'innovation_convention': 'observation_minus_model',
-            'forward_operator': 'horizontal interpolation only -- obs matched to model pressure levels at read time, no vertical interpolation',
+            'forward_operator': forward_operator_desc,
             'history': 'Created by long_window_4dvar.py',
         },
     )
@@ -2870,6 +3231,22 @@ def save_raobs_diagnostics(exp, raobs_traj, background, analysis, valid_times, l
         ds[base+'_used'].attrs.update({'long_name': long_name+' observation used in the background loss', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
         ds[base+'_analysis_used'] = (dims, analysis_used.astype(np.int8))
         ds[base+'_analysis_used'].attrs.update({'long_name': long_name+' observation used when reevaluated at the analysis', 'flag_values': np.array([0, 1], dtype=np.int8), 'flag_meanings': 'not_used used'})
+        if 'pressure_'+base in raobs_traj:
+            real_pressure = raobs_traj['pressure_'+base].detach().cpu().numpy().astype(np.float32)
+            ds[base+'_real_pressure'] = (dims, np.where(mask, real_pressure, np.nan))
+            ds[base+'_real_pressure'].attrs.update({
+                'long_name': long_name+' observation\'s own real reported pressure '
+                             '(may differ from the level_'+base+' nominal coordinate)',
+                'units': 'hPa',
+            })
+        if 'lat_'+base in raobs_traj:
+            for coord_name, long_suffix in (('lat', 'latitude'), ('lon', 'longitude')):
+                drift = raobs_traj[coord_name+'_'+base].detach().cpu().numpy().astype(np.float32)
+                ds[base+'_drift_'+coord_name] = (dims, np.where(mask, drift, np.nan))
+                ds[base+'_drift_'+coord_name].attrs.update({
+                    'long_name': long_name+' observation\'s own drift-corrected '+long_suffix,
+                    'units': 'degrees',
+                })
 
     encoding = {name: {'zlib': True, 'complevel': 2} for name in ds.data_vars}
     ds.to_netcdf(ofile, encoding=encoding)

@@ -23,14 +23,16 @@ LEVEL_COLUMNS = [
     'height_quality', 'temperature_c', 'temperature_quality', 'u_wind_ms',
     'wind_quality', 'v_wind_ms', 'specific_humidity_mg_kg', 'humidity_quality',
     'temperature_error_c', 'wind_error_ms', 'humidity_error_tenths_percent',
-    'background_temperature_c', 'background_pressure_mb',
+    'background_temperature_c', 'background_pressure_mb', 'drift_time_hours',
+    'drift_longitude', 'drift_latitude',
 ]
 # Nullable-float columns: archive rows legitimately have no source error --
 # force float64 (not pyarrow's type inference, which would call an
 # all-None column `null`-typed and break downstream float conversion).
 _FLOAT_COLUMNS = {
     'temperature_error_c', 'wind_error_ms', 'humidity_error_tenths_percent',
-    'background_temperature_c', 'background_pressure_mb',
+    'background_temperature_c', 'background_pressure_mb', 'drift_time_hours',
+    'drift_longitude', 'drift_latitude',
 }
 EVENT_COLUMNS = ['report_id', 'level_index', 'value_mnemonic', 'event_index', 'value', 'program_code']
 
@@ -90,6 +92,7 @@ def level(
     q=5000., humidity_quality=1., level_index=0,
     temperature_error=None, wind_error=None,
     humidity_error_tenths_percent=None, background_temperature=None, background_pressure=None,
+    drift_time_hours=None, drift_longitude=None, drift_latitude=None,
 ):
     return {
         'report_id': report_id, 'level_index': level_index, 'category': category,
@@ -100,6 +103,8 @@ def level(
         'temperature_error_c': temperature_error, 'wind_error_ms': wind_error,
         'humidity_error_tenths_percent': humidity_error_tenths_percent,
         'background_temperature_c': background_temperature, 'background_pressure_mb': background_pressure,
+        'drift_time_hours': drift_time_hours,
+        'drift_longitude': drift_longitude, 'drift_latitude': drift_latitude,
     }
 
 
@@ -123,6 +128,53 @@ def test_level_outside_pressure_match_tolerance_rejected(tmp_path):
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=849.9)])
     data = load(tmp_path, [t0], {'t': [1000., 850., 500.]}, ['t'], pressure_match_tolerance_hpa=0.05)
     assert not data['mask_t'][0].any()
+    assert 'pressure_t' not in data  # 'exact' mode never returns the real-pressure field
+
+
+@pytest.mark.parametrize('vertical_interpolation', ['nearest', 'log-linear'])
+def test_relaxed_modes_keep_level_outside_exact_tolerance(tmp_path, vertical_interpolation):
+    t0 = datetime(2015, 1, 1, 0)
+    # temperature=26.85 (-> 300 K): level()'s own default (300., read as
+    # Celsius -> 573.15 K) fails the physical-bounds QC (195-327 K),
+    # unrelated to this test.
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=849.9, temperature=26.85)])
+    data = load(
+        tmp_path, [t0], {'t': [1000., 850., 500.]}, ['t'],
+        pressure_match_tolerance_hpa=0.05, vertical_interpolation=vertical_interpolation,
+    )
+    assert data['mask_t'][0][1, 0]  # snapped to 850 hPa (index 1) despite being outside tolerance
+    assert data['pressure_t'][0][1, 0] == pytest.approx(849.9)  # real pressure retained
+
+
+def test_exact_mode_does_not_populate_pressure_field(tmp_path):
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850.0, temperature=26.85)])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], vertical_interpolation='exact')
+    assert data['mask_t'][0][0, 0]
+    assert 'pressure_t' not in data
+
+
+@pytest.mark.parametrize('vertical_interpolation', ['nearest', 'log-linear'])
+def test_relaxed_modes_distance_tiebreak_prefers_closer_duplicate(tmp_path, vertical_interpolation):
+    """Two distinct raw levels both nearest to the same model level (850 hPa,
+    between 1000/500) -- the physically closer one should win when both are
+    otherwise QC-equal (irrelevant for 'exact', where the tight tolerance
+    already makes this moot)."""
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0)],
+        [
+            level(1, pressure=830., temperature=10., level_index=0),  # 20 hPa from 850
+            level(1, pressure=860., temperature=20., level_index=1),  # 10 hPa from 850 -- closer
+        ],
+    )
+    data = load(
+        tmp_path, [t0], {'t': [1000., 850., 500.]}, ['t'],
+        vertical_interpolation=vertical_interpolation,
+    )
+    assert data['mask_t'][0][1, 0]
+    assert data['values_t'][0][1, 0] == pytest.approx(293.15)  # 20 C -> K: the 860 hPa duplicate won
+    assert data['pressure_t'][0][1, 0] == pytest.approx(860.)
 
 
 def test_unphysical_height_qc_rejected(tmp_path):
@@ -298,6 +350,50 @@ def test_use_source_error_q_missing_background_is_nan(tmp_path):
     assert np.isnan(data['source_error_q'][0][0, 0])
 
 
+def test_default_q_error_rh_percent_times_static_qsat(tmp_path):
+    # GSI's real q-error mechanism (RH_fraction * qsat(background), per
+    # jswhit's PR #29 review comment), independent of use_source_error --
+    # the table is interpolated (ln p) to the level's own real pressure.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
+        1, pressure=850., background_temperature=20., background_pressure=1000.,
+    )])
+    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], q_error_rh_percent={1000.: 20., 500.: 10.})
+    import math  # 850 hPa sits between the table's two entries, interpolated in ln(p)
+    tp = [math.log(500.), math.log(1000.)]
+    tv = [10., 20.]
+    expected_rh_fraction = np.interp(math.log(850.), tp, tv) / 100.
+    expected = expected_rh_fraction * _saturation_specific_humidity(293.15, 1000.)
+    assert data['default_error_q'][0][0, 0] == pytest.approx(expected, rel=1e-6)
+    assert expected > 0.
+
+
+def test_default_q_error_absent_without_table(tmp_path):
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850.)])
+    data = load(tmp_path, [t0], {'q': [850.]}, ['q'])
+    assert 'default_error_q' not in data
+
+
+def test_default_q_error_and_source_error_q_coexist(tmp_path):
+    # Both use_source_error and q_error_rh_percent can be set together --
+    # the default (table) and the archive source value are independent
+    # fields; get_raobs/the forward operator decide the override.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
+        1, pressure=850., humidity_error_tenths_percent=2.0,
+        background_temperature=20., background_pressure=1000.,
+    )])
+    data = load(
+        tmp_path, [t0], {'q': [850.]}, ['q'],
+        use_source_error=True, q_error_rh_percent={1000.: 15.},
+    )
+    expected_default = 0.15 * _saturation_specific_humidity(293.15, 1000.)
+    expected_source = 0.20 * _saturation_specific_humidity(293.15, 1000.)
+    assert data['default_error_q'][0][0, 0] == pytest.approx(expected_default, rel=1e-6)
+    assert data['source_error_q'][0][0, 0] == pytest.approx(expected_source, rel=1e-6)
+
+
 def test_use_source_error_t_not_clamped_to_gsi_bounds(tmp_path):
     # GSI's own ermin/ermax (1.3-5.6 K for T) only clamp the gross-check
     # comparison (long_window_4dvar_utils.py), never source_error_t itself
@@ -340,7 +436,7 @@ def test_use_source_error_t_inflated_for_suspect_quality_mark(tmp_path):
     # passes QC (mask_t True) while its error is inflated.
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        level(1, pressure=500., temperature_error=1.0, temperature_quality=3)])
+        level(1, pressure=500., temperature=-20., temperature_error=1.0, temperature_quality=3)])
     data = load(tmp_path, [t0], {'t': [500.]}, ['t'], use_source_error=True)
     assert data['source_error_t'][0][0, 0] == pytest.approx(1.2)
     assert data['mask_t'][0][0, 0]
@@ -403,3 +499,130 @@ def test_use_source_error_q_inflated_for_suspect_quality_mark_no_pressure_trigge
     data = load(tmp_path, [t0], {'q': [10.]}, ['q'], use_source_error=True)
     expected = 1.2 * 0.20 * _saturation_specific_humidity(293.15, 1000.)
     assert data['source_error_q'][0][0, 0] == pytest.approx(expected, rel=1e-6)
+
+
+def test_physical_bounds_qc_rejects_impossible_temperature(tmp_path):
+    # UFO/GSI's sonde bounds check (PR #29's review comment): T 195-327 K.
+    # temperature is Celsius (the archive column's own convention) -- 300
+    # C -> 573 K, far outside any physically real atmospheric value.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=300.)])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert not data['mask_t'][0][0, 0]
+    assert data['values_t'][0][0, 0] != 0.  # value still recorded, just flagged unused
+
+
+def test_physical_bounds_qc_accepts_realistic_temperature(tmp_path):
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=15.)])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert data['mask_t'][0][0, 0]
+
+
+def test_physical_bounds_qc_rejects_impossible_humidity(tmp_path):
+    # q 1e-8-0.035 kg/kg; q is specific_humidity_mg_kg (archive units,
+    # 1e6x) -- 50000 mg/kg -> 0.05 kg/kg, above the upper bound.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., q=50000.)])
+    data = load(tmp_path, [t0], {'q': [850.]}, ['q'])
+    assert not data['mask_q'][0][0, 0]
+
+
+def test_physical_bounds_qc_rejects_impossible_wind(tmp_path):
+    # |u|, |v| <= 130 m/s.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., u=200., v=-5.)])
+    data = load(tmp_path, [t0], {'u': [850.], 'v': [850.]}, ['u', 'v'])
+    assert not data['mask_u'][0][0, 0]
+    assert data['mask_v'][0][0, 0]  # v (-5 m/s) is unaffected by u's own rejection
+
+
+def test_use_drift_time_assigns_each_level_to_its_own_slot(tmp_path):
+    # One report (observation_time=t0), two levels: level 0 at drift 0h
+    # (stays at t0's own slot), level 1 at drift +6h (the balloon reaching
+    # 500 hPa six hours after launch -- a real, if deep, sounding) -- with
+    # use_drift_time, level 1 moves to the t0+6h slot instead of staying
+    # at t0's, confirming one profile's levels can split across slots.
+    t0, t1 = datetime(2015, 1, 1, 0), datetime(2015, 1, 1, 6)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., height=1500., temperature=-10., level_index=0, drift_time_hours=0.0),
+        level(1, pressure=500., height=5500., temperature=-10., level_index=1, drift_time_hours=6.0),
+    ])
+    write_cycle(tmp_path, t1, [], [])  # empty -- just needs the cycle directory to exist
+    data = load(tmp_path, [t0, t1], {'t': [850., 500.]}, ['t'], use_drift_time=True)
+    # slot 0 (t0): only the 850 hPa level (level_index 0) is present.
+    assert data['mask_t'][0][0, 0]
+    assert not data['mask_t'][0][1, 0]
+    # slot 1 (t0+6h): only the 500 hPa level (level_index 1) is present.
+    assert not data['mask_t'][1][0, 0]
+    assert data['mask_t'][1][1, 0]
+
+
+def test_use_drift_time_false_keeps_whole_profile_in_one_slot(tmp_path):
+    # Same archive as above, but use_drift_time defaults to False --
+    # every level uses the report's own single observation_time (t0) for
+    # slot assignment, ignoring drift_time_hours entirely, so both levels
+    # land in slot 0; nothing lands in slot 1 at all.
+    t0, t1 = datetime(2015, 1, 1, 0), datetime(2015, 1, 1, 6)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., height=1500., temperature=-10., level_index=0, drift_time_hours=0.0),
+        level(1, pressure=500., height=5500., temperature=-10., level_index=1, drift_time_hours=6.0),
+    ])
+    write_cycle(tmp_path, t1, [], [])  # empty -- just needs the cycle directory to exist
+    data = load(tmp_path, [t0, t1], {'t': [850., 500.]}, ['t'])
+    assert data['mask_t'][0][0, 0]
+    assert data['mask_t'][0][1, 0]
+    assert data['mask_t'][1].shape[-1] == 0  # no station at all landed in slot 1
+
+
+def test_use_drift_time_falls_back_to_report_time_when_missing(tmp_path):
+    # drift_time_hours missing (None/NaN) for this level -- even with
+    # use_drift_time=True, it must fall back to the report's own time,
+    # not be dropped or mis-slotted.
+    t0, t1 = datetime(2015, 1, 1, 0), datetime(2015, 1, 1, 6)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., temperature=-10., drift_time_hours=None)])
+    write_cycle(tmp_path, t1, [], [])  # empty -- just needs the cycle directory to exist
+    data = load(tmp_path, [t0, t1], {'t': [850.]}, ['t'], use_drift_time=True)
+    assert data['mask_t'][0][0, 0]
+    assert data['mask_t'][1].shape[-1] == 0  # no station at all landed in slot 1
+
+
+def test_use_drift_position_gives_each_level_its_own_position(tmp_path):
+    # One report launched at (20, 10); two levels with distinct drift
+    # positions -- 850 hPa barely drifted, 50 hPa drifted substantially
+    # (a real deep sounding; see docs/integrate_multiple_parquetobs.md).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0, lat=10., lon=20.)], [
+        level(1, pressure=850., height=1500., temperature=26.85, level_index=0,
+              drift_longitude=20.05, drift_latitude=10.02),
+        level(1, pressure=50., height=20000., temperature=26.85, level_index=1,
+              drift_longitude=19.60, drift_latitude=10.45),
+    ])
+    data = load(tmp_path, [t0], {'t': [850., 50.]}, ['t'], use_drift_position=True)
+    assert data['mask_t'][0][0, 0] and data['mask_t'][0][1, 0]
+    assert data['lat_t'][0][0, 0] == pytest.approx(10.02)
+    assert data['lon_t'][0][0, 0] == pytest.approx(20.05)
+    assert data['lat_t'][0][1, 0] == pytest.approx(10.45)
+    assert data['lon_t'][0][1, 0] == pytest.approx(19.60)
+
+
+def test_use_drift_position_false_uses_launch_position_only(tmp_path):
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0, lat=10., lon=20.)], [
+        level(1, pressure=850., temperature=26.85, drift_longitude=19.60, drift_latitude=10.45),
+    ])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert 'lat_t' not in data
+    assert 'lon_t' not in data
+
+
+def test_use_drift_position_falls_back_to_launch_position_when_missing(tmp_path):
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0, lat=10., lon=20.)], [
+        level(1, pressure=850., temperature=26.85, drift_longitude=None, drift_latitude=None),
+    ])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_position=True)
+    assert data['mask_t'][0][0, 0]
+    assert data['lat_t'][0][0, 0] == pytest.approx(10.)
+    assert data['lon_t'][0][0, 0] == pytest.approx(20.)

@@ -40,14 +40,22 @@ exp:
       # so nothing else needs it installed.
       path: './prepbufr_parquet'
       nobs_max: 15000 # upper bound on obs per slot; get_psobs raises if a slot's count exceeds it
-      # Optional parquet reader settings (all default to the values shown).
-      # time_tolerance_hours/quality_mark_max default to the legacy
-      # psobs1_*.txt archive's actual generator (/scratch3/NCEPDEV/da/
-      # Jeffrey.Whitaker/psobs/read_ps_prepbufr1.py: halfwindow=1800s,
-      # psqm<=4) -- not independently derived for this archive, just carried
-      # over from the ported reference repo's own (unrelated) defaults
-      # until checked against it.
-      #time_tolerance_hours: 0.5 # max |report time - slot time| accepted
+      # Optional parquet reader settings (all default to the values shown
+      # unless noted). quality_mark_max defaults to the legacy psobs1_*.txt
+      # archive's actual generator (/scratch3/NCEPDEV/da/Jeffrey.Whitaker/
+      # psobs/read_ps_prepbufr1.py: psqm<=4) -- not independently derived
+      # for this archive, just carried over from the ported reference
+      # repo's own (unrelated) default until checked against it.
+      # time_tolerance_hours defaults to dt_obs/2 (same formula raobs uses
+      # below), NOT the legacy generator's own fixed 0.5h (halfwindow=1800s)
+      # -- dt_obs/2 exactly tiles the window edge to edge with no gaps for
+      # any dt_obs, so it captures every archived report, just distributed
+      # across however many slots dt_obs creates (verified mathematically
+      # and by simulation; docs/integrate_multiple_parquetobs.md). At the
+      # mainline dt_obs: 6 this is 3.0h, not 0.5h -- set this explicitly to
+      # 0.5 to reproduce the legacy reader's narrower, dt_obs-independent
+      # window instead.
+      #time_tolerance_hours: 3.0 # default dt_obs/2; max |report time - slot time| accepted
       #prepbufr_classes: ['ADPSFC', 'SFCSHP']
       #report_types: [180, 181, 187] # PREPBUFR report_type codes kept (null = no filter)
       #quality_mark_max: 4 # max accepted PREPBUFR pressure quality mark
@@ -79,24 +87,68 @@ exp:
       #variables: [temperature, u_component_of_wind, v_component_of_wind]  # ace2
       #path: same as observations.psobs.path by default -- the same parquet archive, ADPUPA class
       #prepbufr_classes: [ADPUPA]
-      # Deliberately NOT the same convention as observations.psobs.
-      # time_tolerance_hours (0.5h, matching the legacy psobs1_*.txt
-      # generator's own 30-min window for surface obs): a radiosonde launch
-      # is scheduled relative to the synoptic hour but spans a multi-hour
-      # ascent, and only the two main synoptic hours (00/12Z) are launched
-      # densely -- checked directly against this archive (2015-01-01):
-      # 0.5h keeps 93-96% of 00/12Z stations but only 50-60% of the already
-      # much sparser 06/18Z ones (74 vs 124, 36 vs 72). dt_obs/2 (3h for a
-      # 6h cycle) is the default for a reason -- don't lower this to match
-      # psobs's 0.5h.
-      #time_tolerance_hours: 3.0 # default dt_obs/2
+      # Defaults to dt_obs/2, same formula observations.psobs uses above --
+      # exactly half the obs-slot spacing, so consecutive slots' acceptance
+      # windows tile the whole window edge to edge with no gaps for ANY
+      # dt_obs (verified mathematically and by simulation; every archived
+      # report is captured by its single nearest slot regardless of how
+      # finely dt_obs slices the window -- docs/integrate_multiple_parquetobs.md).
+      # No need to pin this explicitly just because windows.*.dt_obs is
+      # lowered from its own dt_verif default: dt_obs/2 stays safe (no
+      # coverage loss) at any value. 3.0 only matters as a FIXED choice
+      # because it happens to equal GSI's own twindow convinfo value for kx
+      # 120/220/221 -- pin it explicitly only if you want that exact
+      # GSI-matching number regardless of what dt_obs ends up being (at
+      # dt_obs: 6 it's the same as the default anyway).
+      #time_tolerance_hours: 3.0 # default dt_obs/2 (also GSI's own twindow for kx 120/220/221)
+      # Default False: assign EACH LEVEL to its own nearest obs slot using
+      # the archive's own balloon-drift-corrected drift_time_hours (how
+      # many hours after/before the report's own launch time that level
+      # was actually observed -- verified against real data: near 0 at
+      # the surface, growing smoothly to +1.6h by 5 hPa for a deep sounding),
+      # instead of every level of a profile sharing the report's single
+      # launch time. Falls back to the launch time wherever drift_time_hours
+      # is missing for a level. False (unlike use_source_error) since this
+      # changes WHICH background a level is compared against, not just an
+      # error magnitude -- a more fundamental change, introduced cautiously;
+      # see docs/integrate_multiple_parquetobs.md.
+      #use_drift_time: False
+      # Default False, independent of use_drift_time (that corrects WHICH
+      # slot/background a level is compared against; this corrects WHERE,
+      # horizontally): compare each level against the model at that
+      # level's own balloon-drift-corrected position (drift_longitude/
+      # drift_latitude -- absolute degrees, same convention as latitude/
+      # longitude; verified against real data: a 218-level sounding
+      # drifts from 100.27E/5.30N at launch to 99.94E/5.45N by 6 hPa)
+      # instead of every level sharing the station's single launch
+      # position. Falls back to the launch position wherever drift_
+      # longitude/drift_latitude is missing for a level. See
+      # docs/integrate_multiple_parquetobs.md.
+      #use_drift_position: False
       #quality_mark_max: 3
-      # Mandatory-level matching tolerance (hPa): an obs level is kept only
-      # if its reported pressure is within this of one of the MODEL's own
-      # pressure levels (model.pressure_levels('t'/'u'/'v'/'q')) -- no
-      # vertical interpolation. 0.05 hPa comfortably separates true
-      # mandatory-level reports (recorded at exact round pressures) from
-      # significant levels.
+      # How a level is matched to the MODEL's own pressure levels
+      # (model.pressure_levels('t'/'u'/'v'/'q')):
+      # 'exact' (default) -- today's mandatory-level matching: a level is
+      #   kept only if within pressure_match_tolerance_hpa of a model
+      #   level, everything else discarded. No vertical interpolation.
+      # 'nearest' -- every level kept, snapped to its nearest model level
+      #   regardless of distance (no discard) -- so a model with few/
+      #   coarse levels still gets an observation at each one. Still no
+      #   vertical correction: the comparison still pretends the ob sits
+      #   exactly on that level.
+      # 'log-linear' -- same relaxed matching as 'nearest', PLUS a vertical
+      #   correction: the model is log-linearly interpolated between the
+      #   assigned level and its adjacent neighbor to the observation's
+      #   own real pressure before comparing -- JEDI/UFO's own `log-linear`
+      #   VertInterp method (ufo/operators/vertinterp), including its
+      #   boundary rule (clamp-extrapolate to the edge level, never reject
+      #   for being out of the model's vertical range).
+      # See docs/integrate_multiple_parquetobs.md.
+      #vertical_interpolation: exact  # or: nearest, log-linear
+      # 'exact' matching tolerance (hPa); ignored by 'nearest'/'log-linear'
+      # (which have no distance cutoff at all). 0.05 hPa comfortably
+      # separates true mandatory-level reports (recorded at exact round
+      # pressures) from significant levels.
       #pressure_match_tolerance_hpa: 0.05
       # Height-based QC, applied per matched level: reject levels outside
       # this physical height range, or below the station's own elevation
@@ -105,21 +157,47 @@ exp:
       #height_min_m: -1000.
       #height_max_m: 60000.
       #below_station_tolerance_m: 100.
+      # Also always applied, not configurable: a physical sanity bound on
+      # the value itself (same numbers as UFO's GFS sonde QC config, PR
+      # #29's review comment) -- T 195-327 K, q 1e-8-0.035 kg/kg, |u|/|v|
+      # <= 130 m/s.
       # Observation-error standard deviations for temperature (K) and wind
-      # components (m/s) -- NOT specific humidity, see below.
-      #error_std: {t: 1.0, u: 2.0, v: 2.0}
-      # Default True: use each level's own archive source error instead of
-      # the configured flat/table one, falling back to it wherever the
-      # archive has none (e.g. a synthetic test fixture with no real error
-      # columns at all -- set False explicitly there). For t/u/v:
-      # temperature_error_c/wind_error_ms, the real PREPBUFR TOE/WOE value
-      # -- GSI's own per-type, per-pressure error-table number for that
-      # observation. For q: the archive's RH-based QOE converted to kg/kg
-      # via qsat at the archive's own STATIC background T/p (the
-      # historical GFS background at archive time, NOT this run's own
-      # model state -- a known simplification, flagged for follow-up; see
-      # docs/integrate_multiple_parquetobs.md).
-      #use_source_error: True
+      # components (m/s) -- NOT specific humidity, see below. Default is
+      # GSI's own real prepobs_errtable.global (RAOBS_TUV_ERROR_STD,
+      # long_window_4dvar_utils.py -- posted directly by a GSI-source
+      # maintainer, PR #29 review comment #6992427303; NOT the UFO test
+      # fixture sonde_gfs_qc.yaml's own table, which was checked against
+      # this and doesn't match at every level), shown below; set this key
+      # explicitly to override it with a flat scalar or a different
+      # {hPa: value} table (ln(p)-interpolated, like q_error_rh_percent
+      # below).
+      #error_std:  # the default, shown explicitly
+      #  t: {1000: 1.2, 950: 1.1, 900: 1.0, 850: 0.9, 800: 0.8, 750: 0.8,
+      #      700: 0.8, 650: 0.8, 600: 0.8, 550: 0.8, 500: 0.8, 450: 0.8,
+      #      400: 0.8, 350: 0.8, 300: 0.9, 250: 1.2, 200: 1.2, 150: 1.0,
+      #      100: 1.0, 70: 1.0, 50: 1.0, 30: 1.0, 20: 1.3, 10: 1.5, 5: 1.5}
+      #  u: &raob_wind_err {1000: 1.4, 950: 1.5, 900: 1.5, 850: 1.5,
+      #      800: 1.6, 750: 1.6, 700: 1.6, 650: 1.7, 600: 1.8, 550: 1.9,
+      #      500: 2.1, 450: 2.3, 400: 2.6, 350: 2.8, 300: 3.0, 250: 3.2,
+      #      200: 3.2, 150: 2.8, 100: 2.5, 70: 2.2, 50: 2.0, 30: 2.1,
+      #      20: 2.2, 10: 2.5, 5: 3.0}
+      #  v: *raob_wind_err
+      # Default False: use each level's own archive source error (the
+      # embedded PREPBUFR TOE/WOE/QOE value) instead of the configured
+      # flat/table one above. NOT the same as GSI's actual DA error: in
+      # GSI's read_prepbufr.F90, this exact embedded value is read
+      # (ufbint/oestr) but then unconditionally overwritten by a value
+      # interpolated from the prepobs_errtable.global fix table (etabl),
+      # for every conventional type -- the embedded value never reaches
+      # GSI's own Jo weighting operationally. Kept as an opt-in for
+      # experimenting with the archive's own per-level value; the
+      # configured table above is closer to what GSI actually assimilates
+      # with. For t/u/v: temperature_error_c/wind_error_ms. For q: the
+      # archive's RH-based QOE converted to kg/kg via qsat at the
+      # archive's own STATIC background T/p (the historical GFS
+      # background at archive time, NOT this run's own model state -- a
+      # known simplification). See docs/integrate_multiple_parquetobs.md.
+      #use_source_error: False
       # Background check shared by t/u/v (like error_std above): reject
       # |O-B| > tuv_bg_check * qc_error, at the current state (default
       # 8.0, GSI's own 'gross' convinfo value for kx 120/220/221; null
@@ -131,15 +209,39 @@ exp:
       # range for this comparison only (not configurable -- fixed GSI
       # constants); the actual Jo weight stays the real, unclamped value.
       #tuv_bg_check: 8.0
-      # Specific humidity error: a fixed per-level table (g/kg; ln(p)-
-      # interpolated between entries, nearest beyond them). Default below:
-      # Desroziers estimates from a ps + raobs run. Set null to use instead
-      # a FRACTION of the observed value, floored (q_error_fraction /
-      # q_error_floor_kg_kg) -- weights dry obs most and pulls the analysis
-      # dry.
-      #q_error_g_kg: {1000: 1.4, 925: 1.0, 850: 1.05, 700: 0.95, 600: 0.8, 500: 0.6, 400: 0.33, 300: 0.13}
-      #q_error_fraction: 0.2
-      #q_error_floor_kg_kg: 1.e-5
+      # Optional per-variable override of tuv_bg_check/q_bg_check, with an
+      # additional absolute limit -- UFO/GSI's actual form (PR #29's
+      # review comment: T 7.0x+9.0K, wind 6.0x+19m/s, q 8.0x). A variable
+      # not listed here keeps using the shared scalar above, no absolute
+      # limit. Rejects if EITHER the ratio or the absolute limit fires.
+      #bg_check:
+      #  t: {threshold: 7.0, absolute: 9.0}
+      #  u: {threshold: 6.0, absolute: 19.0}
+      #  v: {threshold: 6.0, absolute: 19.0}
+      #  q: {threshold: 8.0}
+      # Specific humidity error: GSI's real mechanism, confirmed directly
+      # by a GSI-source maintainer (PR #29 review comment #6992427303):
+      # "specific humidity error computed using rh error * qsat (where
+      # qsat is saturation specific humidity computed from background)" --
+      # NOT a flat per-level kg/kg guess (the previous Desroziers-based
+      # default) and NOT a fraction of the observed value (checked
+      # directly against UFO's actual source: sonde_gfs_qc.yaml's own
+      # ObsErrorModelStepwiseLinear+scale_factor_var scheme multiplies by
+      # ObsValue/specificHumidity, not qsat -- the genuinely RH-based UFO
+      # function, ObsErrorModelHumidity, isn't wired into that reference
+      # config at all). This key is a {hPa: percent} RH-error table
+      # (ln(p)-interpolated between entries, nearest beyond them),
+      # converted to kg/kg via qsat at the archive's own STATIC
+      # background_temperature_c/background_pressure_mb (same fields/
+      # formula use_source_error's own q conversion uses -- a known
+      # simplification vs. GSI's live background, see
+      # docs/integrate_multiple_parquetobs.md). Default is the same
+      # prepobs_errtable.global posting's RH/10 column, x10 for percent.
+      #q_error_rh_percent:  # the default, shown explicitly
+      #  1000: 10, 950: 10, 900: 10, 850: 10, 800: 10, 750: 10, 700: 10,
+      #  650: 10, 600: 10, 550: 12, 500: 13, 450: 15, 400: 17, 350: 20,
+      #  300: 20, 250: 20, 200: 20, 150: 20, 100: 20, 70: 20, 50: 20,
+      #  30: 20, 20: 20, 10: 20, 5: 20
       # Background check on q: reject |O-B| > q_bg_check * qc_error, at
       # the current state (default 8.0, GSI's own 'gross' convinfo value;
       # null turns it off). Same use_source_error-only ermin/ermax clamp
@@ -537,6 +639,24 @@ windows:
     #   between the bracketing 6h steps -- validated for AIFS (a known
     #   unmitigated tidal (S2) representativeness error at off-step slots
     #   is documented there); untested for FCN3.
+    # Shared with raobs: get_raobs reuses the SAME per-slot step_lo/alpha
+    # psobs builds from dt_obs, so a finer dt_obs also interpolates the
+    # background each raob level is compared against to within dt_obs/2 of
+    # that level's own report time, instead of up to dt_verif/2 away at the
+    # dt_obs: 6 default -- e.g. dt_obs: 1 gets every raob within 30 min.
+    # observations.raobs.time_tolerance_hours (and psobs's) both default to
+    # dt_obs/2, which stays safe (no coverage loss, any dt_obs -- see that
+    # key's own comment) with no change needed here; optionally pair with
+    # raobs.use_drift_time: True to also correct each level's own
+    # comparison time for balloon drift, closing the remaining gap this
+    # doesn't. Try this before any per-observation (rather than
+    # per-slot) time interpolation, which would only remove that last
+    # dt_obs/2. The caveat above (S2 representativeness error) applies
+    # here too, since dt_obs is shared with psobs -- raob t/u/v/q vary
+    # smoothly enough over 6h that this mainly risks psobs, not raobs; if
+    # it does get worse for ps, raobs would need its own step_lo/alpha
+    # (not implemented) rather than sharing psobs's dt_obs. See
+    # docs/integrate_multiple_parquetobs.md.
     # learn_rate is NOT shared across backends -- each was tuned
     # independently and a shared default would silently mistune one of
     # them:

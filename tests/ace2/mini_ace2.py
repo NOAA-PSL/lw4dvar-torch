@@ -110,17 +110,19 @@ def config(tmp_path, ckpt):
                 # The synthetic fixture's t/u/v aren't tied to this tiny
                 # model's own background climatology (unlike the psobs
                 # fixture, which is loose Gaussian noise around a plausible
-                # ps value) -- a larger error than the real-archive default
-                # (1.0 K / 2.0 m/s) keeps raobs Jo from swamping ps Jo + Jc.
+                # ps value) -- a larger, flat error than the default
+                # per-level JEDI/UFO table (RAOBS_TUV_ERROR_STD,
+                # long_window_4dvar_utils.py) keeps raobs Jo from swamping
+                # ps Jo + Jc.
                 'error_std': {'t': 5.0, 'u': 8.0, 'v': 8.0},
-                # use_source_error now defaults True (see
-                # docs/integrate_multiple_parquetobs.md), but this
-                # synthetic fixture (tests/make_fixtures.py's
-                # _write_raobs_parquet) has no temperature_error_c/
-                # wind_error_ms/humidity_error_tenths_percent/background_*
-                # columns at all -- read_partition would raise on the
-                # missing columns. Explicit False keeps using error_std
-                # above, as before.
+                # use_source_error defaults False (see
+                # docs/integrate_multiple_parquetobs.md); explicit here for
+                # clarity since this synthetic fixture
+                # (tests/make_fixtures.py's _write_raobs_parquet) has no
+                # temperature_error_c/wind_error_ms/
+                # humidity_error_tenths_percent/background_* columns at
+                # all -- read_partition would raise on the missing columns
+                # if this were ever flipped True.
                 'use_source_error': False,
             },
         },

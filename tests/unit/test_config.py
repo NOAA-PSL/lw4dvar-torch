@@ -76,6 +76,33 @@ def test_missing_file_returns_none(tmp_path):
      'observations.raobs.tuv_bg_check must be positive and finite'),
     ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'q_bg_check': 0.0}}},
      'observations.raobs.q_bg_check must be positive and finite'),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'error_std': {'t': {1000.: -1.0}}}}},
+     r"observations.raobs.error_std\['t'\]\[1000.0\] must be positive and finite"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'error_std': {'t': {-1.0: 1.2}}}}},
+     r"observations.raobs.error_std\['t'\] has a non-positive/non-finite pressure key -1.0"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'q_error_rh_percent': {1000.: -1.0}}}},
+     r"observations.raobs.q_error_rh_percent\[1000.0\] must be positive and finite"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'bg_check': {'z': {'threshold': 7.0}}}}},
+     r"observations.raobs.bg_check keys must be a subset of .*got \['z'\]"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'bg_check': {'t': {'absolute': 9.0}}}}},
+     r"observations.raobs.bg_check\['t'\] must be a dict with a 'threshold' key"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'bg_check': {'t': {'threshold': 7.0, 'bogus': 1}}}}},
+     r"observations.raobs.bg_check\['t'\] has unknown keys \['bogus'\]"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'bg_check': {'t': {'threshold': -7.0}}}}},
+     r"observations.raobs.bg_check\['t'\].threshold must be positive and finite"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'bg_check': {'t': {'threshold': 7.0, 'absolute': 0.0}}}}},
+     r"observations.raobs.bg_check\['t'\].absolute must be positive and finite"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'vertical_interpolation': 'bogus'}}},
+     r"observations.raobs.vertical_interpolation must be 'exact', 'nearest', or 'log-linear', got 'bogus'"),
 ])
 def test_invalid_configs_rejected(tmp_path, exp, match):
     with pytest.raises(ValueError, match=match):
@@ -103,7 +130,7 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
             'raobs': {
                 'enabled': True, 'variables': ['temperature', 'u_component_of_wind'],
                 'quality_mark_max': 2, 'q_bg_check': None, 'tuv_bg_check': 3.5,
-                'use_source_error': True,
+                'use_source_error': True, 'use_drift_time': True, 'use_drift_position': True,
             },
         },
     ))
@@ -113,7 +140,69 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
     assert exp['raobs_q_bg_check'] is None
     assert exp['raobs_tuv_bg_check'] == 3.5
     assert exp['raobs_use_source_error'] is True
+    assert exp['raobs_use_drift_time'] is True
+    assert exp['raobs_use_drift_position'] is True
     assert exp['raobs_path'] == exp['obspath']  # defaults to psobs's resolved path
+    assert exp['raobs_vertical_interpolation'] == 'exact'  # left unset -> defaults to today's behavior
+
+
+def test_observations_raobs_use_drift_position_left_unset_by_default(tmp_path):
+    exp, _ = utils.load_config(write_config(
+        tmp_path, observations={
+            'psobs': {'path': './psobs'},
+            'raobs': {'enabled': True},
+        },
+    ))
+    assert 'raobs_use_drift_position' not in exp  # left unset -> get_raobs's own False default applies
+
+
+@pytest.mark.parametrize('vertical_interpolation', ['exact', 'nearest', 'log-linear'])
+def test_observations_raobs_vertical_interpolation_accepted(tmp_path, vertical_interpolation):
+    exp, _ = utils.load_config(write_config(
+        tmp_path, observations={
+            'psobs': {'path': './psobs'},
+            'raobs': {'enabled': True, 'vertical_interpolation': vertical_interpolation},
+        },
+    ))
+    assert exp['raobs_vertical_interpolation'] == vertical_interpolation
+
+
+def test_observations_raobs_error_std_table_accepted(tmp_path):
+    # error_std may be a per-variable {hPa: value} table (same convention
+    # as q_error_rh_percent) instead of a flat scalar -- e.g. a UFO/GSI sonde
+    # error table (PR #29's review comment).
+    table = {1000.: 1.2, 500.: 0.8, 10.: 1.5}
+    exp, _ = utils.load_config(write_config(
+        tmp_path, observations={
+            'psobs': {'path': './psobs'},
+            'raobs': {'enabled': True, 'error_std': {'t': table, 'u': 2.0}},
+        },
+    ))
+    assert exp['raobs_error_std'] == {'t': table, 'u': 2.0}
+
+
+def test_observations_raobs_q_error_rh_percent_table_accepted(tmp_path):
+    # q's own {hPa: percent} RH-error table override -- GSI's real
+    # mechanism (RH_fraction * qsat(background)), replacing the previous
+    # Desroziers-based q_error_g_kg (PR #29 review discussion).
+    table = {1000.: 10., 500.: 15., 10.: 20.}
+    exp, _ = utils.load_config(write_config(
+        tmp_path, observations={
+            'psobs': {'path': './psobs'},
+            'raobs': {'enabled': True, 'q_error_rh_percent': table},
+        },
+    ))
+    assert exp['raobs_q_error_rh_percent'] == table
+
+
+def test_observations_raobs_bg_check_accepted(tmp_path):
+    # UFO/GSI's per-variable gross-check form (PR #29's review comment):
+    # threshold + an optional absolute limit, per variable.
+    cfg = {'t': {'threshold': 7.0, 'absolute': 9.0}, 'q': {'threshold': 8.0}}
+    exp, _ = utils.load_config(write_config(
+        tmp_path, observations={'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'bg_check': cfg}},
+    ))
+    assert exp['raobs_bg_check'] == cfg
 
 
 def test_observations_raobs_disabled_by_default(tmp_path):

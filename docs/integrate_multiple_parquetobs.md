@@ -852,6 +852,59 @@ raise on the missing columns otherwise. Golden fixture regenerated to
 match (the config echo in `/config/exp/observations/raobs` now includes
 the key).
 
+## Correction: the archive's `use_source_error` value is NOT GSI's actual DA error (2026-11-18)
+
+The section above claimed the archive's embedded TOE/WOE/QOE value
+"matches GSI's own `prepobs_errtable.global` ... exactly" and is "the
+per-observation error GSI itself would use." That was wrong -- or more
+precisely, incomplete: the numbers happen to land in the right range, but
+tracing `read_prepbufr.F90` line-by-line (not just comparing magnitudes)
+shows GSI does not actually use the embedded value in its Jo weighting.
+
+In `read_prepbufr.F90`:
+- Line 1226: `call ufbint(lunin,obserr,8,255,levs,oestr)` with
+  `oestr='POE QOE TOE NUL WOE NUL PWE'` -- reads the embedded PREPBUFR
+  error into `obserr`. This is the exact value our converter copies into
+  `temperature_error_c`/`wind_error_ms`/`humidity_error_tenths_percent`.
+- Line 1231: `if(oberrflg .and. kx<=300) then` -- immediately after,
+  whenever the error-table fix file loaded successfully (`oberrflg`,
+  true in every real operational run -- `prepobs_errtable.global` is
+  always linked in) and the type is conventional (`kx<=300`, true for
+  every raob `kx`: 120 for T/Q, 220/221 for u/v), `obserr` is
+  **unconditionally overwritten**, both in the `njqc` branch (separate
+  `etabl_t`/`etabl_q`/`etabl_uv`/`etabl_ps` tables, lines 1244-1496) and
+  the non-`njqc` branch (one combined `etabl`, lines 1497-1529:
+  `obserr(3,k)=(one-del)*etabl(itypex,k1,2)+del*etabl(itypex,k2,2)` for T,
+  column 3 for Q, column 4 for UV, column 1 for PS, column 6 for PW) --
+  interpolated fresh from `prepobs_errtable.global` by type and pressure,
+  with nothing of the embedded BUFR value surviving.
+
+So: the embedded value is read, then discarded, in the actual operational
+GDAS. `prepobs_errtable.global` is a GSI/GDAS fix file -- confirmed
+independently via `exglobal_atmos_analysis.sh`'s
+`OBERROR=${FIXgfs}/gsi/prepobs_errtable.global` / `${NLN} "${OBERROR}"
+errtable`, read every cycle by `converr.f90`'s `converr_read` -- and *it*,
+not the archive's embedded field, is what GSI's Jo term actually weights
+by. The archive's TOE/WOE/QOE is a real PREPBUFR quantity (confirmed from
+the converter's own field metadata) stamped on by an earlier processing
+stage, but it's upstream of, and superseded by, GSI's own ingest.
+
+**Consequence: `raobs_use_source_error` now defaults back to `False`**
+(`get_raobs` in `long_window_4dvar_utils.py`, `configs/config.yml.template`).
+The configured `error_std` table (settable to GSI's own
+`prepobs_errtable.global` values, as in the config template's example) is
+closer to what GSI actually assimilates with than the archive's embedded
+value is. `use_source_error: True` remains available as an opt-in for
+experimenting with the archive's own per-level value, with the docstrings
+in `raobs_parquet.py` and the config template corrected to say so plainly
+-- it is a real, physically sensible per-observation error, just not the
+one GSI's own DA run would have used for that same observation.
+
+`tests/ace2/mini_ace2.py`'s explicit `'use_source_error': False` for its
+raobs block is now redundant with the default but left in place (with an
+updated comment) for clarity, since the synthetic fixture still has none
+of the real error columns regardless of the default's value.
+
 ## GSI's ermin/ermax gross-check clamp for raobs (2026-11-18)
 
 Following directly from `use_source_error`: now that the error itself is
@@ -949,3 +1002,692 @@ independently (qm 3, qm 7 stacked with the pressure trigger, t's 100 hPa
 vs. wind's 50 hPa threshold not being interchangeable, q's qm-only
 inflation with no pressure trigger even at a very low pressure), plus a
 good-quality-mark case confirming no spurious inflation.
+
+## PR #29 review comment: UFO's sonde QC config, three follow-ups (2026-11-18)
+
+A review comment on PR #29 (from `jswhit`, generated with Claude Code)
+compared this work against JEDI UFO's GFS sonde QC config
+(`sonde_gfs_qc.yaml`, reproduces GSI's sonde QC), an independent,
+actively-maintained reference. Its T/wind error tables matched
+`prepobs_errtable.global`'s type-120/220 numbers in this account's GSI
+checkout exactly -- useful independent corroboration of the GSI
+comparison work above. Its `ObsErrorFactorConventional` point (GSI's
+inflation for several obs falling in one model layer) is correctly
+reasoned to be a no-op here: mandatory-level-only matching means at most
+one observation per model level, so that trigger can't fire. Three
+concrete follow-ups acted on:
+
+1. **`error_std` as scalar-or-table**: each of `error_std`'s t/u/v
+   entries may now be a `{hPa: value}` table (same ln(p) interpolation as
+   `q_error_g_kg`, via a new shared helper `_interp_level_table`) instead
+   of only a flat scalar -- e.g. the UFO/GSI table itself, closing the one
+   gap flagged earlier this session (the flat `error_std` default was
+   never GSI-derived). `get_raobs` broadcasts a table across every obs
+   slot/station once (`error_<base>` becomes a tensor); when combined
+   with `use_source_error`, the table is the per-element fallback instead
+   of a flat value. **Important design point**: GSI's ermin/ermax clamp
+   must NOT apply to a configured table (even the identical UFO/GSI
+   numbers) -- only to the genuine archive value. Since `error_<base>`
+   being a tensor no longer implies "from the archive" (it can now also
+   mean "a configured table"), added an explicit `is_source_error_<base>`
+   flag to gate the clamp correctly; `torch.is_tensor(...)` alone is no
+   longer the right test.
+2. **Per-variable `bg_check` with an absolute limit**: `observations.
+   raobs.bg_check` (optional) gives UFO/GSI's actual per-variable gross-
+   check form -- `{t: {threshold, absolute}, u: ..., v: ..., q: ...}` --
+   rejecting if EITHER the ratio OR the absolute limit fires. Resolved by
+   a new `_raobs_gross_check_threshold(raobs_traj, base, shared_key)`:
+   the per-variable override if configured, else the existing shared
+   `tuv_bg_check`/`q_bg_check` scalar with no absolute limit --
+   fully additive/backward-compatible, default behavior unchanged.
+   Deliberately did NOT change `tuv_bg_check`/`q_bg_check`'s own default
+   (8.0, GSI's convinfo `gross`) to UFO's numbers (7.0/6.0/8.0) -- same
+   "different GSI vintages, different tuned numbers" pattern hit
+   throughout this session (e.g. the pasted table that matched neither
+   `prepobs_errtable.global` nor any `_nqcf` variant in this checkout);
+   the STRUCTURE is the valuable, low-risk part, the exact numbers are a
+   config choice left to whoever runs it.
+3. **Physical bounds QC**: a new `QC_PHYSICAL_BOUNDS` flag
+   (`raobs_parquet.py`), same numbers as UFO's config -- T 195-327 K, q
+   1e-8-0.035 kg/kg, |u|/|v| <= 130 m/s. Applied at read time (independent
+   of the background/model state, like the existing height-based checks),
+   not configurable (fixed constants, like the ermin/ermax clamp).
+   **Caught a real issue while testing this**: several existing test
+   fixtures relied on `level()`'s default `temperature=300.` -- that
+   column is Celsius (`temperature_c`), so it converts to 573 K, always
+   unphysical, just never checked before. Only one existing test actually
+   asserted on `mask_t` being True with that default; fixed by giving it
+   a realistic Celsius value instead of relaxing the new bound.
+   NOT implemented: UFO's wind-direction-vs-background check (needs the
+   live background at the ob's location, so it belongs in the forward
+   operator, not here -- lower priority, deferred).
+
+The wind-direction check aside, `bg_check`'s absolute limit, and
+`error_std`'s table form are all gated/additive so none of them touch
+existing default behavior except the physical-bounds QC, which is
+unconditional -- verified against the real ACE2 fixture before trusting
+it doesn't reject anything there.
+
+## Balloon drift time: `use_drift_time` (2026-11-18)
+
+A separate PR #29 review thread (https://github.com/NOAA-PSL/lw4dvar-torch/pull/29#issuecomment-6994064088)
+raised balloon drift time as a potentially serious issue: using the
+report's single launch time for every level means upper-level
+observations get compared against the wrong background by hours. One
+suggestion was to modify the parquet converter to derive this from
+PREPBUFR's `HRDR` mnemonic. Checked first: the parquet archive already
+carries `drift_time_hours` per level, confirmed directly against real
+data (one 218-level sounding, report 460, 2015-01-07 00Z): −0.35h at the
+surface (1009 hPa), crossing zero around 438 hPa, growing to **+1.62h by
+5 hPa** -- exactly the magnitude the concern was about, and already
+available with no converter change needed.
+
+**Added `observations.raobs.use_drift_time`** (default **False** --
+unlike `use_source_error`, this changes WHICH background a level is
+compared against, not just an error magnitude, so introduced the same
+cautious way `use_source_error` itself was before its own default got
+flipped): `_profile_records` (`raobs_parquet.py`) already computed the
+slot-assignment time independently per LEVEL ROW, it just happened to
+read the same report-level time for every level of a report (nothing
+else varied it) -- so using `report_time + timedelta(hours=
+drift_time_hours[level])` instead, falling back to the report's own time
+wherever `drift_time_hours` is missing/non-finite, needed no
+restructuring: one profile's levels splitting across multiple obs slots
+is already handled by the existing `(slot_index, station_key)` keying,
+since each slot already tolerates "this station has only some levels
+here." Nothing downstream (`get_raobs`'s per-slot tensor building, the
+forward operator) needed to change at all.
+
+**Testing**: `tests/unit/test_raobs_parquet.py` -- a two-level profile
+(850/500 hPa) with drift pushing the 500 hPa level into the next 6h
+slot: confirmed it moves there with `use_drift_time: True` and stays
+with the 850 hPa level in the original slot with the default `False`;
+missing `drift_time_hours` falls back to the report's own time. (Hit an
+unrelated test-construction bug along the way: both levels defaulted to
+the same `height`, tripping the pre-existing non-monotonic-height QC
+once they shared one slot -- fixed by giving them realistic, increasing
+heights, not a drift-time issue.)
+
+**Not yet done**: this only corrects the LOCATION-IN-TIME each level is
+matched against (which existing, discrete obs slot). It doesn't touch
+`alpha`'s own per-slot (not per-observation) background time-
+interpolation -- that's the separate, larger "per-observation 4D
+interpolation" architecture question discussed earlier (GSI's
+`tintrp31` interpolates to each observation's own exact time from
+several in-window background snapshots; this repo interpolates once per
+slot, shared by every observation assigned to it). `use_drift_time`
+narrows the mismatch between a level's actual time and its assigned
+slot's nominal time; it doesn't eliminate it the way true per-
+observation time-interpolation would. Also not yet done: using
+`drift_longitude`/`drift_latitude` (present in the same archive,
+confirmed earlier) for the forward operator's horizontal interpolation
+location -- a related but separate, slightly larger change (needs
+per-level interpolation weights, not per-station).
+
+## Session recap (2026-11-19): `use_source_error`'s real relationship to GSI, finer raobs time interpolation, four new longcyc trials
+
+Picking up directly from the "Correction" section above. This session's
+own earlier correction (flip `use_source_error` to `False` because GSI's
+`read_prepbufr.F90` overwrites the embedded value rather than reading
+it) was right about MECHANISM but incomplete about CONSEQUENCE -- a
+follow-up investigation, prompted by a user push-back for more rigor,
+settled the actual question: **is the archive's embedded value usable
+as a stand-in for `prepobs_errtable.global` in our own DA?** Yes,
+empirically confirmed, not just inferred.
+
+**What was verified, concretely**: reproduced GSI's own linear-in-
+pressure `etabl` interpolation (`read_prepbufr.F90`'s non-`njqc` branch,
+lines 1497-1529 -- confirmed `njqc=.false.` is GSI's actual default and
+is never overridden anywhere in this account's global-workflow
+checkout's `parm/`, so that branch is the one operationally active) from
+the real `prepobs_errtable.global` fix file, for kx=120 (T/Q) and
+kx=220/221 (UV) -- exactly the types this repo's raobs reader uses --
+then compared it level-by-level against the real 2015-01-07 00Z ADPUPA
+archive partition's `temperature_error_c`/`wind_error_ms`/
+`humidity_error_tenths_percent` (~64,000 levels):
+
+| type | match after rounding the GSI prediction to 1 decimal |
+|---|---|
+| T (kx=120) | 29157/29595 exact; all 438 remaining are exact-half rounding-tie artifacts (e.g. predicted 0.85 rounds to the archive's 0.9 under round-half-away-from-zero, 0.8 under Python's banker's rounding) |
+| UV (kx=220) | 33881/33955, same rounding-tie story |
+| UV (kx=221) | 832/832 -- 100% |
+| Q (kx=120) | 26375/26375 -- 100% (trivial: this table's Q column is flat 2.0, no interpolation variance) |
+
+Every discrepancy is explained by the archive's 1-decimal BUFR storage
+precision, not a different source or formula. Also checked: for
+quality-mark-3 observations, the archive's stored value is the RAW,
+pre-inflation table value (ratio ~0.99-1.0 against the raw prediction,
+not ~1.2) -- confirming GSI's own x1.2 quality-mark inflation
+(`docs` section above) is applied by GSI itself at read time, never
+baked into the archived mnemonic, so this repo's own `_gsi_inflate_error`
+is correctly additive on top of `use_source_error`, not double-counting
+anything.
+
+Independent corroboration: PR #29 comment
+[#issuecomment-6994962917](https://github.com/NOAA-PSL/lw4dvar-torch/pull/29#issuecomment-6994962917),
+`jswhit` directly: *"The operational DA uses the prepobs_errtable.global
+... The values encoded in the prepbufr are not used."* -- correct about
+mechanism (GSI recomputes, doesn't reuse the BUFR field), and not in
+tension with the verification above: the recomputed value and the
+archived value are numerically the same (to rounding), because both
+derive from the same table and formula, just at different times (archive
+creation vs. analysis time).
+
+**Net conclusion, stated precisely**: the archive's TOE/WOE/QOE values
+ARE encoded in the PREPBUFR (literal mnemonics, not invented by this
+repo's converter) AND are NOT read by GSI's own DA (overwritten by a
+fresh `etabl` recompute) AND are numerically consistent with
+`prepobs_errtable.global` to BUFR storage precision -- so
+`use_source_error: True` is a faithful, verified stand-in for "use
+`prepobs_errtable.global` in our own DA," for raobs t/u/v/q (kx
+120/220/221) specifically. **Decided: leave the code default at `False`**
+(unchanged from the "Correction" section above -- opt-in, not required)
+but the three new `-t2` configs below turn it on explicitly for raobs,
+now on this stronger evidence rather than the original, looser "same
+range" comparison.
+
+**Still open, not investigated this session**:
+- `psobs` has no background/gross check at all (unlike raobs, which now
+  has `tuv_bg_check`/`bg_check`). Identified while reviewing
+  PR #29 comment 6993377418's UFO reference table, which gives
+  `stationPressure`: threshold 3.6σ, absolute limit 990 Pa -- a
+  reasonable default if/when this gets implemented, mirroring raobs'
+  `_raobs_gross_check_threshold` pattern. Flagged, not built.
+- `observations.psobs.error_std_hpa` (default 1.0) could be tightened to
+  ~1.2 hPa, the middle of `prepobs_errtable.global`'s own PS-column
+  range (1.3/1.1/1.2 mb for kx 180/181/187, this repo's own
+  `psobs_report_types` default) -- confirmed directly from the fix file,
+  not yet applied to any tracked config.
+- The PR #29 thread has not been updated with this session's stronger
+  verification (the "likely same lineage" draft reply from the prior
+  session is now supersedable by the precise finding above) -- still
+  pending the user's decision on how/whether to post it.
+
+**Config-template-only change (no code/behavior change)**: per PR #29
+comment
+[#issuecomment-6993629238](https://github.com/NOAA-PSL/lw4dvar-torch/pull/29#issuecomment-6993629238),
+confirmed `get_raobs` already reuses `psobs_traj['step_lo']`/`['alpha']`
+(`long_window_4dvar_utils.py:1570-1571`) and
+`raobs_time_tolerance_hours` already defaults to `dt_obs / 2.`
+(`:1394`) -- so lowering `windows.*.dt_obs` (e.g. to `1`) already
+sharpens the background each raob level is compared against to within
+`dt_obs/2` of its own report time, with **no new code**, as long as
+`observations.raobs.time_tolerance_hours` is set explicitly (otherwise
+it silently collapses to `dt_obs/2`, e.g. 0.5h, matching psobs's much
+tighter convention and dropping most raobs). Documented both sides of
+this in `configs/config.yml.template`: a new paragraph under
+`windows.*.dt_obs` describing the shared-slot mechanism and the S2-tide
+caveat (dt_obs is shared with psobs), and a new paragraph under
+`observations.raobs.time_tolerance_hours` warning it must be set
+explicitly whenever `dt_obs` is lowered.
+
+**Four new long-cycling trials** (gitignored by convention, like the
+existing `-t1` pair -- `config*longcyc*.yml`/`slurm/*longcyc*.sh`
+patterns in `.gitignore`), each `-t1`'s own config plus: `windows.'5'.
+dt_obs: 1` (was `6`, applied to ALL FOUR, including the two ps-only
+configs, so ps-only and ps+raobs share the identical time-interpolation
+scheme -- isolating "does adding raobs help" as the only difference
+between a ps-only/ps+raobs pair, at the cost of also exposing ps itself
+to the S2-tide risk in all four) and `observations.raobs.
+use_source_error: True` in the two ps+raobs configs (psobs's was already
+`True` in `-t1`):
+
+| # | config | slurm script | job ID |
+|---|---|---|---|
+| ps-only, AIFS 1.0deg | `config_test_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-ps_only-t2.yml` | `run_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-ps_only-t2.sh` | 26868150 |
+| ps+raobs, AIFS 1.0deg | `config_test_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-ps_raobs-t2.yml` | `run_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-ps_raobs-t2.sh` | 26868151 |
+| ps-only, ACE2 | `config_test_ace2-longcyc-obsint-1hour-ps_only-t2.yml` | `run_ace2-longcyc-obsint-1hour-ps_only-t2.sh` | 26868148 |
+| ps+raobs, ACE2 | `config_test_ace2-longcyc-obsint-1hour-ps_raobs-t2.yml` | `run_ace2-longcyc-obsint-1hour-ps_raobs-t2.sh` | 26868149 |
+
+All four loaded cleanly through `load_config` and pass
+`tests/unit/test_config.py`; checkpoints, IC caches and the `lwaifs2` env
+were confirmed present before submitting; no output-directory collision
+with any existing `exp_name`. Submitted 2026-11-19, 5h walltime each (1
+month / 300 6h cycles requested, same as `-t1`).
+
+**Pick up here tomorrow**:
+1. Check `squeue`/job `.out`/`.err` for all four job IDs above. If any
+   hit its 5h walltime before finishing 300 cycles (as both `-t1` runs
+   did, needing their own `-1rst` configs), make the analogous `-1rst`
+   config/script pair: `restart: True`, `sdate`/`rpath` advanced to the
+   last cycle with a complete `optimal_inputs.pkl`, same `exp_name`/
+   output dir, and resubmit.
+2. Decide on the two "still open" items above (ps background check, ps
+   `error_std_hpa` value) and whether/how to update the PR #29 thread
+   with this session's stronger `use_source_error` verification.
+3. Once all four `-t2` runs complete, compare against their `-t1`
+   counterparts (dt_obs: 6, raobs `use_source_error` unset) and the
+   ps-only vs ps+raobs pairs against each other -- region-split z500 and
+   raobs-fit diagnostics, same approach as the ACE2 Tropics z500
+   investigation section above.
+
+## `psobs.time_tolerance_hours` now defaults to `dt_obs/2`, matching raobs (2026-11-19)
+
+While explaining the `-t1`/`-t2` ps-obs-count jump above in a follow-up
+session, worked out precisely how `time_tolerance_hours` and `dt_obs`
+interact in `cycle_directories`/the per-report `argmin`-over-all-slots
+assignment (`psobs_parquet.py`/`raobs_parquet.py`): each raw report is
+claimed by its single nearest obs slot, then kept only if that slot is
+within `time_tolerance_hours` -- never duplicated across slots, never
+independently re-fetched per slot.
+
+**Key property, confirmed both algebraically and by direct simulation**:
+when `time_tolerance_hours == dt_obs/2` (exactly half the slot spacing),
+consecutive slots' acceptance windows tile the whole window edge to edge
+with no gaps and no overlap, for ANY `dt_obs` -- so this formula captures
+100% of the archive's reports regardless of how finely `dt_obs` slices the
+window, just redistributing them across however many slots result. A
+200k-sample simulation confirmed this exactly: `dt_obs:1`/`tol:0.5h` and
+`dt_obs:6`/`tol:3.0h` (both `== dt_obs/2`) each keep 100% of synthetic
+reports uniformly scattered across a 120h window; only a tolerance
+*smaller* than `dt_obs/2` loses anything (`dt_obs:6`/`tol:0.5h`, the
+previous psobs default, kept only ~16.5% in the same simulation --
+consistent with the real archive's measured ~17% psobs coverage at the
+mainline `dt_obs: 6`).
+
+**This corrects an earlier wrong inference in this same investigation**:
+raobs's own `time_tolerance_hours` default (`dt_obs/2`) was assumed to
+need pinning to a fixed `3.0` whenever `dt_obs` is lowered, reasoning (by
+analogy to the real `93-96%`-vs-`50-60%` station-count gap measured
+earlier -- see "time_tolerance_hours is deliberately NOT the same value
+as observations.psobs's" above) that `dt_obs: 1`'s default collapsing to
+`0.5h` would similarly drop most sparse-cycle stations. That gap was
+real, but it was measured entirely at a FIXED `dt_obs: 6` comparing a
+mismatched fixed `0.5h` (psobs's old fixed convention, far narrower than
+the `6h` spacing's own `3h` half-width) against the matched `dt_obs/2`
+formula -- not a property of lowering `dt_obs` itself. At `dt_obs: 1`,
+`dt_obs/2 = 0.5h` IS the matched formula (half of the new, narrower `1h`
+spacing), so it tiles perfectly and loses nothing, as the simulation
+above confirms directly.
+
+**Changed**: `get_psobs` (`long_window_4dvar_utils.py`) now defaults
+`psobs_time_tolerance_hours` to `dt_obs / 2.` instead of a fixed `0.5`
+(previously independent of `dt_obs` entirely, carried over from the
+legacy `psobs1_*.txt` generator's own `halfwindow = 1800s`). raobs's own
+default was already `dt_obs/2` and needed no code change. The mini-ACE2
+CI fixture is unaffected: `tests/make_fixtures.py`'s `_write_psobs_parquet`
+places every synthetic report's `observation_time` exactly on its cycle
+boundary (zero jitter), so widening the tolerance window changes nothing
+there (`make check-ace2` reconfirmed passing).
+
+**Consequence for every tracked production config**: none of them set
+`observations.psobs.time_tolerance_hours` explicitly, and all run at the
+mainline `dt_obs: 6` -- so this changes their *effective* psobs tolerance
+from `0.5h` to `3.0h`, i.e. from ~17% to 100% of each 6h cycle's surface
+reports captured. This is a real, intentional behavior change to every
+backend's ps-obs assimilation density, not just the longcyc raobs
+experiments above -- set `observations.psobs.time_tolerance_hours: 0.5`
+explicitly on any config that needs to keep reproducing the old
+legacy-`.txt`-matching density. Not yet re-run against any tracked
+production config to see how this affects skill; the longcyc `-t2`
+comparison above already exercises the new default directly (it never
+set `psobs.time_tolerance_hours` explicitly either).
+
+**Config template** (`configs/config.yml.template`): both the
+`observations.psobs.time_tolerance_hours` and
+`observations.raobs.time_tolerance_hours` comments rewritten to state the
+tiling property directly and drop the now-incorrect "must pin explicitly
+when lowering dt_obs" guidance; the `windows.*.dt_obs` comment's reference
+to pairing with a pinned raobs `3.0` was softened the same way.
+
+## raobs vertical interpolation: `exact`/`nearest`/`log-linear`, following JEDI's `VertInterp` (2026-11-19)
+
+Read JEDI's actual `ufo`/`oops` source (`gh api`, not documentation/memory)
+to compare this repo's raobs forward operator against JEDI's own design,
+prompted by the still-open "ACE2 Tropics z500 degradation with raobs"
+investigation above and a general question of how closely this repo's
+horizontal/vertical/time interpolation choices track JEDI's.
+
+**Findings, horizontal**: `oops::UnstructuredInterpolator`
+(`src/oops/generic/UnstructuredInterpolator.h`) does Delaunay-triangulation
++ 3-point barycentric weights, exact for linear fields on ANY unstructured
+mesh, computed once per source geometry by the model-interface layer
+(`oops::GetValues`), shared by every obs type/operator. This repo's own
+`grid_interp` (`get_grid_interpolator`) already defaults every backend to
+an exact-for-linear-fields method too (`ReducedGaussianBilinearInterpolator`/
+`BilinearGridInterpolator`/`RectilinearBilinearInterpolator`, one per grid
+topology, since 2026-10-08) -- already well-aligned; the only gap is
+needing a new per-topology class for a future non-row-structured mesh,
+where JEDI's one triangulation algorithm would just work. No action taken
+here.
+
+**Findings, time**: `oops::GetValues` has `doLinearTimeInterpolation_`
+(linear vs. nearest-neighbor between background snapshots) -- the same
+role as this repo's `step_lo`/`alpha` linear time-bracketing, already in
+place. Already aligned, no action needed.
+
+**Findings, vertical -- the real gap**: `ufo::VertInterp`
+(`src/ufo/operators/vertinterp/ufo_vertinterp_mod.F90`,
+`src/ufo/utils/vert_interp.F90`) interpolates UNCONDITIONALLY from the
+model's own vertical GeoVaL profile to each observation's own exact
+reported coordinate (`log-linear` is JEDI's actual default for pressure --
+confirmed directly in the sonde QC config,
+`test/testinput/instrumentTests/Sonde/sonde_gfs_qc.yaml`: `obs operator:
+VertInterp, vertical coordinate: air_pressure, observation vertical
+coordinate: pressure, interpolation method: log-linear`). It never rejects
+for being far from a model level -- out-of-range clamps to the nearest
+edge level's value (`vert_interp_weights`'s `wi=1, wf=1.0`/`wi=nlev-1,
+wf=0.0`). All QC (physical bounds, background/gross-error check) happens
+AFTER interpolation, as separate filters -- exactly the role this repo's
+own `tuv_bg_check`/`q_bg_check`/`bg_check` already plays. This repo's
+actual design (before this section) discarded any level not within
+`pressure_match_tolerance_hpa` (`0.05` hPa) of a model level -- i.e. the
+proximity check WAS the rejection mechanism, something JEDI's design
+doesn't have at all.
+
+**Decided**: add `observations.raobs.vertical_interpolation` (`'exact'`
+default / `'nearest'` / `'log-linear'`), closely tracking JEDI's own
+`nearest-neighbor`/`log-linear` `VertInterp` methods, rather than inventing
+a third scheme -- at the user's explicit request to keep a coarse-model-
+safe nearest-level option alongside real interpolation. `'exact'` keeps
+today's behavior byte-for-bit; `'nearest'`/`'log-linear'` both drop the
+`pressure_match_tolerance_hpa` discard (every level kept, snapped to its
+nearest model level unconditionally -- fixing the real failure mode for a
+coarse model: a level getting ZERO observations because nothing happened
+to land within the tight tolerance). `'log-linear'` additionally corrects
+the comparison for the kept level not sitting exactly on its assigned
+model level, via JEDI's own boundary rule (clamp-extrapolate, never
+reject).
+
+**Implementation** (`'exact'` default preserves every tracked config/test
+byte-for-bit -- purely additive):
+- `raobs_parquet.py`'s `_profile_records`/`load_raobs_parquet`: new
+  `vertical_interpolation` parameter. `'nearest'`/`'log-linear'` drop the
+  tolerance discard and add the kept level's own real pressure
+  (`record['pressure']`/`pressure_<v>` output, same shape as `values_<v>`)
+  for the forward operator to use. The existing per-`(variable,
+  level_index)` duplicate-selection priority gained a third tie-break --
+  distance to the assigned level -- since without the tight tolerance,
+  genuinely different raw levels can now compete for one bucket (moot for
+  `'exact'`, where the tolerance already made it so).
+- `long_window_4dvar_utils.py`: new `_raobs_vertical_interp_weights`
+  helper -- a direct port of `vert_interp_weights`'s bracket-and-clamp
+  logic (ln(p), adjacent model level, edge-clamp) -- called once per
+  window in `get_raobs` (same "compute once, not per epoch" pattern as
+  `interp_idx`/`interp_wts`/`step_lo`/`alpha`), producing
+  `vert_neighbor_idx_<base>`/`vert_alpha_<base>` tensors.
+  `_compute_raobs_observation_diagnostics_at_time` gains one new step for
+  `'log-linear'` only: gather the neighbor level and blend by `alpha`
+  before forming the innovation (`alpha=0` is a no-op, reproducing
+  `'nearest'`/`'exact'` exactly). `save_raobs_diagnostics` additively
+  writes `<base>_real_pressure` when not `'exact'`.
+- `_RAOBS_CONFIG_KEYS`/`load_config` validate the three values;
+  `configs/config.yml.template` documents all three with the JEDI
+  correspondence.
+
+**Testing**: `tests/unit/test_raobs_parquet.py` -- a level outside the old
+`0.05 hPa` tolerance is discarded under `'exact'` but kept under
+`'nearest'`/`'log-linear'`; the distance tie-break when two raw levels
+compete for one bucket; `'exact'` never populates the new `pressure_<v>`
+field (regression guard). `tests/unit/test_solver_helpers.py` --
+`_raobs_vertical_interp_weights` directly: exact match gives `alpha=0`,
+a level exactly between two model levels gives `alpha=0.5` with the
+correct neighbor, out-of-range clamps to self with `alpha=0` rather than
+rejecting; the full forward-operator blend reproduces hand-computed
+values; every pre-existing hand-built `raobs_traj` fixture (none of which
+set `vertical_interpolation`) is confirmed to still take the unmodified
+path (`raobs_traj.get('vertical_interpolation', 'exact')`, not direct
+indexing -- needed because those fixtures predate this key).
+`tests/unit/test_config.py` -- accepts the three values, rejects anything
+else, confirms the resolved flat key and its `'exact'` default.
+
+**Not yet done**: the mini-ACE2 CI fixture (`tests/ace2/test_ace2_mini.py`)
+was not extended to exercise `'nearest'`/`'log-linear'` end to end (not
+run in this environment either -- `fme` isn't importable here); the error-
+level tables (`error_std`/`q_error_g_kg`) still evaluate at the nominal
+model-level pressure rather than the kept observation's own real pressure
+for `'nearest'`/`'log-linear'` -- a small, flagged secondary accuracy
+improvement, not bundled into this change; and no tracked config has been
+switched to `'nearest'`/`'log-linear'` yet to see how it affects the
+still-open ACE2 Tropics z500 investigation above.
+
+## raobs balloon-drift horizontal position: `use_drift_position`, following JEDI's `ProfileHorizontalDrift` (2026-11-19)
+
+Read JEDI's own source again (`ufo/variabletransforms/Cal_ProfileHorizontalDrift.{h,cc}`,
+`ufo/variabletransforms/Formulas.cc`'s `horizontalDrift`) to see how it
+handles balloon drift's HORIZONTAL component -- the "also not yet done"
+item flagged in the "Balloon drift time" section above.
+
+**How JEDI does it**: as an upstream variable transform (`ProfileHorizontalDrift`),
+run BEFORE any obs operator -- it overwrites `MetaData/latitude`/
+`longitude`/`dateTime` in place, per LEVEL (computed from the sonde's own
+measured wind via a Laroche-Sarrazin ballistic integration, fixed 5.16 m/s
+ascent speed). This works with zero changes to `VertInterp`/`GetValues`
+because JEDI's ObsSpace already treats each level as its own independent
+row with its own location -- `GetValues` already interpolates per row,
+uniformly for every obs type; there is no "one location shared across many
+levels" concept to generalize in the first place. Confirmed the archive
+already carries `drift_longitude`/`drift_latitude` directly (absolute
+degrees, same convention as `latitude`/`longitude` -- checked a real
+218-level sounding: drifts from its launch position 100.27E/5.30N to
+99.94E/5.45N by 6 hPa), so unlike JEDI's general case this repo doesn't
+need to derive drift from wind at all -- just read it.
+
+**Why this repo's situation differs**: `get_raobs` computes horizontal
+interpolation weights ONCE PER STATION (`grid_interp.weights(lon_np[j],
+lat_np[j], ...)`), shared across every level of that station's profile --
+the opposite of JEDI's per-row design. Adopting the correction meant
+introducing per-level position where none existed, not just reading one
+more column.
+
+**Added `observations.raobs.use_drift_position`** (default `False`,
+independent of both `use_drift_time` and `vertical_interpolation` -- any
+combination is valid):
+- `raobs_parquet.py`'s `_profile_records`/`load_raobs_parquet`: each kept
+  level additionally records its own drift-corrected `(lat, lon)`
+  (`record['level_position']`/`lat_<v>`/`lon_<v>` output, same shape as
+  `pressure_<v>`), falling back to the station's own launch position
+  wherever `drift_longitude`/`drift_latitude` is missing/non-finite.
+- `long_window_4dvar_utils.py`: when enabled, `get_raobs` computes
+  per-`(slot, level)` horizontal weights PER BASE (`interp_idx_<base>`/
+  `interp_wts_<base>`, shape `(n_obs, n_levels, capacity, k)` -- each base
+  needed its own, since each base maps raw levels to its own `levels_hpa[base]`
+  independently) instead of the single shared `interp_idx`/`interp_wts`.
+  New `_raobs_gather_per_level` helper applies them in
+  `_compute_raobs_observation_diagnostics_at_time` (advanced indexing with
+  two same-shaped index tensors -- avoids materializing a `(capacity,
+  n_points)` intermediate, which would be disastrous for AIFS's 542080-point
+  grid). When disabled, the forward operator takes the exact same
+  `grid_interp.interp` path as before -- zero behavior change.
+  `save_raobs_diagnostics` additively writes `<base>_drift_lat`/
+  `<base>_drift_lon`.
+
+**Testing**: `tests/unit/test_raobs_parquet.py` -- each level gets its own
+drift position when enabled; falls back to launch position when the
+archive columns are missing/non-finite; the feature is a no-op (no
+`lat_<v>`/`lon_<v>` keys at all) when disabled. `tests/unit/
+test_solver_helpers.py` -- `_raobs_gather_per_level` reproduces `grid_interp.
+interp`'s shared-weight result when weights happen to be constant across
+levels; picks genuinely different grid points per level when they differ;
+the full forward operator correctly applies distinct per-level weights
+end to end. `tests/unit/test_config.py` -- new key defaults unset (`False`
+default applied by `get_raobs`), accepted/resolved when set.
+
+**Verified against the real archive** (not just synthetic fixtures):
+`use_drift_position=False` produces no `lat_t`/`lon_t` keys at all
+(regression-safe); `True` recovers per-level positions that genuinely
+vary across a real sounding (one station's latitude ranged 70.94-71.17
+across its kept levels). `make check`/`make check-ace2` both still pass
+with the new code present (default off) -- the mini-ACE2 CI fixture
+itself isn't extended to exercise `use_drift_position: True` end to end,
+since (like `use_source_error`) its synthetic archive has no
+`drift_longitude`/`drift_latitude` columns at all.
+
+## raobs t/u/v/q observation error: GSI's real table, not a UFO test fixture or Desroziers estimates (2026-11-19)
+
+Followed up on the `use_source_error` discussion above with a direct
+question: how does JEDI actually define raobs observation error, and is
+that consistent with what this repo does? Answer, worked out by reading
+the real `JCSDA/ufo` source (not documentation/memory) and a real
+NOAA-EMC operational config, not by trusting any one reference in
+isolation:
+
+**UFO itself is inconsistent about what an "RH error" table means.**
+`sonde_gfs_qc.yaml` (the reference PR #29's review comment described)
+assigns q's error via `ObsFunction/ObsErrorModelStepwiseLinear` +
+`scale_factor_var: ObsValue/specificHumidity` -- confirmed directly in
+that function's own source (`obserr[iv][jobs] = error *
+(*obvalues)[iv][jobs]`): a pressure-dependent fraction of the **observed**
+q, no qsat, no temperature, no saturation-vapor-pressure formula anywhere.
+But the exact same table of numbers (`errors: [0.2, 0.4, 0.8]` at
+`xvals: [25000, 20000, 10]` Pa) also appears, identically labeled `# RH
+error`, in a *different* UFO function's own unit test --
+`ObsFunction/ObsErrorModelHumidity` (`function_obserrorhumidity.yaml`) --
+which DOES do the real conversion: interpolate the RH-error table to the
+ob's pressure, then multiply by a genuine saturation specific humidity
+computed from the **live model background** (`GeoVaLs/air_temperature`/
+`air_pressure`, via a real Magnus-Tetens-family formula,
+`SatVaporPres_fromTemp`). So the same numbers get used two different ways
+in UFO depending on which function happens to consume them; the sonde
+reference config's own wiring isn't the authoritative pattern to copy.
+
+**A real operational config settles which mechanism GSI/JEDI actually
+use for sondes**: `NOAA-EMC/RDASApp`'s
+`parm/jcb-rdas/observations/atmosphere/adpupa_specificHumidity_120.yaml.j2`
+(ADPUPA, kx 120 -- exactly this repo's raobs) supports both via a
+`use_error_inflation` toggle, defaulting to the fraction-of-observed-q
+path (`ObsErrorModelStepwiseLinear`) paired with several *additional*
+GSI-`errormod`-replicating inflation filters -- `ObsErrorModelHumidity`
+is the non-default, opt-out alternative.
+
+**The deciding evidence**: a direct comment from a GSI-source maintainer
+on PR #29
+([#6992427303](https://github.com/NOAA-PSL/lw4dvar-torch/pull/29#issuecomment-6992427303)),
+posting GSI's actual `prepobs_errtable.global` table (T, RH/10, ps, uv
+columns, 1000-5 hPa) and stating plainly: *"specific humidity error
+computed using rh error * qsat (where qsat is saturation specific
+humidity computed from background)."* That's authoritative in a way
+neither UFO reference config is on its own -- it's GSI's own stated
+mechanism, not inferred from a test fixture's wiring.
+
+**Decided**: adopt that GSI table as the single source for t/u/v/q,
+replacing both the previous UFO-YAML-sourced `RAOBS_TUV_ERROR_STD`
+(checked against this table and found to disagree at several levels --
+e.g. 900 hPa T: UFO's test fixture said `0.9`, GSI's real table says
+`1.0`; 100 hPa T: `0.8` vs `1.0` -- confirming the UFO test config is not
+a reliable stand-in for the real fix file) and the Desroziers-based
+`RAOBS_Q_ERROR_G_KG`/the `q_error_fraction`/`q_error_floor_kg_kg`
+fraction-of-observed-q fallback (removed entirely, not just
+deprioritized -- GSI's real mechanism is RH*qsat, not a fraction of the
+observation). The qsat conversion reuses the archive's own static
+`background_temperature_c`/`background_pressure_mb` fields -- the same
+simplification (live GSI background vs. this repo's static archived one)
+already made and documented for `use_source_error`'s own q path above,
+not a new one.
+
+**Implementation**:
+- `long_window_4dvar_utils.py`: `RAOBS_TUV_ERROR_STD` updated to GSI's
+  real T/uv columns (25 levels, 1000-5 hPa, transcribed and verified
+  pair-by-pair against the posted table). New `RAOBS_Q_ERROR_RH_PERCENT`
+  (the RH/10 column, x10 for percent) replaces `RAOBS_Q_ERROR_G_KG`
+  entirely. Deliberately kept as a SEPARATE constant, not folded into
+  `RAOBS_TUV_ERROR_STD['q']`: different units (RH percent vs. absolute
+  K/m-s -- a `['q']` entry in the TUV dict would look usable the same way
+  `['t']`/`['u']`/`['v']` are and silently wouldn't be) and a different
+  consumption path (t/u/v's table is interpolated once per MODEL level in
+  `get_raobs`; q's needs each observation's own real pressure and static
+  background, so it's interpolated per RAW ARCHIVE ROW in
+  `raobs_parquet.py` instead).
+- `raobs_parquet.py`: `background_temperature_c`/`background_pressure_mb`
+  are now read whenever `'q' in variables`, not just under
+  `use_source_error` -- the DEFAULT q error needs qsat too now. New
+  `_interp_rh_percent_table` (ln(p) interpolation, duplicated from
+  `long_window_4dvar_utils.py`'s `_interp_level_table` rather than
+  imported, matching this module's existing no-solver-dependency
+  convention) interpolates the RH-percent table to each kept level's own
+  real pressure; `default_error = (rh_percent/100.) * qsat` -- NOT
+  inflated by GSI's x1.2 rule, which stays scoped to the genuine
+  archive-sourced value only (same principle as `is_source_error_<base>`
+  for t/u/v). New `default_error_q` output (same shape as `values_q`),
+  always populated whenever q is requested, independent of
+  `use_source_error`.
+- `get_raobs`/`_compute_raobs_observation_diagnostics_at_time`: q's
+  `effective_error` simplifies to `raobs_traj['default_error_q'][oind]`,
+  overridden per-element wherever `source_error_q` (the real archive
+  value, `use_source_error: True`) is finite -- the override logic itself
+  is unchanged, only what it falls back to. `q_error_fraction`/
+  `q_error_floor_kg_kg`/`q_error_g_kg` removed from `_RAOBS_CONFIG_KEYS`
+  and their validation; new `q_error_rh_percent` (`{hPa: percent}` table,
+  merged over `RAOBS_Q_ERROR_RH_PERCENT` the same way `error_std`
+  overrides `RAOBS_TUV_ERROR_STD`) added.
+- `configs/config.yml.template`: both tables rewritten with the new
+  source and numbers; the q section rewritten to explain the RH*qsat
+  mechanism and why it isn't a fraction-of-observed-value scheme.
+
+**Testing**: `tests/unit/test_raobs_parquet.py` -- default q error
+matches a hand-computed RH-percent-table-interpolated-times-qsat value;
+absent entirely when no table is given; coexists correctly with
+`source_error_q` when both `use_source_error` and `q_error_rh_percent`
+are set (independent fields, the override happens downstream).
+`tests/unit/test_solver_helpers.py` -- the three hand-built `raobs_traj`
+fixtures that used `error_q_fraction`/`error_q_floor` rewritten to set
+`default_error_q` directly (same asserted numeric behavior, new field
+name). `tests/unit/test_config.py` -- new `q_error_rh_percent` table
+accepted/resolved and its own invalid-value rejection, mirroring
+`error_std`'s existing tests. `make check` and `make check-ace2` both
+pass (the mini-ACE2 fixture doesn't enable `specific_humidity` for raobs
+at all, so is unaffected either way).
+
+**Known, deliberately unaddressed consequence**: the four `-t1`/`-t2`-family
+longcyc configs that explicitly set `q_error_g_kg`/`q_error_fraction`/
+`q_error_floor_kg_kg` (gitignored, not tracked -- `config_test_*-longcyc-
+*.yml`) now fail `_RAOBS_CONFIG_KEYS`'s unknown-key validation. Checked
+what they actually contain before leaving them alone (at the user's
+explicit request, "ignore the longcyc yamls for now"): the four ACE2
+configs never actually exercised these keys at all (ACE2's raobs
+variables exclude `specific_humidity` per the existing total-water
+caveat); the four AIFS2 configs' values exactly matched the OLD defaults
+(not customized), so removing the three lines would be a real behavior
+change for q on any future rerun (old saved outputs are unaffected). Not
+fixed -- these 3 lines in each of the 8 files are what would need
+removing whenever this is picked back up.
+
+## Raob station pressure: confirmed assimilated in both GSI and JEDI, not implemented here (2026-11-19)
+
+Follow-up question from the GSI table above: jswhit's posted table has a
+`ps` column (flat `0.70` hPa at every level) -- is that usable for this
+repo's existing `observations.psobs.error_std_hpa`? **No** -- that table
+is explicitly GSI's radiosonde (kx 120/220/221) error table, and its `ps`
+column is the error for **the raob's own station pressure**, reported
+alongside its profile. This repo's `psobs` reads a completely different
+PREPBUFR class/kx entirely (ADPSFC/SFCSHP, 180/181/187) -- unrelated
+observations, not interchangeable sources. (Separately, and still open
+from an earlier session: `psobs.error_std_hpa` could be tightened using
+kx 180/181/187's OWN real `prepobs_errtable.global` PS values, `1.3/1.1/
+1.2` mb respectively -- a different, already-identified number, not this
+one.)
+
+**Checked whether GSI/JEDI actually assimilate the raob's own station
+pressure at all** (this repo currently doesn't -- `RAOBS_VARIABLE_MODEL_
+BASE` only maps `temperature`/`u_component_of_wind`/`v_component_of_wind`/
+`specific_humidity`, no station-pressure option exists). Confirmed yes,
+via a real, CI-exercised NOAA-EMC RDASApp config:
+`parm/jcb-rdas/observations/atmosphere/adpupa_stationPressure_120.yaml.j2`
+(part of the same RRFS/JEDI pipeline the q config above came from --
+shows up in that repo's own `rrfs-fv3jedi-*-analysis.ref`/`-conv-upperair.
+ref` regression-test outputs, so genuinely exercised, not dead config).
+Its filter-step comments cite real GSI routines by name (`setupps.f90`,
+`read_prepbufr.f90`), confirming this mirrors actual GSI behavior:
+- **Forward operator**: `SfcCorrected` (`correction scheme to use: GSL`)
+  -- a genuine terrain-height correction using `GeoVaLs/geopotential_
+  height`/`geopotential_height_at_surface` and the observed temperature,
+  the same conceptual role this repo's own `preduce`/`get_surface_
+  pressure` elevation reduction already plays for `psobs`.
+- **Error table**: a 33-point `ObsErrorModelStepwiseLinear` in Pa --
+  `68.115` Pa (~0.68 hPa) at the surface, growing smoothly to `577.03` Pa
+  (~5.77 hPa) by 50 hPa, then literally `1E11` (effectively infinite,
+  i.e. switched off) above that -- station pressure is a surface-only
+  quantity, and GSI's real table encodes that by disabling it entirely
+  at upper levels rather than using one flat value everywhere the way
+  jswhit's quick-reference table's single `0.70` number would suggest.
+- Further `ObsErrorFactorSfcPressure` terrain-mismatch inflation (the
+  same function the real `psobs`-equivalent config uses) plus the usual
+  quality-mark/low-pressure x1.2 inflation and gross-error/bounds checks.
+
+**Not implemented here, and not scoped yet**: this would be a genuinely
+new raobs capability (a new variable, a new forward-operator path
+deciding on an equivalent terrain-correction operator, a new error
+table sourced from this RDASApp config rather than jswhit's single flat
+number), not a tweak to something existing -- flagged as a candidate
+future addition if/when picked up, deliberately not scoped further this
+session.
