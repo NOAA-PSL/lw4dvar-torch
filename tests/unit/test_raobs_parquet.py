@@ -344,75 +344,10 @@ def test_station_capacity_overflow_raises(tmp_path):
         load(tmp_path, [t0], {'t': [850.]}, ['t'], station_capacity=1)
 
 
-def test_use_source_error_disabled_omits_source_error_key(tmp_path):
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, temperature_error=0.8, wind_error=1.4)])
-    data = load(tmp_path, [t0], {'t': [850.], 'u': [850.]}, ['t', 'u'])
-    assert 'source_error_t' not in data
-    assert 'source_error_u' not in data
-
-
-def test_use_source_error_read_and_fallback_when_missing(tmp_path):
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(
-        tmp_path, t0,
-        [report(1, time=t0, station_id='A'), report(2, time=t0, station_id='B')],
-        [
-            level(1, pressure=850., temperature_error=0.8, wind_error=1.4),
-            level(2, pressure=850., temperature_error=None, wind_error=None, level_index=0),
-        ],
-    )
-    data = load(tmp_path, [t0], {'t': [850.], 'u': [850.]}, ['t', 'u'], use_source_error=True)
-    # Both stations share lat/lon/elev defaults, so station order follows
-    # station_key (sid-based): 'sid:S1' < 'sid:S2' -> index 0 is report 1.
-    assert data['source_error_t'][0][0, 0] == pytest.approx(0.8)
-    assert data['source_error_u'][0][0, 0] == pytest.approx(1.4)
-    assert np.isnan(data['source_error_t'][0][0, 1])
-    assert np.isnan(data['source_error_u'][0][0, 1])
-
-
-def test_use_source_error_nonpositive_treated_as_missing(tmp_path):
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature_error=0.)])
-    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_source_error=True)
-    assert np.isnan(data['source_error_t'][0][0, 0])
-
-
-def test_use_source_error_wind_shared_between_u_and_v(tmp_path):
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., wind_error=1.6)])
-    data = load(tmp_path, [t0], {'u': [850.], 'v': [850.]}, ['u', 'v'], use_source_error=True)
-    assert data['source_error_u'][0][0, 0] == pytest.approx(1.6)
-    assert data['source_error_v'][0][0, 0] == pytest.approx(1.6)
-
-
-def test_use_source_error_q_converted_via_static_background_qsat(tmp_path):
-    # humidity_error_tenths_percent is percent/10 (confirmed against
-    # convert_prepbufr_to_parquet.py's own field metadata): 2.0 -> 20% RH.
-    # background_temperature is Celsius (the column's own name/convention,
-    # matching background_temperature_c) -- 20 C == 293.15 K.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
-        1, pressure=850., humidity_error_tenths_percent=2.0,
-        background_temperature=20., background_pressure=1000.,
-    )])
-    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], use_source_error=True)
-    expected = 0.20 * _saturation_specific_humidity(293.15, 1000.)
-    assert data['source_error_q'][0][0, 0] == pytest.approx(expected, rel=1e-6)
-    assert expected > 0.  # sanity: a real kg/kg magnitude, not degenerate
-
-
-def test_use_source_error_q_missing_background_is_nan(tmp_path):
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850.)])  # no background_*/QOE
-    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], use_source_error=True)
-    assert np.isnan(data['source_error_q'][0][0, 0])
-
-
 def test_default_q_error_rh_percent_times_static_qsat(tmp_path):
-    # GSI's real q-error mechanism (RH_fraction * qsat(background), per
-    # jswhit's PR #29 review comment), independent of use_source_error --
-    # the table is interpolated (ln p) to the level's own real pressure.
+    # GSI/UFO's real q-error mechanism (RH_fraction * qsat(background),
+    # per jswhit's PR #29 review comment) -- the table is interpolated
+    # (ln p) to the level's own real pressure.
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
         1, pressure=850., background_temperature=20., background_pressure=1000.,
@@ -432,150 +367,6 @@ def test_default_q_error_absent_without_table(tmp_path):
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850.)])
     data = load(tmp_path, [t0], {'q': [850.]}, ['q'])
     assert 'default_error_q' not in data
-
-
-def test_default_q_error_and_source_error_q_coexist(tmp_path):
-    # Both use_source_error and q_error_rh_percent can be set together --
-    # the default (table) and the archive source value are independent
-    # fields; get_raobs/the forward operator decide the override.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
-        1, pressure=850., humidity_error_tenths_percent=2.0,
-        background_temperature=20., background_pressure=1000.,
-    )])
-    data = load(
-        tmp_path, [t0], {'q': [850.]}, ['q'],
-        use_source_error=True, q_error_rh_percent={1000.: 15.},
-    )
-    expected_default = 0.15 * _saturation_specific_humidity(293.15, 1000.)
-    expected_source = 0.20 * _saturation_specific_humidity(293.15, 1000.)
-    assert data['default_error_q'][0][0, 0] == pytest.approx(expected_default, rel=1e-6)
-    assert data['source_error_q'][0][0, 0] == pytest.approx(expected_source, rel=1e-6)
-
-
-def test_use_source_error_t_not_clamped_to_gsi_bounds(tmp_path):
-    # GSI's own ermin/ermax (1.3-5.6 K for T) only clamp the gross-check
-    # comparison (long_window_4dvar_utils.py), never source_error_t itself
-    # -- confirmed by reading GSI's setupq.f90 directly: the ermin/ermax-
-    # clamped `obserror` there never feeds the actual Jo weight, only a
-    # later diagnostic. A raw archive value outside that range (e.g. 0.8 K
-    # at 850 hPa, the real archive's own mid-troposphere value) must come
-    # through unmodified -- that's the whole point of reading the real
-    # per-level table instead of a flat constant.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature_error=0.8)])
-    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_source_error=True)
-    assert data['source_error_t'][0][0, 0] == pytest.approx(0.8)
-
-
-def test_use_source_error_q_qsat_exposed_alongside_source_error(tmp_path):
-    # source_qsat_q lets the gross check (long_window_4dvar_utils.py)
-    # derive GSI's RH-percent ermin/ermax bounds in kg/kg later, without
-    # the read-time conversion itself being clamped.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
-        1, pressure=850., humidity_error_tenths_percent=2.0,
-        background_temperature=20., background_pressure=1000.,
-    )])
-    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], use_source_error=True)
-    expected_qsat = _saturation_specific_humidity(293.15, 1000.)
-    assert data['source_qsat_q'][0][0, 0] == pytest.approx(expected_qsat, rel=1e-6)
-
-
-def test_use_source_error_q_qsat_nan_when_background_missing(tmp_path):
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850.)])  # no background_*/QOE
-    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], use_source_error=True)
-    assert np.isnan(data['source_qsat_q'][0][0, 0])
-
-
-def test_use_source_error_q_qsat_withheld_when_qoe_missing_but_background_valid(tmp_path):
-    # QOE (humidity_error_tenths_percent) missing/invalid, but
-    # background_temperature/background_pressure ARE valid -- qsat itself
-    # would convert fine, but with no RH-error to pair it with,
-    # source_error_q ends up NaN. source_qsat_q must ALSO stay NaN here,
-    # not expose a "valid" qsat alongside a missing source error: the
-    # forward operator's ermin/ermax clamp assumes the two are valid
-    # together (PR #29's review).
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
-        1, pressure=850., humidity_error_tenths_percent=None,
-        background_temperature=20., background_pressure=1000.,
-    )])
-    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], use_source_error=True)
-    assert np.isnan(data['source_error_q'][0][0, 0])
-    assert np.isnan(data['source_qsat_q'][0][0, 0])
-
-
-def test_use_source_error_t_inflated_for_suspect_quality_mark(tmp_path):
-    # GSI's x1.2 inflation for quality mark 3 or 7 (suspect, not
-    # rejected) -- quality_mark_max defaults to 3, so this ob still
-    # passes QC (mask_t True) while its error is inflated.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        level(1, pressure=500., temperature=-20., temperature_error=1.0, temperature_quality=3)])
-    data = load(tmp_path, [t0], {'t': [500.]}, ['t'], use_source_error=True)
-    assert data['source_error_t'][0][0, 0] == pytest.approx(1.2)
-    assert data['mask_t'][0][0, 0]
-
-
-def test_use_source_error_t_not_inflated_for_good_quality_mark(tmp_path):
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        level(1, pressure=500., temperature_error=1.0, temperature_quality=1)])
-    data = load(tmp_path, [t0], {'t': [500.]}, ['t'], use_source_error=True)
-    assert data['source_error_t'][0][0, 0] == pytest.approx(1.0)
-
-
-def test_use_source_error_t_inflated_above_100hpa(tmp_path):
-    # GSI's x1.2 inflation for T above 100 hPa (ppb < r100 in
-    # read_prepbufr.F90) -- independent of quality mark.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        level(1, pressure=50., temperature_error=1.0, temperature_quality=1)])
-    data = load(tmp_path, [t0], {'t': [50.]}, ['t'], use_source_error=True)
-    assert data['source_error_t'][0][0, 0] == pytest.approx(1.2)
-
-
-def test_use_source_error_t_inflation_factors_multiply(tmp_path):
-    # Both triggers at once (qm=7, above 100 hPa) -> x1.2 x1.2 = x1.44.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        level(1, pressure=50., temperature_error=1.0, temperature_quality=7)])
-    data = load(tmp_path, [t0], {'t': [50.]}, ['t'], use_source_error=True)
-    assert data['source_error_t'][0][0, 0] == pytest.approx(1.0 * 1.2 * 1.2)
-
-
-def test_use_source_error_wind_inflated_above_50hpa_not_t_threshold(tmp_path):
-    # Wind's pressure threshold is 50 hPa, not T's 100 hPa -- 70 hPa is
-    # below T's threshold but NOT below wind's, so wind must stay
-    # uninflated there.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        level(1, pressure=70., wind_error=2.0, wind_quality=1)])
-    data = load(tmp_path, [t0], {'u': [70.]}, ['u'], use_source_error=True)
-    assert data['source_error_u'][0][0, 0] == pytest.approx(2.0)
-
-    write_cycle(
-        tmp_path / 'below50', datetime(2015, 1, 1, 0),
-        [report(1, time=t0)], [level(1, pressure=30., wind_error=2.0, wind_quality=1)],
-    )
-    data2 = load(tmp_path / 'below50', [t0], {'u': [30.]}, ['u'], use_source_error=True)
-    assert data2['source_error_u'][0][0, 0] == pytest.approx(2.0 * 1.2)
-
-
-def test_use_source_error_q_inflated_for_suspect_quality_mark_no_pressure_trigger(tmp_path):
-    # q gets the same quality-mark inflation as t/u/v, but GSI has no
-    # pressure-based inflation for q -- even at a very low pressure
-    # (here 10 hPa), only the quality-mark factor applies.
-    t0 = datetime(2015, 1, 1, 0)
-    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
-        1, pressure=10., humidity_error_tenths_percent=2.0, humidity_quality=3,
-        background_temperature=20., background_pressure=1000.,
-    )])
-    data = load(tmp_path, [t0], {'q': [10.]}, ['q'], use_source_error=True)
-    expected = 1.2 * 0.20 * _saturation_specific_humidity(293.15, 1000.)
-    assert data['source_error_q'][0][0, 0] == pytest.approx(expected, rel=1e-6)
 
 
 def test_physical_bounds_qc_rejects_impossible_temperature(tmp_path):
@@ -612,6 +403,37 @@ def test_physical_bounds_qc_rejects_impossible_wind(tmp_path):
     data = load(tmp_path, [t0], {'u': [850.], 'v': [850.]}, ['u', 'v'])
     assert not data['mask_u'][0][0, 0]
     assert data['mask_v'][0][0, 0]  # v (-5 m/s) is unaffected by u's own rejection
+
+
+def test_physical_bounds_override_widens_a_variable(tmp_path):
+    # 573 K (300 C) fails the default T bound (195-327 K) -- test_physical_
+    # bounds_qc_rejects_impossible_temperature above -- but an explicit,
+    # wider override for 't' alone must rescue it.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=300.)])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], physical_bounds={'t': (100., 600.)})
+    assert data['mask_t'][0][0, 0]
+
+
+def test_physical_bounds_override_replaces_wholesale_at_this_layer(tmp_path):
+    # load_raobs_parquet itself does no per-variable merging with the
+    # default table (that happens one layer up, in get_raobs -- see
+    # test_config.py's test_get_raobs_physical_bounds_merged_per_variable)
+    # -- a variable not present in an explicitly-given dict gets NO bound
+    # check at all here, same as q_error_rh_percent's own "replace
+    # wholesale, don't merge" contract.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., q=50000.)])  # 0.05 kg/kg
+    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], physical_bounds={'t': (100., 600.)})
+    assert data['mask_q'][0][0, 0]  # no 'q' entry in the given dict -> unchecked here
+
+
+def test_physical_bounds_override_narrows_a_variable(tmp_path):
+    # A narrower override must reject a value the default would accept.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=15.)])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], physical_bounds={'t': (300., 327.)})
+    assert not data['mask_t'][0][0, 0]
 
 
 def test_use_drift_time_assigns_each_level_to_its_own_slot(tmp_path):

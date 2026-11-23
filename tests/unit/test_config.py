@@ -103,6 +103,15 @@ def test_missing_file_returns_none(tmp_path):
     ({'observations': {'psobs': {'path': './psobs'},
                        'raobs': {'enabled': True, 'vertical_interpolation': 'bogus'}}},
      r"observations.raobs.vertical_interpolation must be 'exact', 'nearest', or 'log-linear', got 'bogus'"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'physical_bounds': {'z': [0., 1.]}}}},
+     r"observations.raobs.physical_bounds keys must be a subset of .*got \['z'\]"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'physical_bounds': {'t': 195.}}}},
+     r"observations.raobs.physical_bounds\['t'\] must be a 2-element \[min, max\]"),
+    ({'observations': {'psobs': {'path': './psobs'},
+                       'raobs': {'enabled': True, 'physical_bounds': {'t': [327., 195.]}}}},
+     r"observations.raobs.physical_bounds\['t'\] must be finite with min < max"),
 ])
 def test_invalid_configs_rejected(tmp_path, exp, match):
     with pytest.raises(ValueError, match=match):
@@ -130,7 +139,8 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
             'raobs': {
                 'enabled': True, 'variables': ['temperature', 'u_component_of_wind'],
                 'quality_mark_max': 2, 'q_bg_check': None, 'tuv_bg_check': 3.5,
-                'use_source_error': True, 'use_drift_time': True, 'use_drift_position': True,
+                'use_drift_time': True, 'use_drift_position': True,
+                'physical_bounds': {'t': [100., 400.]},
             },
         },
     ))
@@ -139,7 +149,7 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
     assert exp['raobs_quality_mark_max'] == 2
     assert exp['raobs_q_bg_check'] is None
     assert exp['raobs_tuv_bg_check'] == 3.5
-    assert exp['raobs_use_source_error'] is True
+    assert exp['raobs_physical_bounds'] == {'t': [100., 400.]}
     assert exp['raobs_use_drift_time'] is True
     assert exp['raobs_use_drift_position'] is True
     assert exp['raobs_path'] == exp['obspath']  # defaults to psobs's resolved path
@@ -338,6 +348,45 @@ def test_get_raobs_q_error_rh_percent_table_not_merged_with_defaults(tmp_path):
     expected_rh_fraction = np.interp(math.log(850.), tp, tv) / 100.
     expected = expected_rh_fraction * _saturation_specific_humidity(293.15, 1000.)
     assert raobs_traj['default_error_q'].item() == pytest.approx(expected, rel=1e-6)
+
+
+def test_get_raobs_physical_bounds_merged_per_variable(tmp_path):
+    """Unlike q_error_rh_percent's pressure-knot table, each
+    observations.raobs.physical_bounds entry is a complete, self-
+    contained [min, max] -- get_raobs merges a configured override
+    per-variable-key with the default table (_RAOBS_PHYSICAL_BOUNDS),
+    rather than replacing it wholesale: overriding 't' alone must leave
+    'q's own default bound (<=0.035 kg/kg) untouched."""
+    import numpy as np
+    import torch
+    from datetime import datetime
+    from test_raobs_parquet import write_cycle, report, level
+
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., temperature=300., q=50000.)])  # 573 K, 0.05 kg/kg
+
+    class FakeModel:
+        device = torch.device('cpu')
+
+        def pressure_levels(self, base):
+            return np.array([850.], dtype=np.float32)
+
+    class FakeGridInterp:
+        def weights(self, lon, lat, k=4, device=None):
+            return torch.zeros(k, dtype=torch.int64), torch.full((k,), 1. / k)
+
+    exp = {
+        'raobs_enabled': True, 'raobs_variables': ['temperature', 'specific_humidity'],
+        'dt_obs': 6, 'date': '2015-01-01T00', 'raobs_path': str(tmp_path), 'obspath': str(tmp_path),
+        'raobs_physical_bounds': {'t': [100., 600.]},
+    }
+    raobs_traj = utils.get_raobs(
+        exp, FakeModel(), utils.get_logger(), FakeGridInterp(),
+        {'step_lo': [0], 'alpha': [0.0], 'n_steps': 1},
+    )
+    assert raobs_traj['mask_t'].item()  # 573 K rescued by the widened override
+    assert not raobs_traj['mask_q'].item()  # q's default bound (<=0.035 kg/kg) still applies
 
 
 def test_ace2_defaults_to_ps_native(tmp_path):

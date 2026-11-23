@@ -1788,3 +1788,114 @@ regression test (`tests/unit/test_solver_helpers.py`,
   ermin/ermax clamp (keyed off `source_qsat_q`'s presence) assumes never
   happens. `load_raobs_parquet` now only records `source_qsat_q` where
   the corresponding `source_error_q` cell is already finite.
+
+## Simplifying raobs to JEDI-only: removed `use_source_error`, GSI's ermin/ermax clamp, and GSI's x1.2 inflation (2026-11-23)
+
+Follow-up to the GSI-vs-JEDI comparison work above (the "raobs QC/thinning
+vs. GSI's actual implementation", "GSI's ermin/ermax gross-check clamp",
+and "GSI's x1.2 error inflation" sections), prompted by the user's explicit
+goal of keeping this repo's raobs implementation JEDI-consistent rather
+than tracking two reference systems (GSI and JEDI/UFO) with genuinely
+different, sometimes incompatible mechanisms. Scoped first (not changed
+blind), confirming against the real `JCSDA/ufo` source (not memory) that
+the three removed pieces have no JEDI counterpart:
+
+- **`observations.raobs.use_source_error`** (the archive's own embedded
+  PREPBUFR TOE/WOE/QOE value) -- removed entirely. GSI itself reads this
+  value then unconditionally overwrites it from `prepobs_errtable.global`
+  before assimilating (confirmed directly in `read_prepbufr.F90`, see the
+  "Correction" section above); it has no JEDI/UFO equivalent either --
+  `ufo`'s own error filters (`ObsErrorModelHumidity`/
+  `ObsErrorModelStepwiseLinear`) always derive error from a table plus
+  the background, never from an embedded observation-file value.
+- **GSI's ermin/ermax gross-check clamp** (`RAOBS_TUV_ERMIN`/`ERMAX`,
+  `RAOBS_Q_ERMIN_PERCENT`/`ERMAX_PERCENT`) -- removed. This was only ever
+  reachable when `use_source_error` was in effect, so it's dead code once
+  that's gone; it was also never found anywhere in `ufo`'s real gross-
+  check filter (`BackgroundCheck`), which bounds the *innovation* with an
+  absolute limit instead of clamping the *error value* the way GSI's
+  `setupq.f90` does -- a genuinely different mechanism, not a stand-in.
+- **GSI's x1.2 quality-mark/pressure error inflation**
+  (`_gsi_inflate_error` in `raobs_parquet.py`) -- removed. Also only ever
+  reachable under `use_source_error`; no equivalent trigger (quality-mark-
+  3/7, or above a fixed pressure) was found in `ufo`'s own sonde QC
+  reference config (`sonde_gfs_qc.yaml`)'s active filter list.
+
+**Kept unchanged, confirmed JEDI-consistent**: `vertical_interpolation`
+(`'log-linear'` is a direct port of `ufo::VertInterp`'s own bracket/clamp-
+to-edge logic, confirmed against `vert_interp.F90` directly), the
+`error_std`/`q_error_rh_percent` tables and the RH-fraction-times-qsat-
+from-background q error mechanism (matches `ufo`'s own
+`ObsErrorModelHumidity`, confirmed by reading `ObsErrorModelHumidity.cc`
+directly), `bg_check`'s per-variable `{threshold, absolute}` form (UFO's
+own `BackgroundCheck` shape), and `QC_PHYSICAL_BOUNDS` (UFO's own sonde
+config numbers).
+
+**Left as-is, deliberately not touched this pass**: no thinning,
+`quality_mark_max` (both already confirmed JEDI-consistent too --
+`sonde_gfs_qc.yaml` has no thinning filter, and a commented-out `PreQC`
+filter there uses the identical `maxvalue: 3` threshold), the virtual-to-
+sensible-temperature conversion (`sensible_temperature`, confirmed to have
+no equivalent inside `ufo` itself -- any such conversion in a real JEDI
+pipeline happens upstream, in `ioda-converters`, not checked further here),
+and the height-bound/non-monotonic-height/below-station QC (this repo's
+own addition; `ufo`'s own `ConventionalProfileProcessing` filter covers
+a related but much larger scope -- hydrostatic/superadiabatic/sign-change
+checks -- and isn't invoked by the GSI-replicating reference config this
+repo has anchored its comparisons on, so porting it was judged out of
+scope for this pass). `use_drift_time`/`use_drift_position` are also left
+as-is -- JEDI's own `ProfileHorizontalDrift` derives drift from wind via a
+formula, while this repo reads the archive's own precomputed drift
+columns directly; a different implementation of the same correction, not
+a GSI-only mechanism, so nothing to remove.
+
+**Fallout**: `configs/config.yml.template`'s `use_source_error`/ermin-
+ermax-clamp comments removed; `tests/unit/test_config.py`,
+`tests/unit/test_raobs_parquet.py`, `tests/unit/test_solver_helpers.py`
+had their `use_source_error`/clamp/inflation-specific tests removed
+(coverage for the surviving `error_std`-table-as-tensor path kept via a
+new, narrower test); `tests/ace2/mini_ace2.py`'s explicit
+`'use_source_error': False` (already redundant with the default) dropped,
+with `tests/data/golden/mini_ace2.json`'s config echo updated to match.
+`make check` (285 passed) and `make check-ace2` both pass.
+
+**Not reopened**: the four already-run long-cycling experiments
+(`-ps_raobs-t1` through `-t4`) are unaffected -- all four explicitly set
+`use_source_error: False` already (confirmed before removing the key), so
+none of the removed code paths were ever exercised for them.
+
+## `observations.raobs.physical_bounds`: made configurable (2026-11-23)
+
+`_RAOBS_PHYSICAL_BOUNDS` (`raobs_parquet.py`) was a hardcoded Python dict
+with no config path at all -- the only stated reason was "fixed constants,
+like the ermin/ermax clamp" (the "PR #29 review comment" section above),
+an analogy that no longer has a partner now that the ermin/ermax clamp
+itself was removed above. Every other GSI/JEDI-sourced default in this
+schema (`error_std`, `q_error_rh_percent`, `bg_check`) is configurable;
+this one was the odd one out, with no principled reason it needed to stay
+fixed.
+
+**Added `observations.raobs.physical_bounds`**: an optional `{base: [min,
+max]}` override, defaulting to today's values (same as UFO's sonde
+`Bounds Check` filters). `load_raobs_parquet`/`_profile_records`
+(`raobs_parquet.py`) gained a `physical_bounds=None` parameter (None keeps
+`_RAOBS_PHYSICAL_BOUNDS`, used at both duplicate-selection time and the
+final QC flag); `get_raobs` (`long_window_4dvar_utils.py`) merges a
+configured override **per-variable-key** with the default
+(`{**_RAOBS_PHYSICAL_BOUNDS, **(exp.get('raobs_physical_bounds') or {})}`)
+-- unlike `q_error_rh_percent`'s pressure-knot table (where a partial
+merge was the actual bug PR #29's review caught), each `physical_bounds`
+entry is a complete, self-contained `[min, max]` pair, so overriding one
+variable and leaving the others at their default is the correct,
+intended behavior here, not a hazard to guard against.
+
+Validated at config-load time like `bg_check`: keys must be a subset of
+`('t', 'u', 'v', 'q')`, each value a 2-element `[min, max]` with
+`min < max`, both finite. `configs/config.yml.template` documents the
+default explicitly. Tests: `tests/unit/test_raobs_parquet.py` (a widened
+override rescues a value the default would reject; a narrowed one rejects
+one the default would accept; confirms `load_raobs_parquet` itself does
+no per-variable merging -- that's `get_raobs`'s job), `tests/unit/
+test_config.py` (the per-variable merge, via a real `get_raobs` call; the
+three new validation-rejection cases). `make check` (292 passed) and
+`make check-ace2` both pass.

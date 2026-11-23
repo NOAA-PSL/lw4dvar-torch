@@ -319,89 +319,6 @@ def test_raobs_tuv_bg_check_does_not_override_read_time_qc():
     assert used.tolist() == [[True, False]]
 
 
-def test_raobs_source_error_tensor_used_per_station():
-    # error_t as a per-(obs, level, station) tensor (use_source_error: True
-    # in get_raobs) instead of the flat float every other test here uses --
-    # same |O-B|=3.0 at both stations, but station 0's tight source error
-    # (0.5 -> 4-sigma threshold 2.0) fails the check while station 1's
-    # looser one (2.0 -> threshold 8.0) passes it, proving effective_error
-    # is actually read per-station, not broadcast from a single scalar.
-    raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=1.0, tuv_bg_check=4.0)
-    raobs_traj['error_t'] = torch.as_tensor([[[0.5, 2.0]]])
-    # Wide enough to not affect this test's own numbers -- real get_raobs
-    # output always sets these whenever error_t is a tensor; see the GSI
-    # ermin/ermax clamp tests below for their actual effect.
-    raobs_traj['ermin_t'], raobs_traj['ermax_t'] = 0.01, 100.0
-    results = utils._compute_raobs_observation_diagnostics_at_time(
-        None, {'t': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
-    _, _, effective_error, used = results['t']
-    assert effective_error.tolist() == [[0.5, 2.0]]
-    assert used.tolist() == [[False, True]]
-
-
-def test_raobs_source_error_q_overrides_default_error_when_finite():
-    # q has no single flat fallback (unlike t/u/v) -- source_error_q
-    # overrides the default (RH_fraction * qsat) error per element,
-    # falling back to it wherever the archive had no valid source value
-    # (NaN).
-    background = torch.zeros(1, 2)
-    raobs_traj = {
-        'variables': ['q'],
-        'interp_idx': [None], 'interp_wts': [None],
-        'values_q': torch.as_tensor([[[0.01, 0.01]]], dtype=torch.float32),
-        'mask_q': torch.as_tensor([[[True, True]]]),
-        'default_error_q': torch.as_tensor([[[0.002, 0.002]]]),
-        'source_error_q': torch.as_tensor([[[0.005, float('nan')]]]),
-        'q_bg_check': None,
-    }
-    results = utils._compute_raobs_observation_diagnostics_at_time(
-        None, {'q': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
-    _, _, effective_error, _ = results['q']
-    assert effective_error[0, 0].item() == pytest.approx(0.005)  # overridden
-    assert effective_error[0, 1].item() == pytest.approx(0.002)  # default fallback
-
-
-def test_raobs_tuv_gsi_ermin_ermax_clamps_gross_check_not_the_weight():
-    # Confirmed by reading GSI's setupq.f90 directly: the ermin/ermax
-    # clamp there never feeds the actual Jo weight, only the gross-check
-    # decision. error_t raw = 0.5 (below the test ermin=1.0): unclamped,
-    # bg_check=4 * 0.5 = 2.0 < |O-B|=3.0 would reject; GSI's clamp raises
-    # the COMPARISON's denominator to ermin=1.0 (4*1.0=4.0 >= 3.0, passes)
-    # while effective_error (the weight) stays the real, unclamped 0.5.
-    raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=1.0, tuv_bg_check=4.0)
-    raobs_traj['error_t'] = torch.as_tensor([[[0.5, 0.5]]])
-    raobs_traj['is_source_error_t'] = torch.as_tensor([[[True, True]]])
-    raobs_traj['ermin_t'] = 1.0
-    raobs_traj['ermax_t'] = 2.0
-    results = utils._compute_raobs_observation_diagnostics_at_time(
-        None, {'t': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
-    _, _, effective_error, used = results['t']
-    assert effective_error.tolist() == [[0.5, 0.5]]
-    assert used.tolist() == [[True, True]]
-
-
-def test_raobs_tuv_gsi_clamp_is_per_cell_not_whole_variable():
-    # Station 0's error_t fell back to error_std (no archive value at
-    # that cell -- is_source_error_t False there) even though station 1's
-    # DID come from the archive (True there) -- both stations share one
-    # use_source_error: True variable. The clamp (ermin=1.0) must only
-    # raise the gross-check denominator for station 1, not station 0's
-    # fallback value, even though both have the same raw error (0.5).
-    raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=1.0, tuv_bg_check=4.0)
-    raobs_traj['error_t'] = torch.as_tensor([[[0.5, 0.5]]])
-    raobs_traj['is_source_error_t'] = torch.as_tensor([[[False, True]]])
-    raobs_traj['ermin_t'] = 1.0
-    raobs_traj['ermax_t'] = 2.0
-    results = utils._compute_raobs_observation_diagnostics_at_time(
-        None, {'t': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
-    _, _, effective_error, used = results['t']
-    # effective_error (the Jo weight) is unclamped at both, as always.
-    assert effective_error.tolist() == [[0.5, 0.5]]
-    # station 0 (fallback, not clamped): 4*0.5=2.0 < |O-B|=3.0 -> rejected.
-    # station 1 (archive, clamped to ermin=1.0): 4*1.0=4.0 >= 3.0 -> passes.
-    assert used.tolist() == [[False, True]]
-
-
 def test_raobs_effective_error_nonfinite_rejected_even_with_bg_check_disabled():
     # A missing archived background can leave q's default AND source
     # error both NaN at read time -- with no bg_check configured to
@@ -430,48 +347,6 @@ def test_raobs_effective_error_nonpositive_rejected():
     assert used.tolist() == [[False, False]]
 
 
-def test_raobs_tuv_clamp_not_applied_to_flat_error_std():
-    # error_t a flat float (use_source_error: False) -- GSI's clamp must
-    # not touch this repo's own deliberately-chosen flat error_std.
-    raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=0.5, tuv_bg_check=4.0)
-    raobs_traj['ermin_t'] = 1.0
-    raobs_traj['ermax_t'] = 2.0
-    results = utils._compute_raobs_observation_diagnostics_at_time(
-        None, {'t': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
-    _, _, _, used = results['t']
-    # Unclamped: bg_check=4 * 0.5 = 2.0 < |O-B|=3.0 -> rejected at both.
-    assert used.tolist() == [[False, False]]
-
-
-def test_raobs_q_gsi_ermin_ermax_clamps_gross_check_not_the_weight():
-    # station 0 has a real source value and qsat; station 1 has neither
-    # (falls back to the default RH_fraction*qsat error, which has
-    # nothing GSI-sourced to clamp against).
-    background = torch.zeros(1, 2)
-    raobs_traj = {
-        'variables': ['q'],
-        'interp_idx': [None], 'interp_wts': [None],
-        'values_q': torch.as_tensor([[[0.003, 0.003]]], dtype=torch.float32),
-        'mask_q': torch.as_tensor([[[True, True]]]),
-        'default_error_q': torch.as_tensor([[[0.0006, 0.0006]]]),
-        'source_error_q': torch.as_tensor([[[0.0005, float('nan')]]]),
-        'source_qsat_q': torch.as_tensor([[[0.01, float('nan')]]]),
-        'q_bg_check': 4.0,
-    }
-    results = utils._compute_raobs_observation_diagnostics_at_time(
-        None, {'q': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
-    _, _, effective_error, used = results['q']
-    # effective_error (the Jo weight) is unclamped: 0.0005 (overridden by
-    # the source value) and 0.0006 (the default fallback).
-    assert effective_error[0, 0].item() == pytest.approx(0.0005)
-    assert effective_error[0, 1].item() == pytest.approx(0.0006)
-    # station 0: unclamped, bg_check=4*0.0005=0.002 < |O-B|=0.003 would
-    # reject; GSI's clamp raises the comparison to ermin=10%*qsat=0.001
-    # (4*0.001=0.004 >= 0.003, passes). station 1: no qsat -> unclamped
-    # default error used, 4*0.0006=0.0024 < 0.003 -> rejected.
-    assert used.tolist() == [[True, False]]
-
-
 def test_interp_level_table_matches_entries_and_holds_beyond_range():
     # Same ln(p)-interpolation convention raobs uses throughout
     # (error_std tables): exact at table
@@ -485,23 +360,18 @@ def test_interp_level_table_matches_entries_and_holds_beyond_range():
     assert out[4] == pytest.approx(1.2)   # below the table's own range
 
 
-def test_raobs_tuv_error_std_table_without_source_error_is_not_clamped():
-    # error_t a per-level TABLE tensor (a user-configured error_std table,
-    # e.g. the UFO/GSI sonde table from PR #29's review comment) with NO
-    # archive source error (is_source_error_t unset/False) -- torch.
-    # is_tensor(error_t) is True, but GSI's ermin/ermax clamp must still
-    # NOT apply (it's for the genuine archive value only, not a
-    # deliberately-configured table standing in for it).
+def test_raobs_error_std_table_tensor_used_per_level():
+    # error_t a per-level TABLE tensor (a user-configured error_std
+    # table, e.g. the UFO/GSI sonde table from PR #29's review comment),
+    # broadcast across every obs/station -- confirms effective_error is
+    # read correctly from a tensor, not just a flat float.
     raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=1.0, tuv_bg_check=4.0)
-    raobs_traj['error_t'] = torch.as_tensor([[[0.5, 0.5]]])  # a "table", not a source error
-    raobs_traj['ermin_t'], raobs_traj['ermax_t'] = 1.0, 2.0
+    raobs_traj['error_t'] = torch.as_tensor([[[0.5, 0.5]]])
     results = utils._compute_raobs_observation_diagnostics_at_time(
         None, {'t': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
     _, _, effective_error, used = results['t']
     assert effective_error.tolist() == [[0.5, 0.5]]
-    # Unclamped: bg_check=4*0.5=2.0 < |O-B|=3.0 -> rejected at both (would
-    # have passed at both had the clamp wrongly applied, raising to 1.0).
-    assert used.tolist() == [[False, False]]
+    assert used.tolist() == [[False, False]]  # bg_check=4*0.5=2.0 < |O-B|=3.0 -> rejected
 
 
 def test_raobs_gross_check_threshold_resolves_override_then_shared():
