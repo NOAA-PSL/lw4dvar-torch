@@ -21,6 +21,7 @@ import os
 import sys
 
 import pytest
+import xarray as xr
 
 pytest.importorskip('fme')
 
@@ -55,12 +56,24 @@ def test_ace2_mini_window(tmp_path, checkpoint):
         f'cost fell only {losses[1]:.0f} -> {losses[epochs]:.0f} in {epochs} epochs')
 
     stem = f"{exp['sdate']}_"
+    raobs_hits = None
     for kind in (
         'latent_increment', 'observation_diagnostics', 'control_forecast', 'optimal_forecast',
         'raobs_diagnostics',
     ):
         hits = [f for f in os.listdir(out) if f.startswith(stem + kind)]
         assert hits, f'no {kind} output in {out}: {sorted(os.listdir(out))}'
+        if kind == 'raobs_diagnostics':
+            raobs_hits = hits
+
+    # The aggregate cost-drop check above can pass on psobs alone even if
+    # every radiosonde profile is silently dropped (e.g. masked out
+    # entirely by QC) -- check the diagnostics themselves record used
+    # observations for every raobs variable this config requests, not
+    # just that the file exists (PR #29's review).
+    with xr.open_dataset(os.path.join(out, raobs_hits[0])) as ds:
+        for base in ('t', 'u', 'v'):
+            assert int(ds[base + '_used'].sum()) > 0, f'no {base} raobs observations used'
 
     with open(mini_ace2.GOLDEN) as f:
         golden = json.load(f)

@@ -179,7 +179,7 @@ def test_first_step_penalties_reject_too_short_windows(at_start, n_steps, ok):
 def test_jc_z_diagnostic_with_no_obs(x0, capsys):
     # an empty window makes the penalty's factor 0: the printed rms must not divide by it
     p = Problem(**VARIANTS['jc_z_weight'])
-    J, _ = utils.compute_loss_4dvar(
+    J, _, _ = utils.compute_loss_4dvar(
         p.model, x0, 1.0, p.state, p.verif_ic, p.psobs_traj, 1, p.exp, p.grid_interp, 1,
         p.interp_specs, jcz_ref=(p.jcz_ref[0], 0.0))
     assert 'Jz = 0.0' in capsys.readouterr().out

@@ -279,6 +279,13 @@ def _profile_records(
     level_columns = list(dict.fromkeys(level_columns))
 
     records = {}
+    # Profile-wide (not per-slot) winner tracking for the height-order QC
+    # below -- keyed by profile identity alone, so an inversion spanning
+    # two use_drift_time slots is still caught on the COMPLETE sounding,
+    # not just whichever levels happened to land in one slot (PR #29's
+    # review).
+    profile_priority = {}
+    profile_heights = {}
     for cycle in cycles:
         for prepbufr_class in prepbufr_classes:
             reports = common.read_partition(
@@ -292,6 +299,18 @@ def _profile_records(
                 int(report_id): row for row, report_id in enumerate(report_ids)
             }
             report_times = common.timestamps(reports)
+            # HRDR ('drift_time_hours') is cycle-relative, the SAME
+            # referent as DHR -- a per-level REPLACEMENT for the report's
+            # single DHR-based time, not an increment on top of it (GSI's
+            # read_prepbufr.F90 and the RDASApp bufr2ioda_adpupa_prepbufr.py
+            # converter both anchor it to cycle_time directly). Anchoring
+            # to report_time (== cycle_time + DHR) instead would double-
+            # count DHR (PR #29's review). `cycle` is the archive's own
+            # <root>/<YYYY-MM-DD>/<HH> partition directory for this cycle
+            # -- parsed back into the same cycle datetime
+            # cycle_directories (common.py) computed before discarding it
+            # down to a bare Path, rather than adding a new archive column.
+            cycle_datetime = np.datetime64(common.cycle_time_from_directory(cycle), 's')
             station_ids = reports['station_id'].to_pylist()
             latitude = common.column(reports, 'latitude')
             longitude = common.column(reports, 'longitude')
@@ -342,7 +361,7 @@ def _profile_records(
                 pressure_value = pressure[level_row]
                 if not (
                     np.isfinite(lat) and np.isfinite(lon)
-                    and -90. <= lat <= 90. and np.isfinite(pressure_value)
+                    and -90. <= lat <= 90. and np.isfinite(pressure_value) and pressure_value > 0.
                 ):
                     continue
                 report_time = report_times[report_row]
@@ -358,7 +377,7 @@ def _profile_records(
                 if drift_time_hours is not None:
                     drift_h = drift_time_hours[level_row]
                     if np.isfinite(drift_h):
-                        level_time = report_time + np.timedelta64(int(round(drift_h * 3600.)), 's')
+                        level_time = cycle_datetime + np.timedelta64(int(round(drift_h * 3600.)), 's')
                 delta_seconds = np.abs(
                     (verification - level_time).astype('timedelta64[s]')
                     .astype(np.int64)
@@ -371,7 +390,17 @@ def _profile_records(
                     station_ids[report_row], lat, lon,
                     str(cycle)+':'+str(report_id),
                 )
-                key = (slot_index, station_key)
+                # Include the report's own (un-drifted) launch time in the
+                # profile identity: a bare station_key collapses two
+                # DIFFERENT launches from the same physical station (e.g. a
+                # special/extra sounding near a regular one) into one
+                # profile, letting their levels silently replace each other
+                # by quality and corrupting the height-order QC below with
+                # levels from different soundings (PR #29's review).
+                # Genuinely repeated rows of the SAME launch still share one
+                # report_time, so they keep merging as before.
+                profile_key = (station_key, report_time)
+                key = (slot_index, profile_key)
                 elevation_m = elevation[report_row]
                 record = records.setdefault(key, {
                     'lat': lat, 'lon': lon, 'elev': elevation_m,
@@ -428,6 +457,18 @@ def _profile_records(
                     # docstring above).
                     bounds = physical_bounds.get(variable)
                     physical_bad = bounds is not None and not (bounds[0] <= value <= bounds[1])
+                    # A 'q' candidate whose computed default_error (RH_frac
+                    # * qsat(background)) isn't usable ranks as bad too --
+                    # otherwise a quality-1 row with a missing/invalid
+                    # archived background could win the slot over a
+                    # quality-2 row with a finite error, only to be
+                    # rejected later by the forward operator's own
+                    # isfinite(effective_error) guard, losing the level
+                    # entirely (PR #29's review).
+                    error_bad = False
+                    if variable in level_default_error:
+                        default_error_value = level_default_error[variable][level_row]
+                        error_bad = not (np.isfinite(default_error_value) and default_error_value > 0.)
                     # (worse-bucket-first, then numeric quality mark -- a
                     # non-finite quality sorts last within its bucket, same
                     # as the pre-existing tie-break). 'nearest'/'log-linear'
@@ -438,7 +479,7 @@ def _profile_records(
                     # win (irrelevant for 'exact', where the tight tolerance
                     # already made this moot).
                     priority = (
-                        quality_bad or height_bad or physical_bad,
+                        quality_bad or height_bad or physical_bad or error_bad,
                         quality if np.isfinite(quality) else np.inf,
                         differences[level_index] if vertical_interpolation != 'exact' else 0.,
                     )
@@ -469,6 +510,59 @@ def _profile_records(
                                 level_default_error[variable][level_row]
                         else:
                             record['default_error'].pop((variable, level_index), None)
+
+                    # Mirrors the per-slot winner selection just above, but
+                    # keyed by the whole PROFILE (profile_key alone, not
+                    # (slot_index, profile_key)) -- feeds the height-order
+                    # QC below, computed once on the COMPLETE sounding
+                    # rather than per-slot, so an inversion spanning two
+                    # use_drift_time slots is still caught (PR #29's
+                    # review).
+                    profile_key_priority = profile_priority.setdefault(profile_key, {})
+                    existing_profile_priority = profile_key_priority.get((variable, level_index))
+                    if existing_profile_priority is None or priority < existing_profile_priority:
+                        profile_key_priority[(variable, level_index)] = priority
+                        profile_key_heights = profile_heights.setdefault(profile_key, {})
+                        if height_eligible:
+                            profile_key_heights[(variable, level_index)] = height_m
+                        else:
+                            profile_key_heights.pop((variable, level_index), None)
+
+    # Non-monotonic height-with-pressure, computed ONCE per complete
+    # profile (every level across every slot it was split into), not
+    # per-slot -- an inversion straddling two use_drift_time slots must
+    # reject the whole variable's profile, matching the no-drift-time
+    # behavior where it's always checked on the complete sounding
+    # (PR #29's review). Consumed by load_raobs_parquet instead of that
+    # function recomputing it from its own (slot-limited) record['height'].
+    profile_height_order_bad = {}
+    for profile_key, heights_by_key in profile_heights.items():
+        bad_variables = set()
+        for variable in variables:
+            heights = {
+                level_index: height_m
+                for (var, level_index), height_m in heights_by_key.items()
+                if var == variable
+            }
+            ordered = [
+                heights[idx] for idx in np.argsort(-levels_hpa[variable])
+                if idx in heights
+            ]
+            if len(ordered) > 1 and np.any(np.diff(ordered) <= 0.):
+                bad_variables.add(variable)
+        if bad_variables:
+            profile_height_order_bad[profile_key] = bad_variables
+
+    # Drop records that ended up with no retained observation at all (e.g.
+    # a q-only sounding with every level below humidity_min_pressure_hpa)
+    # -- otherwise they still consume a station slot downstream, wasting
+    # raobs_station_capacity and potentially displacing a station that
+    # would have had usable observations (PR #29's review).
+    records = {
+        key: record for key, record in records.items() if record['values']
+    }
+    for (slot_index, profile_key), record in records.items():
+        record['height_order_bad'] = profile_height_order_bad.get(profile_key, set())
     return records
 
 
@@ -565,8 +659,8 @@ def load_raobs_parquet(
     position_bases = tuple(variables) if use_drift_position else ()
 
     by_slot = {}
-    for (slot_index, station_key), record in records.items():
-        by_slot.setdefault(slot_index, {})[station_key] = record
+    for (slot_index, profile_key), record in records.items():
+        by_slot.setdefault(slot_index, {})[profile_key] = record
 
     n_slots = len(verification_times)
     result = {'lat': [None]*n_slots, 'lon': [None]*n_slots, 'elev': [None]*n_slots}
@@ -584,11 +678,11 @@ def load_raobs_parquet(
 
     for slot_index in range(n_slots):
         stations = by_slot.get(slot_index, {})
-        station_keys = sorted(stations)
-        capacity = len(station_keys) if station_capacity is None else int(station_capacity)
-        if len(station_keys) > capacity:
+        profile_keys = sorted(stations)
+        capacity = len(profile_keys) if station_capacity is None else int(station_capacity)
+        if len(profile_keys) > capacity:
             raise ValueError(
-                'raobs slot '+str(slot_index)+' has '+str(len(station_keys))
+                'raobs slot '+str(slot_index)+' has '+str(len(profile_keys))
                 +' stations, exceeding fixed capacity '+str(capacity)+'.'
             )
         lat = np.zeros(capacity, dtype=np.float32)
@@ -605,8 +699,8 @@ def load_raobs_parquet(
         lat_level = {v: np.zeros((levels_hpa[v].size, capacity), dtype=np.float32) for v in position_bases}
         lon_level = {v: np.zeros((levels_hpa[v].size, capacity), dtype=np.float32) for v in position_bases}
 
-        for station_index, station_key in enumerate(station_keys):
-            record = stations[station_key]
+        for station_index, profile_key in enumerate(profile_keys):
+            record = stations[profile_key]
             lat[station_index] = record['lat']
             lon[station_index] = np.mod(record['lon'], 360.)
             elev[station_index] = record['elev']
@@ -653,21 +747,14 @@ def load_raobs_parquet(
                         if default is not None and np.isfinite(default) and default > 0.:
                             default_error[v][level_index, station_index] = default
 
-            # Non-monotonic height-with-pressure, checked per variable (each
-            # variable's own level/height collocations), excluding category-4
-            # rows already filtered out of `record['height']`.
-            for v in variables:
-                heights = {
-                    level_index: record['height'][(v, level_index)]
-                    for level_index in range(levels_hpa[v].size)
-                    if (v, level_index) in record['height']
-                }
-                ordered = [
-                    heights[idx] for idx in np.argsort(-levels_hpa[v])
-                    if idx in heights
-                ]
-                if len(ordered) > 1 and np.any(np.diff(ordered) <= 0.):
-                    mask[v][:, station_index] = False
+            # Non-monotonic height-with-pressure: computed in
+            # _profile_records across the COMPLETE source profile (every
+            # level, before use_drift_time splits it across slots), not
+            # just this slot's own subset -- an inversion straddling two
+            # slots must reject both, matching the no-drift-time behavior
+            # (PR #29's review).
+            for v in record.get('height_order_bad', ()):
+                mask[v][:, station_index] = False
 
         for v in variables:
             counts[v] += int(mask[v].sum())

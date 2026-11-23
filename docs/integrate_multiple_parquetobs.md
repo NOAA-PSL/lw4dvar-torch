@@ -1899,3 +1899,166 @@ no per-variable merging -- that's `get_raobs`'s job), `tests/unit/
 test_config.py` (the per-variable merge, via a real `get_raobs` call; the
 three new validation-rejection cases). `make check` (292 passed) and
 `make check-ace2` both pass.
+
+## PR #29's third Copilot review: 15 of 16 findings fixed (2026-11-23)
+
+Diagnosed and fixed in order of severity (reasoning and exact code checked
+against upstream references before any fix -- see the PR discussion for
+the full diagnosis):
+
+- **Virtual-temperature-only levels assimilated as sensible** (High,
+  `common.sensible_temperature`): a level whose TOB event stack is 100%
+  VIRTMP (no plain non-VIRTMP event at all) silently kept the virtual
+  temperature as if it were sensible. Now returns NaN for that case
+  (excluded downstream like any other missing value); the input-value
+  fallback is kept only for a level with no TOB events in the archive at
+  all.
+- **Balloon drift time double-counted DHR** (High, `raobs_parquet.py`):
+  `drift_time_hours` (PREPBUFR's HRDR) is cycle-relative, the SAME
+  referent as the report's own DHR -- confirmed against both GSI's
+  `read_prepbufr.F90` (HRDR replaces, not adds to, the header time) and
+  the RDASApp `bufr2ioda_adpupa_prepbufr.py` converter (`hrdr*3600 +
+  cycleTimeSinceEpoch`). The code was anchoring to `report_time` (==
+  `cycle_time + DHR`) instead of `cycle_time`, double-counting DHR.
+  Fixed by parsing the cycle time back out of the archive's own
+  `<root>/<YYYY-MM-DD>/<HH>` partition directory (`common.
+  cycle_time_from_directory`, new) rather than adding an archive column.
+- **Gross-check mask recomputed against the live optimization state**
+  (High, deferred): matches an existing, pre-PR-29 pattern already in
+  the ps-obs path (`_compute_ps_observation_diagnostics_at_time`'s own
+  `gross_check_failed`) -- fixing it properly needs a reusable "decode
+  the background once" mechanism for both obs types, planned as its own
+  follow-up task rather than a narrow raobs-only patch that would
+  diverge from psobs's behavior.
+- **Both drift corrections now default to True in code** (`get_raobs`),
+  not just in the committed template, per explicit request -- matches
+  the PR description's own stated default.
+- **Empty `error_std`/`q_error_rh_percent` pressure tables rejected at
+  config-load time** instead of reaching `np.interp` with no sample
+  points.
+- **t/u/v error tables evaluated at each observation's own real reported
+  pressure in `nearest`/`log-linear` modes** (`get_raobs`), not the
+  nominal model-level pressure -- matches what `q`'s error already did.
+- **raobs cost now included in the per-slot loss output**
+  (`compute_loss_4dvar` returns a third value, `Jraobs_np`/
+  `all_loss_raobs`, kept separate from the existing `all_loss` so
+  psobs-only golden values are unaffected).
+- **Non-positive reported pressure rejected** before matching/
+  interpolation (was reaching `np.log` in `log-linear` mode).
+- **Profile identity now includes the report's own launch time**
+  (`raobs_parquet.py`'s `profile_key = (station_key, report_time)`), so
+  two different launches from the same physical station landing in the
+  same slot no longer merge into one profile.
+- **Duplicate humidity ranking now also requires a usable computed
+  error** (finite, positive `default_error_q`) before ranking by quality
+  mark, so an unusable-background duplicate can't win over a usable one.
+- **Station records with no retained observation at all are dropped**
+  (e.g. a q-only sounding with every level below
+  `humidity_min_pressure_hpa`) instead of consuming a station slot with
+  an all-False mask.
+- **Non-monotonic-height QC now checked once on the COMPLETE profile**
+  (across every `use_drift_time` slot it was split into), not per-slot
+  -- an inversion straddling two slots was previously invisible to
+  either slot's own check.
+- Added: a VIRTMP-only-stack test, a duplicate-q-by-usable-error test, a
+  two-launches-same-station test, a non-monotonic-height-across-slots
+  test, a non-positive-pressure test, a cycle-time-vs-report-time
+  anchoring regression test (`tests/unit/test_raobs_parquet.py`); a
+  multi-dimensional `_interp_level_table` test and an independent
+  finite-difference gradient check on the raobs cost term
+  (`tests/unit/test_solver_helpers.py`, since `tests/math/`'s toy-model
+  gates never pass `raobs_traj` at all); an assertion that the mini-ACE2
+  raobs diagnostics record nonzero `t_used`/`u_used`/`v_used`
+  (`tests/ace2/test_ace2_mini.py` -- not run in this session, no fme/
+  checkpoint/network available; syntax-checked only). `tests/ace2/
+  mini_ace2.py`'s raobs config now explicitly sets `use_drift_time:
+  False, use_drift_position: False`, since that fixture's reports have
+  no `drift_time_hours`/`drift_longitude`/`drift_latitude` columns at
+  all and would otherwise hit the new True-by-default (PR #29's review,
+  this round).
+- One existing test (`test_use_drift_time_widens_partition_discovery_
+  for_a_boundary_report`) was built around the OLD, double-counting
+  formula's arithmetic and needed its scenario reworked; one
+  (`test_humidity_pressure_floor_checked_against_real_pressure_not_
+  nominal_level`) now asserts zero stations landed instead of one
+  all-False station, per the dropped-empty-record fix above.
+- Not fixed (acceptable per Copilot's own stated alternative): the
+  `psobs.time_tolerance_hours` default change from the earlier
+  `dt_obs/2` entry above is already extensively documented, including
+  the exact override (`time_tolerance_hours: 0.5`) for anyone who needs
+  the old legacy-matching density -- no code change needed.
+- `make check`: 300 passed (up from 292), plus 12 **pre-existing,
+  unrelated** failures (`test_tracked_configs_load`) -- `_RAOBS_CONFIG_KEYS`
+  dropped `q_error_fraction`/`q_error_g_kg`/`q_error_floor_kg_kg` in the
+  JEDI-only-error/QC simplification above, but 12 tracked
+  `config_test_*.yml` files still set them; confirmed present before any
+  of this round's changes (`git stash` + rerun). Not fixed in this round
+  (out of scope for the Copilot review); flagged to the user instead.
+  `make check-ace2` not run (no fme/checkpoint/network in this session).
+
+## Finding #1, fixed: gross-check QC frozen at the background (2026-11-23)
+
+The one deferred finding from the round above: both `_compute_ps_
+observation_diagnostics_at_time` and `_compute_raobs_observation_
+diagnostics_at_time` recomputed their background/gross check from the
+LIVE, currently-optimizing state at every epoch, not the background --
+letting the optimizer lower Jo by pushing an observation out of QC
+instead of actually fitting it (Copilot's own worked example: two unit-
+error wind obs at 0 and 12, 8-sigma threshold -- state 6 costs 72 fitting
+both; state 12 drops the first observation and costs 0, a LOWER cost
+from a worse fit). Confirmed this is not raobs-specific: psobs's own
+`gross_check_failed` had the identical pattern already, pre-dating PR #29
+entirely. Fixed for both, unconditionally (no new config flag) -- this
+is a correctness fix matching traditional 4DVar/GSI/JEDI practice, and
+this module's own saved-diagnostics file already claimed
+`'quality_control_reference': 'background'`, previously true only of
+what got saved after the fact, not what the optimizer itself used.
+
+**Mechanism**: `compute_ps_observation_hx` (`@torch.no_grad()`) already
+existed for exactly this -- `save_trajectory_diagnostics` was already
+calling it with `step_start=0` on the uncorrected background, purely for
+post-hoc reporting. `compute_optimal` now makes that SAME call once,
+before the AdamW loop, and stores the result (`psobs_traj['background_hx']`/
+`raobs_traj['background_hx']`, plus the derived boolean `bg_used`:
+psobs's qc_flag bit 8 resolved once; raobs's full per-base `used`).
+Both diagnostics functions gained `frozen_qc=False`: when `True`, the
+background-check comparison is replaced by a lookup into `bg_used`
+instead of being recomputed from the live innovation -- availability/
+interpolation/orography (raobs: the archive mask/isfinite(error)) stay
+live either way, since orography is state-independent anyway and
+interpolation must keep catching a live state going non-finite.
+`compute_loss_4dvar`'s `_obs_term`/`_raobs_term` pass `frozen_qc=(psobs_
+traj.get('bg_used') is not None)` (automatically True via `compute_optimal`,
+automatically False -- today's behavior, unchanged -- for a caller like
+`tests/math/`'s toy-model gates that builds its own `psobs_traj` without
+that step). `compute_ps_observation_hx`'s own calls (used for BOTH the
+background bootstrap above and `save_trajectory_diagnostics`'s analysis-
+side snapshot) never set it -- both must always score fresh at whatever
+state they're handed, not reuse the frozen decision; freezing the
+analysis-side snapshot too would have defeated its entire point ("what
+does the final analysis score right now"). `save_trajectory_diagnostics`
+now reuses `psobs_traj['background_hx']`/`raobs_traj['background_hx']`
+instead of recomputing that same no-grad pass a second time (falls back
+to recomputing if called without `compute_optimal` having run first --
+not the production call pattern, but keeps the function usable
+standalone).
+
+**Golden values moved** (expected -- QC active in all 5 toy configs,
+with 4 planted gross-error obs specifically meant to exercise the
+background check): regenerated via `python tests/make_fixtures.py
+golden`. `tests/data/golden/mini_ace2.json` was **not** regenerated in
+this session (no fme/checkpoint/network available) -- `make check-ace2`
+will fail on a stale golden file until someone runs `python tests/
+make_fixtures.py golden --ace2` on Ursa; this is expected, not a bug.
+
+**Tests**: `tests/unit/test_solver_helpers.py` -- Copilot's own worked
+example reproduced directly (`frozen_qc=False` reproduces the pathology
+byte-for-byte: cost 72 at state 6, 0 at state 12, obs dropped;
+`frozen_qc=True` fixes it: cost 144 at state 12, obs kept).
+`tests/golden/test_golden_toy.py` -- a new test confirms
+`save_trajectory_diagnostics`'s saved `surface_pressure_used` matches
+`compute_optimal`'s own cached `background_hx['used']` exactly (not just
+"doesn't crash" -- genuinely the same values), with `save_xr_trajectory`
+stubbed out since `ToyModel` has no `_levels_by_base` (a real backend's
+attribute the toy model never needed before this test). `make check`:
+302 passed (up from 300), same 12 pre-existing unrelated failures.

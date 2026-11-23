@@ -115,6 +115,15 @@ def config(tmp_path, ckpt):
                 # long_window_4dvar_utils.py) keeps raobs Jo from swamping
                 # ps Jo + Jc.
                 'error_std': {'t': 5.0, 'u': 8.0, 'v': 8.0},
+                # Explicit False: this fixture's reports are all zero-
+                # jitter (observation_time exactly on the cycle hour, no
+                # drift_time_hours/drift_longitude/drift_latitude columns
+                # at all) -- the drift corrections' own mechanics are
+                # covered by tests/unit/test_raobs_parquet.py instead.
+                # Both now default to True in code (PR #29's review), so
+                # this must be explicit now that raobs.enabled: True alone
+                # would otherwise turn them on here too.
+                'use_drift_time': False, 'use_drift_position': False,
             },
         },
         'path_output': os.path.join(str(tmp_path), 'output') + '/',

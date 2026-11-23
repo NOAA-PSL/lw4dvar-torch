@@ -137,6 +137,84 @@ def _raobs_traj_case(observation, error, tuv_bg_check):
     }, background
 
 
+def test_raobs_term_cost_gradient_matches_finite_difference():
+    # Independent finite-difference check on the raobs cost term itself
+    # (mirrors _raobs_term's exact Jt = sum((innov/err)**2) formula,
+    # long_window_4dvar_utils.py) -- the math-gate toy-model tests
+    # (tests/math/) never pass raobs_traj at all, so this cost's gradient
+    # had no coverage independent of the real backends (PR #29's review).
+    background = torch.tensor([[280.0, 282.0, 284.0]], dtype=torch.float64, requires_grad=True)
+    raobs_traj = {
+        'variables': ['t'],
+        'interp_idx': [None], 'interp_wts': [None],
+        'values_t': torch.tensor([[[279.0, 283.5, 290.0]]], dtype=torch.float64),
+        'mask_t': torch.tensor([[[True, True, False]]]),  # third station masked out at read time
+        'error_t': 1.5,
+        'tuv_bg_check': None,  # no background check: keep every masked-in ob
+    }
+
+    def cost(b):
+        results = utils._compute_raobs_observation_diagnostics_at_time(
+            None, {'t': b}, raobs_traj, _FakeRaobsGridInterp(b), 0)
+        innovation, _, effective_error, used = results['t']
+        innov = torch.where(used, innovation, torch.zeros_like(innovation))
+        err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
+        return ((innov / err) ** 2).sum()
+
+    assert torch.autograd.gradcheck(cost, (background,))
+    # The third (masked-out) station must not influence the cost or its
+    # gradient at all.
+    cost(background).backward()
+    assert background.grad[0, 2].item() == 0.0
+
+
+def test_raobs_frozen_qc_prevents_gaming_the_gross_check():
+    # Copilot's adversarial example (PR #29's review): two unit-error
+    # wind observations, 0 and 12, 8-sigma threshold, both compared
+    # against one shared model value. At the background (model value 6),
+    # BOTH pass (|0-6|=6, |12-6|=6, both <= 8) -- recomputing the gross
+    # check from the LIVE state instead lets the optimizer move the
+    # state to 12 and get a FREE reduction in cost by dropping the first
+    # observation outright (|0-12|=12 > 8) rather than fitting it: cost
+    # 72 at state 6 (both fit, badly) falls to 0 at state 12 (one
+    # observation dropped, the other fits exactly) -- lower cost from
+    # moving AWAY from a better fit. With the background check frozen,
+    # state 12 must still account for the first observation's now-much-
+    # worse residual: cost rises to 144, not 0.
+    raobs_traj, _ = _raobs_traj_case([0.0, 12.0], error=1.0, tuv_bg_check=8.0)
+
+    def jo(decoded, frozen_qc):
+        results = utils._compute_raobs_observation_diagnostics_at_time(
+            None, {'t': decoded}, raobs_traj, _FakeRaobsGridInterp(decoded), 0, frozen_qc=frozen_qc)
+        innovation, _, effective_error, used = results['t']
+        innov = torch.where(used, innovation, torch.zeros_like(innovation))
+        err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
+        return ((innov / err) ** 2).sum().item(), used.tolist()
+
+    state6 = torch.full((1, 2), 6.0)
+    state12 = torch.full((1, 2), 12.0)
+
+    # Live recompute (today's code path when no background pass has
+    # run, frozen_qc=False): reproduces the pathology directly.
+    cost6_live, used6_live = jo(state6, frozen_qc=False)
+    cost12_live, used12_live = jo(state12, frozen_qc=False)
+    assert cost6_live == pytest.approx(72.0)
+    assert used6_live == [[True, True]]
+    assert cost12_live == pytest.approx(0.0)
+    assert used12_live == [[False, True]]  # the gaming: observation 0 dropped
+
+    # Freeze the gross check at the background's own verdict (both pass
+    # at state 6, as compute_optimal would resolve it before
+    # optimization starts) -- state 12 can no longer get a free ride.
+    raobs_traj['bg_used'] = {'t': torch.tensor([[[True, True]]])}
+    cost6_frozen, used6_frozen = jo(state6, frozen_qc=True)
+    cost12_frozen, used12_frozen = jo(state12, frozen_qc=True)
+    assert cost6_frozen == pytest.approx(72.0)
+    assert used6_frozen == [[True, True]]
+    assert cost12_frozen == pytest.approx(144.0)
+    assert used12_frozen == [[True, True]]
+
+
 def test_raobs_tuv_bg_check_rejects_outlier_not_the_good_ob():
     # error_t=1.0, tuv_bg_check=4.0 -> reject |O-B| > 4.0; 3.0 passes, 5.0 doesn't
     raobs_traj, background = _raobs_traj_case([3.0, 5.0], error=1.0, tuv_bg_check=4.0)
@@ -358,6 +436,23 @@ def test_interp_level_table_matches_entries_and_holds_beyond_range():
     assert out[2] == pytest.approx(1.2)
     assert out[3] == pytest.approx(1.2)   # above the table's own range
     assert out[4] == pytest.approx(1.2)   # below the table's own range
+
+
+def test_interp_level_table_broadcasts_over_per_cell_pressure_array():
+    # 'nearest'/'log-linear' raobs error tables are evaluated at each
+    # observation's own real pressure (get_raobs, PR #29's review) --
+    # an (n_obs, n_levels, capacity)-shaped array, not the 1D levels_hpa
+    # vector _interp_level_table was previously only ever called with.
+    # NaN (an unused padding cell) must propagate through as NaN, not
+    # raise or silently become some other value.
+    table = {1000.: 1.2, 500.: 0.8}
+    pressure_cells = np.array([[[1000., 500.], [750., np.nan]]])
+    out = utils._interp_level_table(table, pressure_cells)
+    assert out.shape == pressure_cells.shape
+    assert out[0, 0, 0] == pytest.approx(1.2)
+    assert out[0, 0, 1] == pytest.approx(0.8)
+    assert 0.8 < out[0, 1, 0] < 1.2  # 750 hPa: strictly between the two table entries
+    assert np.isnan(out[0, 1, 1])
 
 
 def test_raobs_error_std_table_tensor_used_per_level():

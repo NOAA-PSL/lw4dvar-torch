@@ -98,6 +98,19 @@ def cycle_directories(directory, verification_times, tolerance_hours, allow_miss
     return paths
 
 
+def cycle_time_from_directory(cycle_directory):
+    """The cycle's own nominal synoptic time (00/06/12/18Z), parsed back
+    from a `<root>/<YYYY-MM-DD>/<HH>` partition directory -- the same
+    datetime `cycle_directories` above computed before discarding it down
+    to a bare `Path`. Used by raobs_parquet.py to anchor HRDR
+    (`drift_time_hours`) to the cycle it's actually relative to, without
+    needing a new archive column for it (PR #29's review)."""
+    cycle_directory = Path(cycle_directory)
+    return datetime.strptime(
+        cycle_directory.parent.name+' '+cycle_directory.name, '%Y-%m-%d %H'
+    )
+
+
 def class_file(cycle_directory, table, prepbufr_class):
     path = cycle_directory / table / str(prepbufr_class) / 'part-00000.parquet'
     if not path.is_file():
@@ -166,20 +179,25 @@ def sensible_temperature(cycle_directory, prepbufr_class, report_ids, level_indi
     The archive's `temperature_c` is the current (top-of-stack) TOB. Wherever
     moisture was reported, that is virtual temperature, written by PREPBUFR's
     VIRTMP step (program code 8). This returns, for each (report_id,
-    level_index), the first event in the stack whose program is not VIRTMP,
-    falling back to the input value when there are no events. Values that are
-    NaN on input stay NaN.
+    level_index), the first event in the stack whose program is not VIRTMP.
+    A level whose ONLY TOB event(s) are VIRTMP has no recoverable sensible
+    value and comes back NaN, so it gets excluded downstream like any other
+    missing value -- the input value is kept as a fallback only for a level
+    with no TOB events in the archive at all (PR #29's review: falling back
+    to the input there previously let a virtual temperature be assimilated
+    as sensible). Values that are NaN on input stay NaN.
     """
     events = read_partition(class_file(cycle_directory, 'events', prepbufr_class), _EVENT_COLUMNS)
     mnemonic = np.asarray(events['value_mnemonic'].to_pylist())
     keep = mnemonic == 'TOB'
-    rid = column(events, 'report_id', np.int64)[keep]
-    lev = column(events, 'level_index', np.int64)[keep]
-    idx = column(events, 'event_index', np.int64)[keep]
-    val = column(events, 'value')[keep]
-    prog = column(events, 'program_code')[keep]
-    ok = prog != VIRTMP_PROGRAM_CODE
-    rid, lev, idx, val = rid[ok], lev[ok], idx[ok], val[ok]
+    rid_all = column(events, 'report_id', np.int64)[keep]
+    lev_all = column(events, 'level_index', np.int64)[keep]
+    idx_all = column(events, 'event_index', np.int64)[keep]
+    val_all = column(events, 'value')[keep]
+    prog_all = column(events, 'program_code')[keep]
+    has_tob_event = set(zip(rid_all.tolist(), lev_all.tolist()))
+    ok = prog_all != VIRTMP_PROGRAM_CODE
+    rid, lev, idx, val = rid_all[ok], lev_all[ok], idx_all[ok], val_all[ok]
     order = np.lexsort((idx, lev, rid))
     rid, lev, val = rid[order], lev[order], val[order]
     first = np.ones(len(rid), bool)
@@ -188,5 +206,8 @@ def sensible_temperature(cycle_directory, prepbufr_class, report_ids, level_indi
     out = np.asarray(temperature_c, dtype=np.float64).copy()
     for i, key in enumerate(zip(np.asarray(report_ids).tolist(), np.asarray(level_indices).tolist())):
         if np.isfinite(out[i]):
-            out[i] = sensible.get(key, out[i])
+            if key in sensible:
+                out[i] = sensible[key]
+            elif key in has_tob_event:
+                out[i] = np.nan
     return out

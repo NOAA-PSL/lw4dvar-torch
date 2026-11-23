@@ -138,7 +138,7 @@ class Problem:
 
     def cost(self, increment):
         """The solver's Jo (+ Jc) for a latent increment."""
-        J, _ = utils.compute_loss_4dvar(
+        J, _, _ = utils.compute_loss_4dvar(
             self.model, increment, 1.0, self.state, self.verif_ic, self.psobs_traj, 1, self.exp,
             self.grid_interp, -1, self.interp_specs, self.keep_mask, self.ref_state1, self.jc_ref,
             self.jcz_ref)
