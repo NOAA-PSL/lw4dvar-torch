@@ -264,36 +264,51 @@ def _profile_records(
         'report_id', 'observation_time', 'station_id', 'latitude',
         'longitude', 'elevation_m', 'report_type',
     ]
-    level_columns = ['report_id', 'level_index', 'category', 'pressure_mb'] + list(_HEIGHT_COLUMNS)
+    base_level_columns = ['report_id', 'level_index', 'category', 'pressure_mb'] + list(_HEIGHT_COLUMNS)
     for variable in variables:
-        level_columns.extend(_VARIABLE_COLUMNS[variable])
+        base_level_columns.extend(_VARIABLE_COLUMNS[variable])
     # background_temperature_c/background_pressure_mb feed the qsat
     # conversion for q's error (RH_percent * qsat -- see q_error_rh_percent
     # above).
     if 'q' in variables and q_error_rh_percent:
-        level_columns.extend(('background_temperature_c', 'background_pressure_mb'))
-    if use_drift_time:
-        level_columns.append('drift_time_hours')
-    if use_drift_position:
-        level_columns.extend(('drift_longitude', 'drift_latitude'))
-    level_columns = list(dict.fromkeys(level_columns))
+        base_level_columns.extend(('background_temperature_c', 'background_pressure_mb'))
+    base_level_columns = list(dict.fromkeys(base_level_columns))
 
     records = {}
     # Profile-wide (not per-slot) winner tracking for the height-order QC
-    # below -- keyed by profile identity alone, so an inversion spanning
-    # two use_drift_time slots is still caught on the COMPLETE sounding,
-    # not just whichever levels happened to land in one slot (PR #29's
-    # review).
-    profile_priority = {}
-    profile_heights = {}
+    # below -- keyed by (profile identity, variable, the row's own REAL
+    # reported pressure), not the matched model level, so two genuinely
+    # different real levels that happen to snap to the same model-level
+    # bucket (vertical_interpolation != 'exact') both stay visible to the
+    # monotonicity check below instead of one hiding the other's height
+    # (PR #29's review).
+    profile_source_priority = {}
+    profile_source_heights = {}
     for cycle in cycles:
         for prepbufr_class in prepbufr_classes:
             reports = common.read_partition(
                 common.class_file(cycle, 'reports', prepbufr_class), report_columns
             )
-            levels = common.read_partition(
-                common.class_file(cycle, 'levels', prepbufr_class), level_columns
+            level_path = common.class_file(cycle, 'levels', prepbufr_class)
+            # drift_time_hours/drift_longitude/drift_latitude are read
+            # only if both requested AND actually present in THIS
+            # partition's schema -- an archive (or synthetic fixture,
+            # e.g. tests/data/mini_ace2/raobs) without them falls back to
+            # the documented launch-time/launch-position behavior instead
+            # of read_partition raising on the WHOLE read over one
+            # missing optional column (PR #29's review).
+            partition_columns = common.available_columns(level_path)
+            this_use_drift_time = use_drift_time and 'drift_time_hours' in partition_columns
+            this_use_drift_position = (
+                use_drift_position
+                and 'drift_longitude' in partition_columns and 'drift_latitude' in partition_columns
             )
+            level_columns = list(base_level_columns)
+            if this_use_drift_time:
+                level_columns.append('drift_time_hours')
+            if this_use_drift_position:
+                level_columns.extend(('drift_longitude', 'drift_latitude'))
+            levels = common.read_partition(level_path, level_columns)
             report_ids = common.column(reports, 'report_id', np.int64)
             report_rows = {
                 int(report_id): row for row, report_id in enumerate(report_ids)
@@ -317,13 +332,14 @@ def _profile_records(
             elevation = common.column(reports, 'elevation_m')
 
             level_report_ids = common.column(levels, 'report_id', np.int64)
+            raw_level_index = common.column(levels, 'level_index', np.int64)
             category = common.column(levels, 'category', np.int16)
             pressure = common.column(levels, 'pressure_mb')
             height = common.column(levels, 'height_m')
             height_quality = common.column(levels, 'height_quality')
-            drift_time_hours = common.column(levels, 'drift_time_hours') if use_drift_time else None
-            drift_longitude = common.column(levels, 'drift_longitude') if use_drift_position else None
-            drift_latitude = common.column(levels, 'drift_latitude') if use_drift_position else None
+            drift_time_hours = common.column(levels, 'drift_time_hours') if this_use_drift_time else None
+            drift_longitude = common.column(levels, 'drift_longitude') if this_use_drift_position else None
+            drift_latitude = common.column(levels, 'drift_latitude') if this_use_drift_position else None
             level_values = {
                 v: common.column(levels, _VARIABLE_COLUMNS[v][0]) for v in variables
             }
@@ -348,8 +364,7 @@ def _profile_records(
                 # current TOB is virtual temperature where moisture was
                 # reported (VIRTMP); the model's t is sensible temperature
                 level_values['t'] = common.sensible_temperature(
-                    cycle, prepbufr_class, level_report_ids,
-                    common.column(levels, 'level_index', np.int64), level_values['t'],
+                    cycle, prepbufr_class, level_report_ids, raw_level_index, level_values['t'],
                 )
 
             for level_row, report_id in enumerate(level_report_ids):
@@ -371,7 +386,11 @@ def _profile_records(
                 if drift_longitude is not None and drift_latitude is not None:
                     drift_lat = drift_latitude[level_row]
                     drift_lon = drift_longitude[level_row]
-                    if np.isfinite(drift_lat) and np.isfinite(drift_lon):
+                    # Same range check the launch latitude gets above --
+                    # a finite-but-out-of-range drift latitude (garbage
+                    # data) would otherwise reach horizontal
+                    # interpolation directly (PR #29's review).
+                    if np.isfinite(drift_lat) and np.isfinite(drift_lon) and -90. <= drift_lat <= 90.:
                         level_lat, level_lon = drift_lat, drift_lon
                 level_time = report_time
                 if drift_time_hours is not None:
@@ -512,42 +531,66 @@ def _profile_records(
                             record['default_error'].pop((variable, level_index), None)
 
                     # Mirrors the per-slot winner selection just above, but
-                    # keyed by the whole PROFILE (profile_key alone, not
-                    # (slot_index, profile_key)) -- feeds the height-order
-                    # QC below, computed once on the COMPLETE sounding
-                    # rather than per-slot, so an inversion spanning two
+                    # keyed by the whole PROFILE (profile_key, not
+                    # (slot_index, profile_key)) AND the row's own REAL
+                    # reported pressure (not the matched model
+                    # level_index) -- feeds the height-order QC below,
+                    # computed once on the COMPLETE sounding rather than
+                    # per-slot, so an inversion spanning two
                     # use_drift_time slots is still caught (PR #29's
-                    # review).
-                    profile_key_priority = profile_priority.setdefault(profile_key, {})
-                    existing_profile_priority = profile_key_priority.get((variable, level_index))
+                    # review). Keying by real pressure instead of the
+                    # matched bucket means two genuinely different real
+                    # levels that snap to the SAME model level
+                    # (vertical_interpolation != 'exact') both stay
+                    # visible here, even though only one of them can win
+                    # that bucket for assimilation above; two rows
+                    # reporting the IDENTICAL real pressure -- a genuine
+                    # duplicate (e.g. a retransmitted message), same
+                    # convention this module's own duplicate-selection
+                    # tests use -- still collapse to one winner
+                    # (PR #29's review, second round).
+                    source_key = (variable, float(pressure_value))
+                    profile_key_priority = profile_source_priority.setdefault(profile_key, {})
+                    existing_profile_priority = profile_key_priority.get(source_key)
                     if existing_profile_priority is None or priority < existing_profile_priority:
-                        profile_key_priority[(variable, level_index)] = priority
-                        profile_key_heights = profile_heights.setdefault(profile_key, {})
+                        profile_key_priority[source_key] = priority
+                        profile_key_heights = profile_source_heights.setdefault(profile_key, {})
                         if height_eligible:
-                            profile_key_heights[(variable, level_index)] = height_m
+                            profile_key_heights[source_key] = (pressure_value, height_m)
                         else:
-                            profile_key_heights.pop((variable, level_index), None)
+                            profile_key_heights.pop(source_key, None)
 
     # Non-monotonic height-with-pressure, computed ONCE per complete
-    # profile (every level across every slot it was split into), not
-    # per-slot -- an inversion straddling two use_drift_time slots must
-    # reject the whole variable's profile, matching the no-drift-time
-    # behavior where it's always checked on the complete sounding
-    # (PR #29's review). Consumed by load_raobs_parquet instead of that
-    # function recomputing it from its own (slot-limited) record['height'].
+    # profile (every RAW level across every slot it was split into, each
+    # one visible regardless of whether it won its model-level bucket for
+    # assimilation -- see the winner-selection comment above), not
+    # per-slot or per-matched-bucket -- an inversion straddling two
+    # use_drift_time slots, or hidden behind a bucket-mate that won the
+    # assimilation slot, must reject the whole variable's profile,
+    # matching the no-drift-time behavior where it's always checked on
+    # the complete sounding (PR #29's review, two rounds). Ordered by
+    # each level's own REAL reported pressure (not the matched model
+    # level) so two raw levels sharing one bucket still sort correctly
+    # relative to each other. Consumed by load_raobs_parquet instead of
+    # that function recomputing it from its own (slot-limited,
+    # bucket-collapsed) record['height']. NOT a check of the literal
+    # complete archive sounding: a raw level whose drift-corrected time
+    # fell outside every slot's tolerance window was never read into any
+    # record at all (same pre-existing behavior as every other QC here),
+    # so it can't be weighed in this check either.
     profile_height_order_bad = {}
-    for profile_key, heights_by_key in profile_heights.items():
+    for profile_key, heights_by_key in profile_source_heights.items():
         bad_variables = set()
         for variable in variables:
-            heights = {
-                level_index: height_m
-                for (var, level_index), height_m in heights_by_key.items()
-                if var == variable
-            }
-            ordered = [
-                heights[idx] for idx in np.argsort(-levels_hpa[variable])
-                if idx in heights
-            ]
+            pairs = sorted(
+                (
+                    (pressure_value, height_m)
+                    for (var, _), (pressure_value, height_m) in heights_by_key.items()
+                    if var == variable
+                ),
+                key=lambda pair: -pair[0],  # descending pressure == surface-to-top, same as before
+            )
+            ordered = [height_m for _, height_m in pairs]
             if len(ordered) > 1 and np.any(np.diff(ordered) <= 0.):
                 bad_variables.add(variable)
         if bad_variables:

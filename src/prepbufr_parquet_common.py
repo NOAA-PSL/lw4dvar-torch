@@ -132,6 +132,17 @@ def read_partition(path, columns):
     return parquet_file.read(columns=list(columns))
 
 
+def available_columns(path):
+    """Column names present in a parquet partition's schema, without
+    reading any row data -- lets a caller request an OPTIONAL column
+    (e.g. raobs_parquet.py's drift_time_hours/drift_longitude/
+    drift_latitude) only if it actually exists, instead of
+    `read_partition` raising on the whole read because one archive
+    without it is missing a column every other required one still needs
+    (PR #29's review)."""
+    return set(parquet().ParquetFile(path).schema_arrow.names)
+
+
 def column(table, name, dtype=np.float64):
     return np.asarray(table[name].to_numpy(zero_copy_only=False), dtype=dtype)
 

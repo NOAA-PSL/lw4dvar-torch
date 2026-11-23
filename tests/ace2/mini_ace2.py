@@ -116,13 +116,17 @@ def config(tmp_path, ckpt):
                 # ps Jo + Jc.
                 'error_std': {'t': 5.0, 'u': 8.0, 'v': 8.0},
                 # Explicit False: this fixture's reports are all zero-
-                # jitter (observation_time exactly on the cycle hour, no
-                # drift_time_hours/drift_longitude/drift_latitude columns
-                # at all) -- the drift corrections' own mechanics are
-                # covered by tests/unit/test_raobs_parquet.py instead.
-                # Both now default to True in code (PR #29's review), so
-                # this must be explicit now that raobs.enabled: True alone
-                # would otherwise turn them on here too.
+                # jitter (observation_time exactly on the cycle hour) and
+                # the archive has no drift_time_hours/drift_longitude/
+                # drift_latitude columns at all -- the drift corrections'
+                # own mechanics are covered by tests/unit/
+                # test_raobs_parquet.py instead. Both now default to True
+                # in code (PR #29's review); raobs_parquet.py's reader
+                # falls back gracefully on a missing-column archive like
+                # this one (PR #29's review, second round), so this isn't
+                # strictly required to avoid a crash any more -- kept
+                # explicit anyway, since it documents this fixture's own
+                # intent rather than relying on that fallback silently.
                 'use_drift_time': False, 'use_drift_position': False,
             },
         },

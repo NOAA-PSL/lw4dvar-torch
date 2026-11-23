@@ -32,9 +32,12 @@ from golden_compare import compare, report  # noqa: E402
 
 pytestmark = [pytest.mark.ace2, pytest.mark.slow]
 
-# observed: 2722 -> 1465 (-46%, synthetic parquet psobs+raobs fixture, raobs
+# observed: 2721 -> 1255 (-54%, synthetic parquet psobs+raobs fixture, raobs
 # t/u/v sampled from the real background + noise -- see
-# tests/make_fixtures.py's _ace2_background_profiles); the margin absorbs
+# tests/make_fixtures.py's _ace2_background_profiles; -54%, not the
+# pre-frozen-background-QC -46%, since PR #29's review -- the gross
+# check no longer loosens as the state moves away from the background).
+# The margin absorbs
 # CPU/BLAS differences
 MAX_FINAL_TO_FIRST = 0.6
 

@@ -24,6 +24,15 @@ VARIANTS = {
     'jc_z_weight': {'jc_z_weight': 20.0},
     'all': {'control_variables': ['z', 't', 'sp'], 'jc_ps_weight': 30.0,
             'obs_density_box_deg': 10.0, 'jc_z_weight': 20.0, 'checkpoint_stride': 2},
+    # A toy t/q radiosonde trajectory (Problem._build_raobs_traj), sharing
+    # psobs's own obs-slot grid so it includes a between-step slot for
+    # free -- independent finite-difference coverage of the raobs cost
+    # term through the real compute_loss_4dvar path (PR #29's review),
+    # not just the isolated unit tests of _compute_raobs_observation_
+    # diagnostics_at_time in tests/unit/test_solver_helpers.py. Both the
+    # background-check-off and -on code paths get their own variant.
+    'raobs': {'raobs': True},
+    'raobs_bg_check': {'raobs': True, 'raobs_bg_check': 3.0},
 }
 
 
@@ -72,6 +81,28 @@ def test_checkpointing_does_not_change_the_gradient(stride, x0):
     J, g = Problem(checkpoint_stride=stride).cost_and_grad(x0)
     assert float(J) == float(J0)
     torch.testing.assert_close(g, g0, rtol=1e-12, atol=0)
+
+
+def test_raobs_taylor_remainder_is_second_order(x0):
+    p = Problem(raobs=True, raobs_bg_check=3.0, checkpoint_stride=2)
+    assert taylor_order(p.cost_and_grad, p.cost, x0) > 1.9
+
+
+@pytest.mark.parametrize('stride', [1, 2, 3])
+def test_raobs_checkpointing_does_not_change_the_gradient(stride, x0):
+    J0, g0 = Problem(raobs=True, checkpoint_stride=0).cost_and_grad(x0)
+    J, g = Problem(raobs=True, checkpoint_stride=stride).cost_and_grad(x0)
+    assert float(J) == float(J0)
+    torch.testing.assert_close(g, g0, rtol=1e-12, atol=0)
+
+
+def test_raobs_adds_a_nonzero_cost(x0):
+    # Confirms the raobs trajectory actually contributes to J (not just
+    # that its gradient is correct if it did) -- same sanity check
+    # test_cost_is_nonlinear makes for the psobs-only cost.
+    with_raobs = float(Problem(raobs=True).cost(x0))
+    without = float(Problem().cost(x0))
+    assert with_raobs > without + 1.0  # well above float64 noise
 
 
 def test_cost_is_nonlinear(x0):

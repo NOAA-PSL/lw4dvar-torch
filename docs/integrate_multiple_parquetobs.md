@@ -2046,10 +2046,17 @@ standalone).
 **Golden values moved** (expected -- QC active in all 5 toy configs,
 with 4 planted gross-error obs specifically meant to exercise the
 background check): regenerated via `python tests/make_fixtures.py
-golden`. `tests/data/golden/mini_ace2.json` was **not** regenerated in
-this session (no fme/checkpoint/network available) -- `make check-ace2`
-will fail on a stale golden file until someone runs `python tests/
-make_fixtures.py golden --ace2` on Ursa; this is expected, not a bug.
+golden`. `tests/data/golden/mini_ace2.json` **was** also regenerated in
+this session, via `python tests/make_fixtures.py golden --ace2` run
+against this same, fully-fixed solver code, using the `ace2` conda env
+(`/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2` -- has fme/pyarrow/
+pytest already; confirmed) and the mini-ACE2 test checkpoint already
+cached at `~/.cache/lw4dvar` (no network needed). Its loss trajectory
+moved as expected: last-epoch cost 2721 -> 1255 (was 1493 pre-fix,
+i.e. -54% now vs. -45% before) -- `make check-ace2` passed against it
+(1 passed, 1 unrelated jax skip). `tests/ace2/test_ace2_mini.py:35`'s
+comment is updated below to cite these new numbers instead of the
+pre-fix ones it was never updated to reflect.
 
 **Tests**: `tests/unit/test_solver_helpers.py` -- Copilot's own worked
 example reproduced directly (`frozen_qc=False` reproduces the pathology
@@ -2062,3 +2069,104 @@ byte-for-byte: cost 72 at state 6, 0 at state 12, obs dropped;
 stubbed out since `ToyModel` has no `_levels_by_base` (a real backend's
 attribute the toy model never needed before this test). `make check`:
 302 passed (up from 300), same 12 pre-existing unrelated failures.
+
+## PR #29's fourth Copilot review: 5 of 8 findings fixed (2026-11-23)
+
+Submitted right after the previous round's push; 13 of the previous
+round's 16 findings marked resolved. Diagnosed and fixed:
+
+- **Missing drift columns crashed the whole levels read** (High,
+  `raobs_parquet.py`): flipping `use_drift_time`/`use_drift_position` to
+  default True (previous round) meant any archive without
+  `drift_time_hours`/`drift_longitude`/`drift_latitude` -- not missing a
+  VALUE, missing the COLUMN entirely, e.g. `tests/data/mini_ace2/raobs`
+  -- failed to load outright, instead of falling back as documented.
+  Fixed by checking each partition's own schema (`common.
+  available_columns`, new) before requesting the optional drift columns,
+  independently per `(cycle, prepbufr_class)` -- a required column
+  missing still raises as before. Confirmed end to end: temporarily
+  removed `tests/ace2/mini_ace2.py`'s explicit `use_drift_time: False`/
+  `use_drift_position: False` (added last round specifically to dodge
+  this crash) and reran `make check-ace2` -- no crash, identical
+  computed values, the only diff was the now-absent config echo. Kept
+  the explicit config anyway (clearer documented intent for this
+  fixture), just softened its comment: no longer *required* to avoid a
+  crash, kept for clarity.
+- **Mini-ACE2 golden fixture "predates frozen-background QC"** (High):
+  the data was actually already correct -- verified the committed
+  `mini_ace2.json`'s loss trajectory had genuinely moved (1493 -> 1255
+  last-epoch cost) consistent with the frozen-QC fix actually running.
+  The bug was in the *documentation*: this doc still said mini_ace2.json
+  "was **not** regenerated in this session" (true when first written,
+  never updated after it actually was), and `tests/ace2/
+  test_ace2_mini.py:35`'s comment still cited the pre-fix observed
+  numbers (-46%, not the new -54%). Both corrected below/above.
+- **Drift latitude not range-checked before overwriting launch
+  coordinates** (Medium, `raobs_parquet.py`): the launch latitude gets
+  `-90 <= lat <= 90`; the drift-position override only checked
+  `isfinite`. A finite-but-garbage drift latitude would have reached
+  horizontal interpolation directly. Added the same range check.
+- **Non-monotonic-height QC still hid a losing bucket-mate's height**
+  (Medium, `raobs_parquet.py`, second round on the same mechanism): the
+  previous round's profile-wide height tracking still collapsed to one
+  winner per *(variable, matched-model-level)* bucket -- inherited from
+  the pre-existing per-slot duplicate-selection design, just applied
+  profile-wide. In `nearest`/`log-linear` modes, two genuinely different
+  real levels from different `use_drift_time` slots that happen to snap
+  to the same coarse model bucket could still hide an inversion: only
+  the bucket's assimilation WINNER's height ever reached the check.
+  Re-keyed the tracking by the row's own REAL reported pressure instead
+  (`profile_source_priority`/`profile_source_heights`, replacing
+  `profile_priority`/`profile_heights`) -- two rows at the SAME real
+  pressure are still one genuine duplicate (same convention this
+  module's own duplicate-selection tests already used); two different
+  real pressures now both stay visible regardless of which one wins its
+  model-level bucket for assimilation. The monotonicity check itself now
+  sorts by real pressure (descending) instead of by matched model level,
+  so it still orders correctly when two rows share one bucket. Hit the
+  exact class of test-construction bug the first round's own docstring
+  warned about: three existing duplicate-selection tests gave competing
+  rows the SAME default height, which used to be invisible (only one
+  winner's height ever reached the old bucket-keyed check) but is now
+  correctly visible and triggered false monotonicity failures -- fixed
+  by giving `test_relaxed_modes_distance_tiebreak_prefers_closer_
+  duplicate` physically distinct heights; the other two already had one
+  row's height excluded before reaching the check (ineligible/wrong
+  bucket) so needed no change once the real-pressure key stopped
+  conflating them. Still NOT a check of the literal complete archive
+  sounding -- a level whose drift-corrected time falls outside every
+  slot's tolerance window is never read into any record at all, same as
+  every other QC here; the fix's own comment says so now instead of
+  overclaiming completeness.
+- **VIRTMP event-selection test only had one candidate after filtering**
+  (Medium, test coverage, carried over from two rounds ago):
+  `test_sensible_temperature_used_instead_of_virtual` couldn't actually
+  tell "first non-VIRTMP event by stack order" apart from "the only one
+  left" -- strengthened with three non-VIRTMP candidates at distinct
+  `event_index` values, given in shuffled input-list order, confirming
+  the selection is by stack order and not list order or value magnitude.
+- **Independent radiosonde cost/gradient coverage, broadened** (Medium,
+  test coverage, carried over from two rounds ago): the previous round's
+  gradient check was an isolated unit test of the diagnostics function
+  alone. Added a toy t/q radiosonde trajectory to `tests/math/
+  problem.py`'s `Problem` (`raobs=True`, sharing psobs's own obs-slot
+  grid, so it gets a between-step slot for free; one masked-at-read-time
+  cell per slot; `q` uses a tensor `default_error_q`, `t` a flat scalar
+  error -- both real code paths), wired through the REAL
+  `compute_loss_4dvar`, with new `gradient_error`/`taylor_order`/
+  checkpointing-consistency gate tests (`tests/math/
+  test_cost_gradient.py`) for both the background-check-off and -on
+  paths, plus a sanity check that the added cost is actually nonzero.
+  Needed `_resolve_loss_interp_specs` to see `raobs_enabled`/
+  `raobs_variables` in `Problem.exp` before `interp_specs` is resolved --
+  already handled correctly in the real code (folds raobs's variables
+  into the sub-6h time-interpolation set), `Problem` just hadn't been
+  exercising that path before.
+- Not fixed (no code change needed): "document the widened psobs
+  tolerance" -- `configs/config.yml.template` and this doc already
+  explain the `dt_obs/2` default, why, and the `time_tolerance_hours:
+  0.5` override; the only thing not mentioning it is the PR's own
+  GitHub description text, which isn't a code change.
+- `make check`: 312 passed (up from 302), same 12 pre-existing unrelated
+  failures. `make check-ace2`: passed, confirmed on the `ace2` conda env
+  (has fme/pyarrow/pytest already) with the cached mini-ACE2 checkpoint.

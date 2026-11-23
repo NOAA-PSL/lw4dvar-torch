@@ -37,20 +37,25 @@ _FLOAT_COLUMNS = {
 EVENT_COLUMNS = ['report_id', 'level_index', 'value_mnemonic', 'event_index', 'value', 'program_code']
 
 
-def write_cycle(root, cycle_time, reports, levels, events=(), prepbufr_class='ADPUPA'):
+def write_cycle(root, cycle_time, reports, levels, events=(), prepbufr_class='ADPUPA', omit_level_columns=()):
     """`reports`/`levels` are lists of dicts with exactly REPORT_COLUMNS/
     LEVEL_COLUMNS keys (observation_time as a `datetime`). `events` (TOB
     event-stack rows, for the sensible-temperature lookup) defaults to
     empty -- common.sensible_temperature falls back to the input
-    temperature_c when no event matches, so most tests don't need any."""
+    temperature_c when no event matches, so most tests don't need any.
+    `omit_level_columns`: column names to leave entirely out of the
+    written levels schema (not just null-valued) -- simulates an archive
+    that never had them at all, e.g. one predating drift_time_hours/
+    drift_longitude/drift_latitude (PR #29's review)."""
     cycle_dir = root / f'{cycle_time:%Y-%m-%d}' / f'{cycle_time:%H}'
     for table_name, columns, rows in (
         ('reports', REPORT_COLUMNS, reports), ('levels', LEVEL_COLUMNS, levels),
     ):
         path = cycle_dir / table_name / prepbufr_class / 'part-00000.parquet'
         path.parent.mkdir(parents=True, exist_ok=True)
+        cols = columns if table_name != 'levels' else [c for c in columns if c not in omit_level_columns]
         arrays = {}
-        for col in columns:
+        for col in cols:
             values = [row[col] for row in rows]
             col_type = (
                 pa.timestamp('s') if col == 'observation_time'
@@ -174,8 +179,12 @@ def test_relaxed_modes_distance_tiebreak_prefers_closer_duplicate(tmp_path, vert
     write_cycle(
         tmp_path, t0, [report(1, time=t0)],
         [
-            level(1, pressure=830., temperature=10., level_index=0),  # 20 hPa from 850
-            level(1, pressure=860., temperature=20., level_index=1),  # 10 hPa from 850 -- closer
+            # heights must increase as pressure drops (830 < 860) or the
+            # profile-wide non-monotonic-height QC rejects both -- these
+            # are two genuinely different real levels now visible to that
+            # check (PR #29's review), not just competing for one bucket.
+            level(1, pressure=830., height=1600., temperature=10., level_index=0),  # 20 hPa from 850
+            level(1, pressure=860., height=1400., temperature=20., level_index=1),  # 10 hPa from 850 -- closer
         ],
     )
     data = load(
@@ -249,14 +258,20 @@ def test_quality_mark_qc_rejected(tmp_path):
 
 def test_sensible_temperature_used_instead_of_virtual(tmp_path):
     # The archive's temperature_c is the (virtual) TOB when moisture was
-    # reported; the first non-VIRTMP (program_code != 8) event stack entry
-    # is the sensible value common.sensible_temperature must return instead.
+    # reported; the FIRST non-VIRTMP (program_code != 8) event BY STACK
+    # ORDER (lowest event_index) is the sensible value
+    # common.sensible_temperature must return instead. Multiple non-
+    # VIRTMP candidates, given in shuffled input order with distinct
+    # event_index values, confirm this picks by stack order -- not input-
+    # list order and not value magnitude (PR #29's review).
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(
         tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=27.0)],
         events=[
-            event(1, value=26.0, program_code=0),   # sensible (pre-VIRTMP)
-            event(1, value=27.0, program_code=8),    # VIRTMP-corrected (matches levels' temperature_c)
+            event(1, value=99.0, event_index=2, program_code=0),  # non-VIRTMP, but not first in stack
+            event(1, value=50.0, event_index=1, program_code=0),  # non-VIRTMP, but not first in stack
+            event(1, value=26.0, event_index=0, program_code=0),  # non-VIRTMP, FIRST in stack -- the answer
+            event(1, value=27.0, event_index=3, program_code=8),  # VIRTMP-corrected (matches levels' temperature_c)
         ],
     )
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
@@ -623,6 +638,65 @@ def test_use_drift_time_anchors_to_cycle_time_not_report_time(tmp_path):
     )
     data = load(tmp_path, [cycle], {'t': [850.]}, ['t'], use_drift_time=True)
     assert data['mask_t'][0][0, 0]  # cycle_time + drift (00:12) is inside the 3h window
+
+
+def test_use_drift_time_falls_back_when_archive_has_no_drift_columns(tmp_path):
+    # use_drift_time/use_drift_position default to True in get_raobs
+    # (long_window_4dvar_utils.py), so an archive that simply predates
+    # drift_time_hours/drift_longitude/drift_latitude -- not just missing
+    # a VALUE, missing the COLUMN entirely, e.g. tests/data/mini_ace2/
+    # raobs -- must still load via the documented launch-time/position
+    # fallback instead of common.read_partition raising on the whole
+    # levels read over one missing optional column (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0, lat=10., lon=20.)],
+        [level(1, pressure=850., temperature=-10.)],
+        omit_level_columns=('drift_time_hours', 'drift_longitude', 'drift_latitude'),
+    )
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True, use_drift_position=True)
+    assert data['mask_t'][0][0, 0]
+    assert data['lat_t'][0][0, 0] == pytest.approx(10.)  # launch position, not drift (column absent)
+    assert data['lon_t'][0][0, 0] == pytest.approx(20.)
+
+
+def test_use_drift_position_rejects_out_of_range_drift_latitude(tmp_path):
+    # A finite but out-of-range drift latitude (garbage/corrupted data)
+    # must not overwrite the already-validated launch coordinates --
+    # same range check the launch latitude itself gets (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0, lat=10., lon=20.)], [
+        level(1, pressure=850., temperature=-10., drift_latitude=190., drift_longitude=20.05),
+    ])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_position=True)
+    assert data['mask_t'][0][0, 0]
+    assert data['lat_t'][0][0, 0] == pytest.approx(10.)  # launch fallback, not the bad drift value
+    assert data['lon_t'][0][0, 0] == pytest.approx(20.)
+
+
+def test_non_monotonic_height_visible_across_bucket_sharing_duplicates(tmp_path):
+    # Two genuinely different real levels (830.5/829 hPa) both snap to
+    # the single model level (830 hPa) in 'nearest' mode -- the 830.5 hPa
+    # row wins that bucket for assimilation (0.5 hPa away vs. 1 hPa), but
+    # the 829 hPa row's height must still be visible to the profile-wide
+    # non-monotonic-height check: it's inverted (50 m, LOWER) relative to
+    # a third, higher-pressure level (900 hPa, 100 m) that IS kept.
+    # Before this fix, only the bucket's WINNING height ever reached the
+    # check, hiding the losing candidate's inversion entirely (PR #29's
+    # review, second round).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        # temperature=-10 (not level()'s own default 300 C -> 573 K,
+        # which fails physical-bounds QC, unrelated to what this checks).
+        level(1, pressure=900., height=100., temperature=-10., level_index=0),
+        level(1, pressure=830.5, height=2500., temperature=-10., level_index=1),  # wins the 830 hPa bucket (closer)
+        level(1, pressure=829., height=50., temperature=-10., level_index=2),     # loses the bucket, height=50 < 100
+    ])
+    data = load(
+        tmp_path, [t0], {'t': [900., 830.]}, ['t'],
+        vertical_interpolation='nearest',
+    )
+    assert not data['mask_t'][0].any()  # the whole profile is rejected, not just the losing candidate
 
 
 def test_use_drift_position_gives_each_level_its_own_position(tmp_path):
