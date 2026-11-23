@@ -177,6 +177,28 @@ def test_relaxed_modes_distance_tiebreak_prefers_closer_duplicate(tmp_path, vert
     assert data['pressure_t'][0][1, 0] == pytest.approx(860.)
 
 
+def test_duplicate_selection_prefers_physically_valid_value(tmp_path):
+    # Two raw rows compete for the same matched model level (same
+    # pressure, 850 hPa): one has the BETTER quality mark but an
+    # impossible value (300 C -> 573 K), the other a worse-but-still-
+    # passing quality mark with a realistic value. Ranking by quality
+    # mark alone (the old behavior) would select the impossible one,
+    # which then fails physical-bounds QC downstream -- losing the
+    # usable duplicate entirely. The fix folds physical-value eligibility
+    # into duplicate selection itself (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0)],
+        [
+            level(1, pressure=850., temperature=300., temperature_quality=1, level_index=0),
+            level(1, pressure=850., temperature=15., temperature_quality=2, level_index=1),
+        ],
+    )
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert data['mask_t'][0][0, 0]
+    assert data['values_t'][0][0, 0] == pytest.approx(15. + 273.15)
+
+
 def test_unphysical_height_qc_rejected(tmp_path):
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., height=70000.)])
@@ -254,6 +276,43 @@ def test_humidity_masked_above_pressure_floor(tmp_path):
     assert not data['mask_q'][0][1, 0]  # 200 hPa: above the floor, floor-masked
     assert data['values_q'][0][1, 0] == 0.  # floor-masked: never assigned, stays at the zero fill
     assert data['values_q'][0][0, 0] == pytest.approx(4000. / 1.e6)
+
+
+def test_humidity_pressure_floor_checked_against_real_pressure_not_nominal_level(tmp_path):
+    # 'nearest' mode snaps a 290 hPa report to the single 300 hPa model
+    # level -- checking the NOMINAL level (300, not itself below the
+    # 300 hPa floor) would wrongly keep this observation; the candidate's
+    # own REAL reported pressure (290, below the floor) must exclude it
+    # (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=290., q=4000.)])
+    data = load(
+        tmp_path, [t0], {'q': [300.]}, ['q'],
+        humidity_min_pressure_hpa=300., vertical_interpolation='nearest',
+    )
+    assert not data['mask_q'][0][0, 0]
+
+
+def test_humidity_pressure_floor_excluded_candidate_cannot_displace_a_valid_one(tmp_path):
+    # Both rows snap to the same 300 hPa model level under 'nearest'. The
+    # below-floor row has the BETTER quality mark -- if the floor isn't
+    # applied until after duplicate selection (using the nominal level,
+    # which never excludes anything here), it wins the slot and the
+    # above-floor row that should have been kept is lost (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0)],
+        [
+            level(1, pressure=290., q=4000., humidity_quality=1, level_index=0),
+            level(1, pressure=310., q=3000., humidity_quality=2, level_index=1),
+        ],
+    )
+    data = load(
+        tmp_path, [t0], {'q': [300.]}, ['q'],
+        humidity_min_pressure_hpa=300., vertical_interpolation='nearest',
+    )
+    assert data['mask_q'][0][0, 0]
+    assert data['values_q'][0][0, 0] == pytest.approx(3000. / 1.e6)
 
 
 def test_multiple_variables_and_slots(tmp_path):
@@ -430,6 +489,24 @@ def test_use_source_error_q_qsat_nan_when_background_missing(tmp_path):
     assert np.isnan(data['source_qsat_q'][0][0, 0])
 
 
+def test_use_source_error_q_qsat_withheld_when_qoe_missing_but_background_valid(tmp_path):
+    # QOE (humidity_error_tenths_percent) missing/invalid, but
+    # background_temperature/background_pressure ARE valid -- qsat itself
+    # would convert fine, but with no RH-error to pair it with,
+    # source_error_q ends up NaN. source_qsat_q must ALSO stay NaN here,
+    # not expose a "valid" qsat alongside a missing source error: the
+    # forward operator's ermin/ermax clamp assumes the two are valid
+    # together (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(
+        1, pressure=850., humidity_error_tenths_percent=None,
+        background_temperature=20., background_pressure=1000.,
+    )])
+    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], use_source_error=True)
+    assert np.isnan(data['source_error_q'][0][0, 0])
+    assert np.isnan(data['source_qsat_q'][0][0, 0])
+
+
 def test_use_source_error_t_inflated_for_suspect_quality_mark(tmp_path):
     # GSI's x1.2 inflation for quality mark 3 or 7 (suspect, not
     # rejected) -- quality_mark_max defaults to 3, so this ob still
@@ -586,6 +663,28 @@ def test_use_drift_time_falls_back_to_report_time_when_missing(tmp_path):
     data = load(tmp_path, [t0, t1], {'t': [850.]}, ['t'], use_drift_time=True)
     assert data['mask_t'][0][0, 0]
     assert data['mask_t'][1].shape[-1] == 0  # no station at all landed in slot 1
+
+
+def test_use_drift_time_widens_partition_discovery_for_a_boundary_report(tmp_path):
+    # A single verification time at 00Z with the default 3h tolerance:
+    # the UN-drifted window [21:00, 03:00] ties to 00Z alone at the exact
+    # 3h midpoint (_nearest_cycle's own tie-break favors the query's own
+    # cycle) -- so the 18Z partition, which actually holds this report,
+    # would never be opened without widening discovery for
+    # use_drift_time. The report itself launched at 20:30Z (just outside
+    # the un-drifted window); +1h of drift puts its one level at 21:30Z,
+    # inside the 3h window around 00Z (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    launch = datetime(2014, 12, 31, 20, 30)
+    write_cycle(
+        tmp_path, datetime(2014, 12, 31, 18), [report(1, time=launch)],
+        # temperature=-10 (not level()'s own default 300 C -> 573 K, which
+        # fails physical-bounds QC, unrelated to what this test checks).
+        [level(1, pressure=850., temperature=-10., drift_time_hours=1.0)],
+    )
+    write_cycle(tmp_path, t0, [], [])  # the 00Z cycle directory must exist too
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True)
+    assert data['mask_t'][0][0, 0]
 
 
 def test_use_drift_position_gives_each_level_its_own_position(tmp_path):

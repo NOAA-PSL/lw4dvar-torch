@@ -235,6 +235,55 @@ def test_raobs_gather_per_level_uses_different_neighbors_per_level():
     assert torch.allclose(result, torch.tensor([[10.], [60.]]))
 
 
+def test_raobs_gather_per_level_field_level_idx_overrides_own_level():
+    # field_level_idx (log-linear's neighbor index) selects which row of
+    # `field` is sampled, independently of which row of `idx`/`wts` (the
+    # horizontal weights) is used -- level0's OWN weights (point0) applied
+    # to level1's FIELD row, and vice versa.
+    field = torch.tensor([[10., 20., 30.], [40., 50., 60.]])
+    idx = torch.tensor([[[0]], [[2]]])   # level0's own weights pick point0, level1's pick point2
+    wts = torch.tensor([[[1.0]], [[1.0]]])
+    field_level_idx = torch.tensor([[1], [0]])  # level0 samples field row1, level1 samples field row0
+    result = utils._raobs_gather_per_level(field, idx, wts, field_level_idx=field_level_idx)
+    # level0: field[1, point0]=40. level1: field[0, point2]=30.
+    assert torch.allclose(result, torch.tensor([[40.], [30.]]))
+
+
+def test_raobs_log_linear_with_drift_position_uses_current_levels_horizontal_weights():
+    # Regression for PR #29's review: with BOTH use_drift_position and
+    # vertical_interpolation='log-linear', the neighbor level's value for
+    # the vertical blend must be sampled at the CURRENT level's own
+    # drift-corrected horizontal position, not reused from the already
+    # per-level-interpolated model_obspace (whose neighbor row used the
+    # NEIGHBOR's own, different position) -- that would mix horizontal
+    # locations into the vertical correction.
+    decoded = {'t': torch.tensor([[1000., 2000., 3000.], [4000., 5000., 6000.]])}
+    raobs_traj = {
+        'variables': ['t'],
+        'interp_idx': [None], 'interp_wts': [None],
+        # level0's own drift position picks point0; level1's picks point2.
+        'interp_idx_t': torch.tensor([[[[0]], [[2]]]], dtype=torch.int64),   # (1, 2, 1, 1)
+        'interp_wts_t': torch.tensor([[[[1.0]], [[1.0]]]]),
+        'values_t': torch.as_tensor([[[0.], [0.]]], dtype=torch.float32),
+        'mask_t': torch.as_tensor([[[True], [True]]]),
+        'error_t': 1.0,
+        'tuv_bg_check': None,
+        'vertical_interpolation': 'log-linear',
+        # level0's vertical neighbor is level1, level1's is level0; alpha=1
+        # so the blend is fully the neighbor value, making a wrong
+        # (mis-positioned) answer unmistakable.
+        'vert_neighbor_idx_t': torch.tensor([[[1], [0]]], dtype=torch.int64),
+        'vert_alpha_t': torch.tensor([[[1.0], [1.0]]]),
+    }
+    results = utils._compute_raobs_observation_diagnostics_at_time(
+        None, decoded, raobs_traj, _FakeRaobsGridInterp(None), 0)
+    _, model_equivalent, _, _ = results['t']
+    # Correct: neighbor level's field sampled at THIS level's own position
+    # (level0 -> decoded['t'][1, point0]=4000; level1 -> decoded['t'][0, point2]=3000).
+    # The bug would instead give [[6000.], [1000.]] (the neighbor's OWN position).
+    assert torch.allclose(model_equivalent, torch.tensor([[4000.], [3000.]]))
+
+
 def test_raobs_use_drift_position_applies_per_level_horizontal_weights():
     # 2 levels, 1 station, 3 grid points with distinct values. Each level
     # picks a DIFFERENT grid point via its own interp_idx_t/interp_wts_t --
@@ -321,7 +370,7 @@ def test_raobs_tuv_gsi_ermin_ermax_clamps_gross_check_not_the_weight():
     # while effective_error (the weight) stays the real, unclamped 0.5.
     raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=1.0, tuv_bg_check=4.0)
     raobs_traj['error_t'] = torch.as_tensor([[[0.5, 0.5]]])
-    raobs_traj['is_source_error_t'] = True
+    raobs_traj['is_source_error_t'] = torch.as_tensor([[[True, True]]])
     raobs_traj['ermin_t'] = 1.0
     raobs_traj['ermax_t'] = 2.0
     results = utils._compute_raobs_observation_diagnostics_at_time(
@@ -329,6 +378,56 @@ def test_raobs_tuv_gsi_ermin_ermax_clamps_gross_check_not_the_weight():
     _, _, effective_error, used = results['t']
     assert effective_error.tolist() == [[0.5, 0.5]]
     assert used.tolist() == [[True, True]]
+
+
+def test_raobs_tuv_gsi_clamp_is_per_cell_not_whole_variable():
+    # Station 0's error_t fell back to error_std (no archive value at
+    # that cell -- is_source_error_t False there) even though station 1's
+    # DID come from the archive (True there) -- both stations share one
+    # use_source_error: True variable. The clamp (ermin=1.0) must only
+    # raise the gross-check denominator for station 1, not station 0's
+    # fallback value, even though both have the same raw error (0.5).
+    raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=1.0, tuv_bg_check=4.0)
+    raobs_traj['error_t'] = torch.as_tensor([[[0.5, 0.5]]])
+    raobs_traj['is_source_error_t'] = torch.as_tensor([[[False, True]]])
+    raobs_traj['ermin_t'] = 1.0
+    raobs_traj['ermax_t'] = 2.0
+    results = utils._compute_raobs_observation_diagnostics_at_time(
+        None, {'t': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
+    _, _, effective_error, used = results['t']
+    # effective_error (the Jo weight) is unclamped at both, as always.
+    assert effective_error.tolist() == [[0.5, 0.5]]
+    # station 0 (fallback, not clamped): 4*0.5=2.0 < |O-B|=3.0 -> rejected.
+    # station 1 (archive, clamped to ermin=1.0): 4*1.0=4.0 >= 3.0 -> passes.
+    assert used.tolist() == [[False, True]]
+
+
+def test_raobs_effective_error_nonfinite_rejected_even_with_bg_check_disabled():
+    # A missing archived background can leave q's default AND source
+    # error both NaN at read time -- with no bg_check configured to
+    # screen it, `used` must still reject it rather than let
+    # _raobs_term divide by a non-finite weight later.
+    background = torch.zeros(1, 2)
+    raobs_traj = {
+        'variables': ['q'],
+        'interp_idx': [None], 'interp_wts': [None],
+        'values_q': torch.as_tensor([[[0.01, 0.01]]], dtype=torch.float32),
+        'mask_q': torch.as_tensor([[[True, True]]]),
+        'default_error_q': torch.as_tensor([[[float('nan'), 0.002]]]),
+        'q_bg_check': None,
+    }
+    results = utils._compute_raobs_observation_diagnostics_at_time(
+        None, {'q': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
+    _, _, _, used = results['q']
+    assert used.tolist() == [[False, True]]
+
+
+def test_raobs_effective_error_nonpositive_rejected():
+    raobs_traj, background = _raobs_traj_case([3.0, 3.0], error=0.0, tuv_bg_check=None)
+    results = utils._compute_raobs_observation_diagnostics_at_time(
+        None, {'t': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
+    _, _, _, used = results['t']
+    assert used.tolist() == [[False, False]]
 
 
 def test_raobs_tuv_clamp_not_applied_to_flat_error_std():

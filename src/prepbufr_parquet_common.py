@@ -58,9 +58,18 @@ def _nearest_cycle(moment, prefer):
     return floor_cycle + _CYCLE_SPAN
 
 
-def cycle_directories(directory, verification_times, tolerance_hours):
+def cycle_directories(directory, verification_times, tolerance_hours, allow_missing=False):
     """Return the six-hourly archive cycle directories that can hold a
-    report within `tolerance_hours` of each verification time."""
+    report within `tolerance_hours` of each verification time.
+
+    `allow_missing`: if False (default), every computed cycle directory
+    must exist on disk, or this raises -- a real guard against a
+    misconfigured/incomplete archive. If True, a computed cycle directory
+    that doesn't exist is silently skipped instead (used by raobs_parquet.py
+    to widen partition discovery for `use_drift_time` into a margin that may
+    legitimately run off the archive's own date-range boundary, without
+    losing the error-on-missing guarantee for the caller's own, unwidened
+    request)."""
     directory = Path(os.path.expanduser(directory)).resolve()
     if not directory.is_dir():
         raise FileNotFoundError(
@@ -80,6 +89,8 @@ def cycle_directories(directory, verification_times, tolerance_hours):
     for cycle in sorted(cycles):
         path = directory / cycle.strftime('%Y-%m-%d') / cycle.strftime('%H')
         if not path.is_dir():
+            if allow_missing:
+                continue
             raise FileNotFoundError(
                 'PREPBUFR parquet cycle directory not found: '+str(path)
             )

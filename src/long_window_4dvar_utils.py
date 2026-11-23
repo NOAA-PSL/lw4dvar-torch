@@ -1439,7 +1439,7 @@ def _raobs_vertical_interp_weights(levels_hpa_base, pressure):
     return neighbor_idx.astype(np.int64), alpha.astype(np.float32)
 
 
-def _raobs_gather_per_level(field, idx, wts):
+def _raobs_gather_per_level(field, idx, wts, field_level_idx=None):
     """Horizontal k-NN/bilinear interpolation with PER-LEVEL weights
     (`observations.raobs.use_drift_position`), vs. `grid_interp.interp`'s
     own per-STATION-shared weights (`field[..., idx]`, broadcasting one
@@ -1450,13 +1450,24 @@ def _raobs_gather_per_level(field, idx, wts):
     `get_raobs`'s drift-corrected `grid_interp.weights` call at that
     level's own position. Returns (n_levels, capacity).
 
+    `field_level_idx` (optional): (n_levels, capacity) int tensor
+    selecting which row of `field` each cell gathers from -- defaults to
+    the row's own index (`arange(n_levels)`, i.e. `field[L]` interpolated
+    at `idx[L]`/`wts[L]`, level `L`'s own position). Pass the log-linear
+    neighbor index here to interpolate the NEIGHBOR level's field at the
+    CURRENT level's own horizontal position (`idx`/`wts` stay level `L`'s
+    own), instead of reusing the neighbor's own, different position --
+    see `_compute_raobs_observation_diagnostics_at_time`.
+
     Uses advanced indexing (two same-shaped index tensors) rather than
     expanding `field` to (capacity, n_points) first -- that would
     materialize a huge intermediate for a large unstructured grid (AIFS's
     N320 mesh has 542080 points).
     """
-    n_levels = field.shape[0]
-    level_rows = torch.arange(n_levels, device=field.device)[:, None, None].expand_as(idx)
+    n_levels, capacity = idx.shape[:2]
+    if field_level_idx is None:
+        field_level_idx = torch.arange(n_levels, device=field.device)[:, None].expand(n_levels, capacity)
+    level_rows = field_level_idx[:, :, None].expand_as(idx)
     gathered = field[level_rows, idx]          # (n_levels, capacity, k)
     return (gathered * wts).sum(-1)             # (n_levels, capacity)
 
@@ -1537,8 +1548,16 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     # background_temperature_c/background_pressure_mb, read in
     # raobs_parquet.py, so the table is resolved and passed in here
     # rather than applied afterward the way error_std's t/u/v tables are.
+    # A configured table REPLACES the default wholesale rather than being
+    # merged knot-by-knot with it (PR #29's review): merging would leave
+    # default pressure knots sitting between the user's own entries,
+    # silently changing the ln(p)-interpolated value at every pressure
+    # that falls near one of those leftover default knots instead of
+    # interpolating directly between the user's own table entries. `or`
+    # also treats an explicit `null` the same as omitted, instead of
+    # crashing _interp_rh_percent_table's dict expansion on it.
     q_error_rh_percent = (
-        {**RAOBS_Q_ERROR_RH_PERCENT, **exp.get('raobs_q_error_rh_percent', {})}
+        (exp.get('raobs_q_error_rh_percent') or RAOBS_Q_ERROR_RH_PERCENT)
         if 'q' in bases else None
     )
     data = load_raobs_parquet(
@@ -1605,8 +1624,12 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     # t/u/v: a per-level table (RAOBS_TUV_ERROR_STD, GSI's own real
     # prepobs_errtable.global, by default). q: RH_fraction * qsat(background)
     # (RAOBS_Q_ERROR_RH_PERCENT by default, resolved above and already
-    # applied in raobs_parquet.py -- see `default_error_q` below).
-    error_std = {**RAOBS_TUV_ERROR_STD, **exp.get('raobs_error_std', {})}
+    # applied in raobs_parquet.py -- see `default_error_q` below). Merged
+    # BY VARIABLE NAME (t/u/v each override independently, unlike
+    # q_error_rh_percent's per-knot table above) -- `or {}` treats an
+    # explicit `raobs_error_std: null` the same as omitted, instead of
+    # crashing on `**None` (PR #29's review).
+    error_std = {**RAOBS_TUV_ERROR_STD, **(exp.get('raobs_error_std') or {})}
     # Per-variable {threshold, absolute} override of tuv_bg_check/
     # q_bg_check (optional; see RAOBS_TUV_BG_CHECK's docstring and PR #29's
     # review comment) -- unlisted variables keep using the shared scalar.
@@ -1722,6 +1745,11 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                 # (flat or per-level) wherever the archive didn't have one
                 # (NaN).
                 source = torch.zeros((n_obs, n_levels, capacity), dtype=torch.float32, device=device)
+                # Per-CELL provenance (not a single whole-variable flag,
+                # see below) -- True only where this cell's own archive
+                # value was actually used, False where it fell back to
+                # error_std instead.
+                is_source_valid = torch.zeros((n_obs, n_levels, capacity), dtype=torch.bool, device=device)
                 if torch.is_tensor(flat_error):
                     fallback_full = flat_error[:, None].expand(n_levels, capacity)
                 else:
@@ -1729,8 +1757,17 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                 for j in range(n_obs):
                     n = data['source_error_'+base][j].shape[-1]
                     source_j = torch.as_tensor(data['source_error_'+base][j], device=device)
-                    source[j, :, :n] = torch.where(torch.isfinite(source_j), source_j, fallback_full[:, :n])
+                    valid_j = torch.isfinite(source_j)
+                    source[j, :, :n] = torch.where(valid_j, source_j, fallback_full[:, :n])
+                    is_source_valid[j, :, :n] = valid_j
                 raobs_traj['error_'+base] = source
+                # Only a cell whose OWN archive value was actually used
+                # (not one that fell back to error_std, even though the
+                # whole variable is "use_source_error: True") gets GSI's
+                # ermin/ermax gross-check clamp -- a whole-variable flag
+                # here would wrongly clamp fallback cells too (PR #29's
+                # review). See _compute_raobs_observation_diagnostics_at_time.
+                raobs_traj['is_source_error_'+base] = is_source_valid
             elif torch.is_tensor(flat_error):
                 # Per-level table, no archive source error available --
                 # broadcast across every obs slot/station (a view, not a
@@ -1738,11 +1775,6 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                 raobs_traj['error_'+base] = flat_error[None, :, None].expand(n_obs, n_levels, capacity)
             else:
                 raobs_traj['error_'+base] = flat_error
-            # Only the genuine archive source value (not a user-configured
-            # error_std table, even the same UFO/GSI reference numbers)
-            # gets GSI's ermin/ermax gross-check clamp -- see
-            # _compute_raobs_observation_diagnostics_at_time.
-            raobs_traj['is_source_error_'+base] = is_source_error
             bgc = exp.get('raobs_tuv_bg_check', RAOBS_TUV_BG_CHECK)
             raobs_traj['tuv_bg_check'] = float(bgc) if bgc else None
             raobs_traj['ermin_'+base] = RAOBS_TUV_ERMIN[base]
@@ -1979,7 +2011,16 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
     level's own drift-corrected position, from `get_raobs`), horizontal
     interpolation uses `_raobs_gather_per_level` instead of `grid_interp.
     interp`'s single weight set shared across every level -- see
-    docs/integrate_multiple_parquetobs.md.
+    docs/integrate_multiple_parquetobs.md. Combined with `log-linear`, the
+    neighbor level's value for the vertical blend is ALSO sampled via
+    `_raobs_gather_per_level` (at the CURRENT level's own `interp_idx_
+    <base>`/`interp_wts_<base>`, just naming the neighbor's row of
+    `decoded[base]` via `field_level_idx`) rather than gathered out of the
+    already-interpolated `model_obspace` -- that would reuse the
+    NEIGHBOR's own drift position instead of the current level's,
+    mixing horizontal locations into the vertical correction (PR #29's
+    review).
+
     QC is the read-time QC already folded into `mask_<base>`, plus an
     optional background check evaluated at the current state: reject
     |O-B| > threshold * qc_error, OR (if configured) |O-B| > an absolute
@@ -1987,19 +2028,30 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
     `_raobs_gross_check_threshold` (UFO/GSI's per-variable form if
     `observations.raobs.bg_check` configured one, else the shared
     `q_bg_check`/`tuv_bg_check` scalar with no absolute limit).
-    `qc_error` is `effective_error` (the actual Jo weight) EXCEPT when
-    `use_source_error` is in effect, where it's additionally clamped into
-    GSI's own ermin/ermax range for this comparison only -- the real,
-    unclamped per-ob archive value still does the actual weighting (see
+    `qc_error` is `effective_error` (the actual Jo weight) EXCEPT PER CELL
+    where `use_source_error` is in effect AND that cell's own archive
+    value was actually used (not one that fell back to error_std/the
+    default table), where it's additionally clamped into GSI's own
+    ermin/ermax range for this comparison only -- the real, unclamped
+    per-ob archive value still does the actual weighting (see
     RAOBS_TUV_ERMIN/ERMAX/RAOBS_Q_ERMIN_PERCENT/ERMAX_PERCENT).
+
+    Regardless of whether a background check is configured, `used` is
+    always additionally restricted to cells with a finite, positive
+    `effective_error` -- a missing archived background (leaving both the
+    default and source q errors NaN) could otherwise pass read-time QC
+    and reach `_raobs_term` with no finite weight, making the total loss
+    non-finite (PR #29's review).
     """
     idx = raobs_traj['interp_idx'][oind]
     wts = raobs_traj['interp_wts'][oind]
     results = {}
     for base in raobs_traj['variables']:
-        if 'interp_idx_'+base in raobs_traj:
-            model_obspace = _raobs_gather_per_level(
-                decoded[base], raobs_traj['interp_idx_'+base][oind], raobs_traj['interp_wts_'+base][oind])
+        own_idx = raobs_traj.get('interp_idx_'+base)
+        own_wts = raobs_traj.get('interp_wts_'+base)
+        if own_idx is not None:
+            own_idx, own_wts = own_idx[oind], own_wts[oind]
+            model_obspace = _raobs_gather_per_level(decoded[base], own_idx, own_wts)
         else:
             model_obspace = grid_interp.interp(idx, wts, decoded[base])  # (n_levels, capacity)
         if raobs_traj.get('vertical_interpolation', 'exact') == 'log-linear':
@@ -2008,7 +2060,18 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
             # sits exactly on its assigned level, or there was none here).
             neighbor_idx = raobs_traj['vert_neighbor_idx_'+base][oind]  # (n_levels, capacity)
             alpha = raobs_traj['vert_alpha_'+base][oind]
-            neighbor_vals = torch.gather(model_obspace, 0, neighbor_idx)
+            if own_idx is not None:
+                # use_drift_position: the neighbor LEVEL's value must be
+                # sampled at the CURRENT level's own drift-corrected
+                # horizontal position (own_idx/own_wts), not the
+                # neighbor's -- gathering the neighbor's row straight out
+                # of model_obspace (as below) would reuse the neighbor's
+                # OWN position instead, mixing horizontal locations into
+                # the vertical blend (PR #29's review).
+                neighbor_vals = _raobs_gather_per_level(
+                    decoded[base], own_idx, own_wts, field_level_idx=neighbor_idx)
+            else:
+                neighbor_vals = torch.gather(model_obspace, 0, neighbor_idx)
             model_obspace = (1. - alpha) * model_obspace + alpha * neighbor_vals
         observation = raobs_traj['values_'+base][oind]
         mask = raobs_traj['mask_'+base][oind]
@@ -2061,21 +2124,32 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
             threshold, absolute = _raobs_gross_check_threshold(raobs_traj, base, 'tuv_bg_check')
             if threshold:
                 qc_error = effective_error
-                if raobs_traj.get('is_source_error_'+base, False):
+                is_source_valid = raobs_traj.get('is_source_error_'+base)
+                if is_source_valid is not None:
                     # GSI's own ermin/ermax clamp -- gross-check only, same
                     # reasoning as q above (effective_error, the actual Jo
                     # weight, stays the real unclamped archive value) --
-                    # and only for the genuine archive source, never a
-                    # user-configured error_std table (even the same UFO/
-                    # GSI reference numbers -- re-clamping a table against
-                    # itself would be redundant at best, distorting at the
-                    # table's own extremes at worst).
-                    qc_error = torch.clamp(
+                    # and only PER CELL where that cell's own archive
+                    # value was actually used (never a cell that fell
+                    # back to error_std, even though the whole variable
+                    # is use_source_error: True, and never a user-
+                    # configured error_std table -- re-clamping a table
+                    # against itself would be redundant at best,
+                    # distorting at the table's own extremes at worst).
+                    clamped = torch.clamp(
                         qc_error, min=raobs_traj['ermin_'+base], max=raobs_traj['ermax_'+base])
+                    qc_error = torch.where(is_source_valid[oind], clamped, qc_error)
                 passes = innovation.abs() <= threshold * qc_error
                 if absolute is not None:
                     passes = passes & (innovation.abs() <= absolute)
                 used = used & passes.detach()
+        # Independent of whether a background check ran above: an
+        # observation whose effective error is non-finite (e.g. a missing
+        # archived background left source/default q error NaN, with no
+        # bg_check configured to screen it) or non-positive must never be
+        # used -- otherwise _raobs_term divides by it and the total loss
+        # goes non-finite (PR #29's review).
+        used = used & torch.isfinite(effective_error) & (effective_error > 0)
         results[base] = (innovation, safe_model_obspace, effective_error, used)
     return results
 

@@ -109,6 +109,18 @@ _VARIABLE_ERROR_COLUMNS = {
 _RAOBS_INFLATE_QM = (3, 7)
 _RAOBS_INFLATE_PRESSURE_HPA = {'t': 100., 'u': 50., 'v': 50.}
 
+# `use_drift_time` can shift a level's EFFECTIVE time away from its
+# report's own (un-drifted) observation_time by up to this much (a real
+# deep sounding: +1.62h by 5 hPa, PR #29's drift-time discussion) --
+# `_profile_records` widens which cycle PARTITIONS it opens by this
+# margin so a level whose drift-corrected time falls inside the
+# verification window, but whose report's own un-corrected time doesn't
+# (e.g. a report right at a tolerance window's edge, drifting into it),
+# still gets its home partition read. The per-level acceptance check
+# still uses the real, un-widened `time_tolerance_hours` against the
+# corrected time -- this constant only affects which files get opened.
+_RAOBS_MAX_DRIFT_HOURS = 3.0
+
 
 def _gsi_inflate_error(raw, quality, pressure=None, pressure_threshold=None):
     factor = np.where(np.isin(quality, _RAOBS_INFLATE_QM), 1.2, 1.0)
@@ -175,6 +187,7 @@ def _profile_records(
     vertical_interpolation='exact',
     use_drift_position=False,
     q_error_rh_percent=None,
+    humidity_min_pressure_hpa=None,
 ):
     """Return {(slot_index, station_key): record} before fixed-shape padding.
 
@@ -225,7 +238,24 @@ def _profile_records(
     `drift_time_hours` is missing/non-finite for a given level. This can
     split one profile's levels across multiple slots -- no special
     handling needed: the (slot_index, station_key) keying below already
-    treats each slot independently.
+    treats each slot independently. Partition discovery (which cycle
+    directories get opened at all, below) is widened by
+    `_RAOBS_MAX_DRIFT_HOURS` to cover this -- otherwise a report sitting
+    right at (or just outside) the un-drifted tolerance window's edge
+    could have its home cycle directory never opened at all, even though
+    its drift-corrected time belongs inside the window (PR #29's review).
+
+    `humidity_min_pressure_hpa`: if set, a 'q' candidate row is dropped
+    entirely -- not even a duplicate-selection candidate -- whenever its
+    own REPORTED pressure (not the model level it would be matched to) is
+    below this floor. Applied here, before duplicate selection, rather
+    than after the fact on the final selection's nominal model-level
+    pressure: in 'nearest'/'log-linear' modes a kept level's own real
+    pressure can differ meaningfully from its assigned model level (e.g.
+    290 hPa snapped to a 300 hPa model level), so checking the model level
+    would let a floor-violating candidate win a duplicate slot over a
+    candidate that would have passed, permanently losing the usable
+    observation (PR #29's review).
 
     `levels_hpa`: {model_base_name: 1D array of exact pressures (hPa) to
     match} -- a level row is kept only when its `pressure_mb` is within
@@ -237,11 +267,14 @@ def _profile_records(
     ranked by actual QC eligibility, not just the raw PREPBUFR quality
     mark: a row whose own quality fails `quality_mark_max`, OR whose
     (quality-passing, non-category-4) height fails the physical-height-
-    bounds/below-station checks, ranks behind any row that passes both --
+    bounds/below-station checks, OR whose own value fails the physical-
+    value bounds (`_RAOBS_PHYSICAL_BOUNDS`, applied again later as QC but
+    also checked HERE), ranks behind any row that passes all three --
     otherwise picking the single numerically-best-quality-mark duplicate
     (the only criterion previously used) could retain a row with a
-    garbage height over an available row that would have passed every
-    check, which then wrongly fails height-based QC downstream. Within
+    garbage height or an impossible value over an available row that
+    would have passed every check, which then wrongly fails QC downstream
+    with the usable duplicate already discarded (PR #29's review). Within
     the same pass/fail bucket, lower (better) quality mark still wins, so
     an all-bad set of duplicates still keeps its best candidate
     (`load_raobs_parquet` still flags it bad via its own QC pass over the
@@ -254,6 +287,17 @@ def _profile_records(
     prepbufr_classes = tuple(str(c).upper() for c in prepbufr_classes)
 
     cycles = common.cycle_directories(directory, verification_times, time_tolerance_hours)
+    if use_drift_time:
+        # See the docstring above: widen which partitions get opened by
+        # the maximum supported drift, tolerating missing directories in
+        # just that extra margin (e.g. at the archive's own date-range
+        # boundary) -- the original, unwidened `cycles` above still raise
+        # as before if genuinely missing.
+        padded_cycles = common.cycle_directories(
+            directory, verification_times, time_tolerance_hours + _RAOBS_MAX_DRIFT_HOURS,
+            allow_missing=True,
+        )
+        cycles = sorted(set(cycles) | set(padded_cycles))
     verification = np.asarray([
         np.datetime64(common.to_datetime(value), 's') for value in verification_times
     ])
@@ -421,6 +465,11 @@ def _profile_records(
                 })
 
                 for variable in variables:
+                    if (
+                        variable == 'q' and humidity_min_pressure_hpa is not None
+                        and pressure_value < float(humidity_min_pressure_hpa)
+                    ):
+                        continue  # not an obs at all here, not even QC-flagged -- see docstring above
                     variable_levels = levels_hpa[variable]
                     differences = np.abs(variable_levels - pressure_value)
                     level_index = int(np.argmin(differences))
@@ -455,6 +504,15 @@ def _profile_records(
                         )
                     )
                     quality_bad = not _quality_passes(quality, quality_mark_max)
+                    # Physical-value sanity (the same bounds load_raobs_parquet
+                    # applies again as QC) checked HERE too, as part of
+                    # duplicate-selection eligibility -- otherwise an
+                    # impossible value with a merely better quality mark
+                    # could win the slot over a value that would have
+                    # passed every check, permanently losing it (see
+                    # docstring above).
+                    bounds = _RAOBS_PHYSICAL_BOUNDS.get(variable)
+                    physical_bad = bounds is not None and not (bounds[0] <= value <= bounds[1])
                     # (worse-bucket-first, then numeric quality mark -- a
                     # non-finite quality sorts last within its bucket, same
                     # as the pre-existing tie-break). 'nearest'/'log-linear'
@@ -465,7 +523,7 @@ def _profile_records(
                     # win (irrelevant for 'exact', where the tight tolerance
                     # already made this moot).
                     priority = (
-                        quality_bad or height_bad,
+                        quality_bad or height_bad or physical_bad,
                         quality if np.isfinite(quality) else np.inf,
                         differences[level_index] if vertical_interpolation != 'exact' else 0.,
                     )
@@ -572,9 +630,12 @@ def load_raobs_parquet(
     QC (physical height bounds, non-monotonic height-with-pressure,
     below-station-elevation, source PREPBUFR quality mark) is applied per
     station using whichever variable's `height` happened to be collocated
-    with that level. `humidity_min_pressure_hpa`, if set, additionally masks
-    'q' at any level with pressure below it (radiosonde humidity sensors are
-    unreliable in the upper troposphere/stratosphere).
+    with that level. `humidity_min_pressure_hpa`, if set, excludes any 'q'
+    candidate whose own reported pressure is below it (radiosonde humidity
+    sensors are unreliable in the upper troposphere/stratosphere) -- applied
+    in `_profile_records`, BEFORE duplicate selection, against each
+    candidate's real reported pressure (see that function's docstring for
+    why, not the final selection's matched model-level pressure).
 
     `use_drift_time`: see `_profile_records`'s docstring -- assigns each
     level to its own slot via the archive's `drift_time_hours`, instead of
@@ -602,7 +663,7 @@ def load_raobs_parquet(
         geopotential_height_min_m, geopotential_height_max_m, below_station_tolerance_m,
         use_source_error=use_source_error, use_drift_time=use_drift_time,
         vertical_interpolation=vertical_interpolation, use_drift_position=use_drift_position,
-        q_error_rh_percent=q_error_rh_percent,
+        q_error_rh_percent=q_error_rh_percent, humidity_min_pressure_hpa=humidity_min_pressure_hpa,
     )
     error_bases = tuple(
         v for v in variables
@@ -703,9 +764,6 @@ def load_raobs_parquet(
                             and height_m < station_elevation - float(below_station_tolerance_m)
                         ):
                             qc_flag |= QC_BELOW_STATION
-                    if v == 'q' and humidity_min_pressure_hpa is not None:
-                        if levels_hpa['q'][level_index] < float(humidity_min_pressure_hpa):
-                            continue  # not an obs at all here, not even QC-flagged
                     value = record['values'][key]
                     bounds = _RAOBS_PHYSICAL_BOUNDS.get(v)
                     if bounds is not None and not (bounds[0] <= value <= bounds[1]):
@@ -724,7 +782,19 @@ def load_raobs_parquet(
                             source_error[v][level_index, station_index] = source
                     if v in qsat_bases:
                         qsat = record['source_qsat'].get(key)
-                        if qsat is not None and np.isfinite(qsat) and qsat > 0.:
+                        # Only alongside a VALID source_error_<v> at this
+                        # same cell (written just above, when v is also in
+                        # error_bases, which it always is whenever
+                        # qsat_bases is non-empty) -- QOE missing/invalid
+                        # while the archive's background T/p still qsat-
+                        # converts fine must not expose a qsat with no
+                        # source error to pair it with (PR #29's review):
+                        # the forward operator's clamp assumes the two are
+                        # valid together.
+                        if (
+                            qsat is not None and np.isfinite(qsat) and qsat > 0.
+                            and np.isfinite(source_error[v][level_index, station_index])
+                        ):
                             source_qsat[v][level_index, station_index] = qsat
                     if v in default_error_bases:
                         default = record['default_error'].get(key)

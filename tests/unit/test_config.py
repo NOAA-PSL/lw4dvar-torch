@@ -259,6 +259,87 @@ def test_get_raobs_allows_tuv_for_total_water_checkpoint():
         utils.get_raobs(exp, FakeModel(), utils.get_logger(), None, {'step_lo': [0]})
 
 
+def test_get_raobs_error_std_null_treated_as_omitted(tmp_path):
+    """An explicit observations.raobs.error_std: null passes config
+    validation (it's just a dict value) but must not crash get_raobs's
+    dict-merge with the default table -- treated the same as omitted
+    (PR #29's review comment)."""
+    import numpy as np
+    import torch
+    from datetime import datetime
+    from test_raobs_parquet import write_cycle, report, level
+
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=10.)])
+
+    class FakeModel:
+        device = torch.device('cpu')
+
+        def pressure_levels(self, base):
+            return np.array([850.], dtype=np.float32)
+
+    class FakeGridInterp:
+        def weights(self, lon, lat, k=4, device=None):
+            return torch.zeros(k, dtype=torch.int64), torch.full((k,), 1. / k)
+
+    exp = {
+        'raobs_enabled': True, 'raobs_variables': ['temperature'],
+        'dt_obs': 6, 'date': '2015-01-01T00', 'raobs_path': str(tmp_path), 'obspath': str(tmp_path),
+        'raobs_error_std': None,
+    }
+    raobs_traj = utils.get_raobs(
+        exp, FakeModel(), utils.get_logger(), FakeGridInterp(),
+        {'step_lo': [0], 'alpha': [0.0], 'n_steps': 1},
+    )
+    expected = utils._interp_level_table(utils.RAOBS_TUV_ERROR_STD['t'], [850.])[0]
+    assert raobs_traj['error_t'].item() == pytest.approx(expected)
+
+
+def test_get_raobs_q_error_rh_percent_table_not_merged_with_defaults(tmp_path):
+    """A configured raobs.q_error_rh_percent table REPLACES the default
+    wholesale -- merging it knot-by-knot with RAOBS_Q_ERROR_RH_PERCENT
+    would leave default pressure knots (almost certainly including 850
+    hPa itself, a standard mandatory level) sitting between the user's
+    own two entries, so interpolating at 850 would return the DEFAULT
+    table's own value there instead of interpolating between the user's
+    1000/500 hPa entries (PR #29's review comment)."""
+    import math
+    import numpy as np
+    import torch
+    from datetime import datetime
+    from test_raobs_parquet import write_cycle, report, level
+    from raobs_parquet import _saturation_specific_humidity
+
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., background_temperature=20., background_pressure=1000.)])
+
+    class FakeModel:
+        device = torch.device('cpu')
+
+        def pressure_levels(self, base):
+            return np.array([850.], dtype=np.float32)
+
+    class FakeGridInterp:
+        def weights(self, lon, lat, k=4, device=None):
+            return torch.zeros(k, dtype=torch.int64), torch.full((k,), 1. / k)
+
+    exp = {
+        'raobs_enabled': True, 'raobs_variables': ['specific_humidity'],
+        'dt_obs': 6, 'date': '2015-01-01T00', 'raobs_path': str(tmp_path), 'obspath': str(tmp_path),
+        'raobs_q_error_rh_percent': {1000.: 20., 500.: 10.},
+    }
+    raobs_traj = utils.get_raobs(
+        exp, FakeModel(), utils.get_logger(), FakeGridInterp(),
+        {'step_lo': [0], 'alpha': [0.0], 'n_steps': 1},
+    )
+    tp = [math.log(500.), math.log(1000.)]
+    tv = [10., 20.]
+    expected_rh_fraction = np.interp(math.log(850.), tp, tv) / 100.
+    expected = expected_rh_fraction * _saturation_specific_humidity(293.15, 1000.)
+    assert raobs_traj['default_error_q'].item() == pytest.approx(expected, rel=1e-6)
+
+
 def test_ace2_defaults_to_ps_native(tmp_path):
     exp, _ = utils.load_config(write_config(tmp_path, model_backend='ace2'))
     assert exp['ps_operator'] == 'ps_native'

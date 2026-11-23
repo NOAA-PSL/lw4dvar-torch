@@ -1691,3 +1691,100 @@ table sourced from this RDASApp config rather than jswhit's single flat
 number), not a tweak to something existing -- flagged as a candidate
 future addition if/when picked up, deliberately not scoped further this
 session.
+
+## PR #29 Copilot review (review #5997548256): 9 correctness fixes (2026-11-20)
+
+GitHub Copilot's automated review on PR #29 found 9 new issues, spanning
+the vertical-interpolation/drift-position combination, the gross-check
+clamp's granularity, two config dict-merge crashes, and four
+`raobs_parquet.py` read-time bugs. All nine fixed, each with a new
+regression test (`tests/unit/test_solver_helpers.py`,
+`tests/unit/test_raobs_parquet.py`, `tests/unit/test_config.py`).
+
+- **`log-linear` + `use_drift_position` mixed horizontal locations**
+  (High): with both set, the vertical blend's neighbor-level value was
+  gathered straight out of `model_obspace` (`torch.gather(model_obspace,
+  0, neighbor_idx)`) -- but under `use_drift_position`, each row of
+  `model_obspace` was already horizontally interpolated at ITS OWN
+  level's drift position, so gathering the neighbor's row reused the
+  NEIGHBOR's position instead of the current level's. Fixed by giving
+  `_raobs_gather_per_level` an optional `field_level_idx` parameter
+  (which row of the decoded field to sample) independent of which row of
+  `idx`/`wts` (whose horizontal weights to apply) -- the neighbor blend
+  now samples the neighbor's pressure level at the CURRENT level's own
+  position (`long_window_4dvar_utils.py`).
+- **A missing effective error could reach the loss as non-finite**
+  (High): `used` only screened a non-finite/non-positive `effective_error`
+  through the optional background check -- `q_bg_check: null` (or
+  `tuv_bg_check: null`) left it unscreened, so a read-time-QC-passing
+  observation with a NaN error (e.g. a missing archived background
+  leaving both `default_error_q` and `source_error_q` NaN) could reach
+  `_raobs_term` and make the total loss non-finite.
+  `_compute_raobs_observation_diagnostics_at_time` now ANDs `used` with
+  `isfinite(effective_error) & (effective_error > 0)` unconditionally,
+  after either branch.
+- **The GSI ermin/ermax clamp was gated per-VARIABLE, not per-CELL**
+  (Medium): `is_source_error_<base>` was a single bool for the whole
+  t/u/v variable (`'source_error_'+base in data`), so a cell that fell
+  back to `error_std` (the archive had no value there) got clamped
+  anyway, as if it were a genuine archive value. Now a per-(obs, level,
+  station) bool tensor, set only where that cell's own archive value was
+  actually used; the clamp applies `torch.where(is_source_valid[oind],
+  clamped, qc_error)` instead of an all-or-nothing Python `if`.
+- **`observations.raobs.error_std: null` / `q_error_rh_percent` merge
+  bug** (Medium x2): `{**RAOBS_TUV_ERROR_STD, **exp.get('raobs_error_std',
+  {})}` crashed on an explicit YAML `null` (`exp.get` still returns the
+  stored `None`, not the default, when the key is present) -- fixed with
+  `exp.get('raobs_error_std') or {}`. Separately, `q_error_rh_percent`'s
+  per-PRESSURE-KNOT table was merged the same way
+  (`{**RAOBS_Q_ERROR_RH_PERCENT, **user_table}`), which is wrong for a
+  knot table specifically: a partial override like `{1000: 20, 500: 10}`
+  left the DEFAULT table's own knots (almost certainly including 850 hPa
+  itself) sitting between the user's two entries, so ln(p)-interpolating
+  at 850 hPa returned the default's own value there instead of
+  interpolating between the user's 1000/500 hPa entries. Fixed to
+  `exp.get('raobs_q_error_rh_percent') or RAOBS_Q_ERROR_RH_PERCENT` --
+  the configured table replaces the default wholesale, never merges with
+  it knot-by-knot (`get_raobs`).
+- **Cycle-partition discovery didn't account for `use_drift_time`**
+  (Medium): `_profile_records` called `common.cycle_directories` with
+  the UN-drifted `time_tolerance_hours`, so a report sitting right at
+  (or just outside) the undrifted window's edge -- e.g. a 20:30Z launch
+  with a first slot at 00Z and a 3h tolerance, where `_nearest_cycle`'s
+  own tie-break at the exact 3h midpoint favors the query's own cycle --
+  could have its home cycle directory never opened at all, even though
+  its drift-corrected time (21:30Z, +1h drift) belongs inside the
+  window. Fixed by widening discovery by a new `_RAOBS_MAX_DRIFT_HOURS`
+  (3.0) margin, tolerating missing padding directories at the archive's
+  own date-range boundary (`common.cycle_directories` gained an
+  `allow_missing` parameter for exactly this, default `False` so every
+  other caller -- `psobs_parquet.py` included -- is unaffected) while
+  the original, unwidened request still raises as before if genuinely
+  missing; the per-level acceptance check still uses the real,
+  un-widened tolerance against the corrected time.
+- **Duplicate selection ignored physical-value bounds / the humidity
+  floor** (Medium x2): `_profile_records`'s duplicate-selection priority
+  bucketed on quality mark and height eligibility only, not the
+  physical-value bounds (`_RAOBS_PHYSICAL_BOUNDS`) applied later as QC --
+  so an impossible value with a merely better quality mark could win a
+  duplicate slot over a value that would have passed every check,
+  permanently losing it once the winning (impossible) value failed QC
+  downstream. Now folded into the same priority tuple's first bucket.
+  Separately, `humidity_min_pressure_hpa` was checked against the
+  matched MODEL level's nominal pressure (in `load_raobs_parquet`, after
+  selection), not each candidate's own REPORTED pressure -- wrong in
+  'nearest'/'log-linear' modes, where a kept level's real pressure can
+  differ from its assigned model level (e.g. 290 hPa snapped to 300 hPa)
+  enough to matter at the floor. Moved into `_profile_records`, checked
+  against each raw row's own pressure BEFORE it ever becomes a
+  duplicate-selection candidate; the old nominal-level check in
+  `load_raobs_parquet` removed as dead/wrong code.
+- **`source_qsat_q` could be finite with no corresponding
+  `source_error_q`** (Medium): the two were populated independently --
+  `source_qsat_q` from the archive's background T/p alone, `source_error_q`
+  additionally needing a valid QOE (`humidity_error_tenths_percent`). A
+  report with valid background but missing/invalid QOE got a finite
+  qsat paired with a NaN source error, which the forward operator's
+  ermin/ermax clamp (keyed off `source_qsat_q`'s presence) assumes never
+  happens. `load_raobs_parquet` now only records `source_qsat_q` where
+  the corresponding `source_error_q` cell is already finite.
