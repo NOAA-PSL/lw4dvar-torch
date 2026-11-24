@@ -163,8 +163,15 @@ def run(tmp_path, ckpt):
     """Run the solver on the mini ACE2. Returns (returncode, log, exp,
     windows, output directory)."""
     cfg, exp, windows = config(tmp_path, ckpt)
-    # one thread: the result must not depend on the machine's core count
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    # One thread: the result must not depend on the machine's core count.
+    # ATEN_CPU_CAPABILITY pins torch's CPU kernel dispatch to AVX2 (every
+    # runner in GitHub's fleet supports it) instead of letting it pick
+    # AVX-512/FMA on some machines and not others -- that dispatch choice
+    # was the confirmed source of this job's cross-machine float32 drift
+    # (PR #29's review: a same-runner retry can't fix a cross-machine
+    # difference, since one job always runs on a single runner).
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1',
+               ATEN_CPU_CAPABILITY='avx2')
     proc = subprocess.run([sys.executable, '-u', 'src/long_window_4dvar.py', cfg], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=1800)
     out = os.path.join(exp['path_output'], exp['exp_name'])
