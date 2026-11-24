@@ -58,7 +58,7 @@ def _nearest_cycle(moment, prefer):
     return floor_cycle + _CYCLE_SPAN
 
 
-def cycle_directories(directory, verification_times, tolerance_hours, allow_missing=False):
+def cycle_directories(directory, verification_times, tolerance_hours, allow_missing=False, logger=None):
     """Return the six-hourly archive cycle directories that can hold a
     report within `tolerance_hours` of each verification time.
 
@@ -69,7 +69,17 @@ def cycle_directories(directory, verification_times, tolerance_hours, allow_miss
     to widen partition discovery for `use_drift_time` into a margin that may
     legitimately run off the archive's own date-range boundary, without
     losing the error-on-missing guarantee for the caller's own, unwidened
-    request)."""
+    request). This also tolerates a genuine INTERIOR gap (e.g. a missing
+    18Z partition between existing 12Z and 00Z cycles) the same way it
+    tolerates the archive's own date-range edge -- there is no way to
+    distinguish the two from here, so a report whose drift-corrected time
+    falls inside that gap is silently never read, same as if it didn't
+    exist (PR #29's review). Pass `logger` to at least make a skipped
+    cycle detectable (an INFO line, not a WARNING -- skipping the archive's
+    own date-range edge is the common, expected case this exists for; an
+    unexpected interior gap looks the same from here and needs a human to
+    notice the log and judge which one it is).
+    """
     directory = Path(os.path.expanduser(directory)).resolve()
     if not directory.is_dir():
         raise FileNotFoundError(
@@ -90,6 +100,12 @@ def cycle_directories(directory, verification_times, tolerance_hours, allow_miss
         path = directory / cycle.strftime('%Y-%m-%d') / cycle.strftime('%H')
         if not path.is_dir():
             if allow_missing:
+                if logger is not None:
+                    logger.info(
+                        'PREPBUFR parquet cycle directory missing, skipped (padding margin -- '
+                        'this is expected at the archive\'s own date-range edge, but also the '
+                        'only sign of an unexpected interior gap): '+str(path)
+                    )
                 continue
             raise FileNotFoundError(
                 'PREPBUFR parquet cycle directory not found: '+str(path)

@@ -93,7 +93,19 @@ def report(report_id, lat=10., lon=20., elev=0., report_type=120, time=None, sta
 
 def level(
     report_id, pressure=850., height=1500., height_quality=1., category=1,
-    temperature=300., temperature_quality=1., u=5., v=-5., wind_quality=1.,
+    # 15 C (288.15 K): physically VALID by default (within the 195-327 K
+    # physical_bounds check), so a test that doesn't care about
+    # temperature and never overrides it isn't also, silently, triggering
+    # a physical_bounds rejection of its own -- the old 300. default
+    # (written straight to temperature_c, so 573.15 K) failed that check
+    # unconditionally, meaning every height/below-station/quality-mark/
+    # cross-slot-height-order rejection test using this helper without an
+    # explicit temperature= would still "pass" even if ITS intended QC
+    # mechanism were broken, since physical_bounds would reject it
+    # regardless (PR #29's review). Tests that specifically want an
+    # impossible temperature (the physical_bounds tests themselves) set
+    # it explicitly.
+    temperature=15., temperature_quality=1., u=5., v=-5., wind_quality=1.,
     q=5000., humidity_quality=1., level_index=0,
     temperature_error=None, wind_error=None,
     humidity_error_tenths_percent=None, background_temperature=None, background_pressure=None,
@@ -640,9 +652,7 @@ def test_use_drift_time_widens_partition_discovery_for_a_boundary_report(tmp_pat
     cycle = datetime(2014, 12, 31, 18)
     write_cycle(
         tmp_path, cycle, [report(1, time=cycle)],
-        # temperature=-10 (not level()'s own default 300 C -> 573 K, which
-        # fails physical-bounds QC, unrelated to what this test checks).
-        [level(1, pressure=850., temperature=-10., drift_time_hours=3.5)],
+        [level(1, pressure=850., drift_time_hours=3.5)],  # level()'s own default temperature is valid
     )
     write_cycle(tmp_path, t0, [], [])  # the 00Z cycle directory must exist too
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True)
@@ -715,11 +725,9 @@ def test_non_monotonic_height_visible_across_bucket_sharing_duplicates(tmp_path)
     # review, second round).
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        # temperature=-10 (not level()'s own default 300 C -> 573 K,
-        # which fails physical-bounds QC, unrelated to what this checks).
-        level(1, pressure=900., height=100., temperature=-10., level_index=0),
-        level(1, pressure=830.5, height=2500., temperature=-10., level_index=1),  # wins the 830 hPa bucket (closer)
-        level(1, pressure=829., height=50., temperature=-10., level_index=2),     # loses the bucket, height=50 < 100
+        level(1, pressure=900., height=100., level_index=0),
+        level(1, pressure=830.5, height=2500., level_index=1),  # wins the 830 hPa bucket (closer)
+        level(1, pressure=829., height=50., level_index=2),     # loses the bucket, height=50 < 100
     ])
     data = load(
         tmp_path, [t0], {'t': [900., 830.]}, ['t'],
@@ -747,6 +755,29 @@ def test_non_monotonic_height_visible_when_sibling_drifts_outside_every_slots_wi
     data = load(tmp_path, [t0], {'t': [850., 500.]}, ['t'], use_drift_time=True)
     # A (850 hPa) is the only level ever assimilated (B drifted outside
     # the window) -- its whole station must still be rejected.
+    assert not data['mask_t'][0].any()
+
+
+def test_non_monotonic_height_visible_when_sibling_fails_exact_mode_tolerance(tmp_path):
+    # Copilot's review example: the model has only one 't' level (850
+    # hPa). Level A (850 hPa, 1500 m) matches it exactly and is kept for
+    # assimilation under the default 'exact' mode. Level B (830 hPa,
+    # 1000 m) is 20 hPa from the model's only level -- way outside
+    # pressure_match_tolerance_hpa, so 'exact' mode discards it for
+    # ASSIMILATION -- but B is at LOWER pressure than A, so B's height
+    # must be HIGHER than A's, not lower: a real inversion. Before this
+    # fix, the 'exact'-mode tolerance discard skipped the profile-wide
+    # height-order bookkeeping entirely (the same class of gap already
+    # fixed for time_accepted), so A sailed through even though the
+    # complete sounding it came from has a genuine inversion.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., height=1500., temperature=27.0, level_index=0),
+        level(1, pressure=830., height=1000., temperature=26.0, level_index=1),
+    ])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    # A (850 hPa) is the only level ever assimilated (B fails the 'exact'
+    # tolerance) -- its whole station must still be rejected.
     assert not data['mask_t'][0].any()
 
 

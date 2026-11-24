@@ -65,16 +65,33 @@ def test_compare_non_finite(golden, got, match):
 def test_save_trajectory_diagnostics_reuses_background_pass(monkeypatch):
     # save_trajectory_diagnostics must reuse compute_optimal's own
     # background QC pass (psobs_traj['background_hx'], added so the
-    # optimization can freeze its gross check against the background --
-    # PR #29's review) instead of recomputing it -- confirms the new
-    # plumbing doesn't just avoid a crash but produces the SAME
-    # background diagnostics the optimization itself used, exactly
-    # matching this file's own 'quality_control_reference': 'background'
-    # claim. Not exercised by the golden-value tests above (they never
-    # call save_trajectory_diagnostics). save_xr_trajectory (the model-
-    # state netCDF, unrelated to this check) is stubbed out: ToyModel has
-    # no `_levels_by_base`, a real backend's own attribute it never
-    # needed before now.
+    # optimization can freeze its gross check against the background)
+    # instead of recomputing it -- confirms the new plumbing doesn't just
+    # avoid a crash but produces the SAME background diagnostics the
+    # optimization itself used, exactly matching this file's own
+    # 'quality_control_reference': 'background' claim. Not exercised by
+    # the golden-value tests above (they never call
+    # save_trajectory_diagnostics). save_xr_trajectory (the model-state
+    # netCDF, unrelated to this check) is stubbed out: ToyModel has no
+    # `_levels_by_base`, a real backend's own attribute it never needed
+    # before now.
+    #
+    # ToyModel is deterministic, so a mere output comparison (saved mask
+    # == cached mask) would still pass even if save_trajectory_diagnostics
+    # silently started RECOMPUTING the background pass instead of
+    # reusing the cache -- recomputing from the same uncorrected input
+    # gives the identical answer either way on a deterministic model.
+    # Wrap compute_ps_observation_hx with a call-counting spy and assert
+    # it's called exactly once overall (PR #29's review) to actually
+    # distinguish "reused" from "recomputed and happened to match".
+    call_count = [0]
+    real_compute_ps_observation_hx = toy_golden.utils.compute_ps_observation_hx
+
+    def counting_compute_ps_observation_hx(*args, **kwargs):
+        call_count[0] += 1
+        return real_compute_ps_observation_hx(*args, **kwargs)
+
+    monkeypatch.setattr(toy_golden.utils, 'compute_ps_observation_hx', counting_compute_ps_observation_hx)
     monkeypatch.setattr(toy_golden.utils, 'save_xr_trajectory', lambda *a, **k: None)
     p = toy_golden._problem('default')
     exp = copy.deepcopy(p.exp)
@@ -87,12 +104,20 @@ def test_save_trajectory_diagnostics_reuses_background_pass(monkeypatch):
         exp['path_output'] = tmp + '/'
         analysis, _ = toy_golden.utils.compute_optimal(
             exp, p.model, p.state, p.verif_ic, p.psobs_traj, p.grid_interp, logging.getLogger('test'))
+        assert call_count[0] == 1  # compute_optimal's own background pass
         assert 'background_hx' in p.psobs_traj
         cached_used = p.psobs_traj['background_hx']['used'].copy()
         ofile1, _, _ = toy_golden.utils.save_trajectory_diagnostics(
             exp, p.model, p.state, analysis, p.verif_ic, p.psobs_traj, 'all', p.grid_interp,
             logging.getLogger('test'),
         )
+        # 2, not 3: save_trajectory_diagnostics makes exactly ONE new call
+        # (the analysis state's own H(x), always computed fresh -- a
+        # genuinely different state/step_start, not a background redo).
+        # If it were 3, the background pass would have been needlessly
+        # recomputed instead of reusing the cache this test exists to
+        # guard.
+        assert call_count[0] == 2
         with xr.open_dataset(ofile1) as ds:
             saved_used = ds['surface_pressure_used'].values.astype(bool)
     assert (saved_used == cached_used).all()

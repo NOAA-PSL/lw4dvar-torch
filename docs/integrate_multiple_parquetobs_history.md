@@ -2656,3 +2656,106 @@ also uses raw, un-logged distance -- `log()` is applied only on the
 repo's `'nearest'` mode isn't a deviation from JEDI at all; it's an
 exact match. Comments corrected in both files to cite the real source
 instead of a false divergence claim.
+
+## PR #29 Copilot review (#6047104139): 6 of 7 findings fixed, all verified (2026-11-24)
+
+All 6 "New" findings confirmed valid and fixed (the 7th, "Add
+independent radiosonde cost and gradient coverage", was carried over
+from 2026-11-17 and subsumed by the live/frozen-QC fix below). Every
+fix mutation-tested where practical: temporarily reintroduce the bug,
+confirm the new/changed test actually fails, then restore.
+
+- **`'exact'`-mode-discarded levels still skipped profile-wide height
+  tracking** (Medium, `raobs_parquet.py`): the same class of gap already
+  fixed twice before for `time_accepted`, found again for a different
+  gate. A level failing `pressure_match_tolerance_hpa` (the default
+  mode) `continue`d before ever reaching the profile-wide
+  `profile_source_priority`/`profile_source_heights` bookkeeping, so it
+  could never reject an in-tolerance sibling for a height inversion.
+  Fixed: replaced the early `continue` with an `exact_ok` flag that
+  gates only the assimilation-bucket-update block
+  (`if time_accepted and exact_ok:`), leaving the profile-wide tracking
+  unconditional on it, same as `time_accepted`. New test
+  `test_non_monotonic_height_visible_when_sibling_fails_exact_mode_tolerance`,
+  built from Copilot's own example (850 hPa/1500 m kept, an unmatched
+  830 hPa/1000 m sibling -- a real inversion since lower pressure must
+  mean higher altitude). Mutation-confirmed.
+- **Toy math-gates only ever exercised frozen QC for raobs** (Medium,
+  `tests/math/problem.py`/`test_cost_gradient.py`): `_build_raobs_traj`
+  unconditionally installed `bg_used`, so every raobs finite-
+  difference/Taylor/checkpointing gate tested the opt-in path and zero
+  gates tested the actual default (live QC, after this PR's own earlier
+  default flip). Fixed: new `Problem.__init__` parameter
+  `install_raobs_bg_used` (default `True`, preserving this module's own
+  already-validated behavior for existing variants) controls whether
+  `_build_raobs_traj` installs the cached mask at all. New VARIANTS
+  entry `'raobs_bg_check_live'` (`install_raobs_bg_used=False`);
+  `test_raobs_taylor_remainder_is_second_order`/
+  `test_raobs_checkpointing_does_not_change_the_gradient` parametrized
+  over both masks, the latter also given a real `bg_check=3.0` threshold
+  it didn't have before (otherwise its own parametrization would have
+  been a no-op, same reasoning as the plain `'raobs'` VARIANTS entry
+  having no threshold at all). Named `install_raobs_bg_used`, not
+  `raobs_frozen_qc`, specifically to avoid colliding with the real
+  `exp['raobs_frozen_qc']` config key an existing test
+  (`test_frozen_qc_is_config_driven_and_defaults_to_live_for_both`)
+  needs to pass through `Problem`'s `**exp` catch-all -- the first
+  attempt used the colliding name and broke that test (`Problem.__init__`
+  consumed it as its own new parameter instead of letting it flow to
+  `exp`); caught immediately by `make check`, renamed before verifying
+  further. Updated the stale comments at `problem.py`'s former line 192
+  and `test_cost_gradient.py`'s former line 34, which both claimed
+  frozen QC was what `compute_optimal`/production "actually uses" --
+  true before this PR's own frozen-QC default flip, false after.
+- **`test_save_trajectory_diagnostics_reuses_background_pass` didn't
+  actually prove reuse** (Medium, `tests/golden/test_golden_toy.py`):
+  `ToyModel` is deterministic, so even a silent regression to
+  recomputing the background pass instead of reusing the cache would
+  give the identical saved mask, passing the test's old output-only
+  comparison. Wrapped `compute_ps_observation_hx` with a call-counting
+  spy; the real expected count turned out to be 2, not 1 (`compute_optimal`'s
+  own background pass, plus `save_trajectory_diagnostics`'s own always-
+  fresh ANALYSIS-state call, a second, genuinely different, non-reused
+  call that's supposed to happen) -- confirmed by reading
+  `save_trajectory_diagnostics`'s actual code, not assumed. Mutation-
+  tested by forcing the background branch to recompute (expected 3,
+  got 3, test correctly failed); restored.
+- **`level()` test helper's default temperature was physically
+  impossible** (Medium, `tests/unit/test_raobs_parquet.py`):
+  `temperature=300.` written straight to `temperature_c` is 573.15 K,
+  outside the 195-327 K physical-bounds check -- any test using the
+  helper without an explicit override had its `'t'` value already
+  rejected regardless of what QC mechanism the test actually intended
+  to exercise. Changed the default to `15.` (288.15 K, physically
+  valid); all 48 existing tests in the file still passed unchanged
+  (confirming none of them were *actually* relying on the broken
+  default, just at risk of it) -- spot-verified
+  `test_below_station_elevation_qc_rejected` by mutation-testing its
+  real QC gate directly (there are two below-station checks in this
+  file -- one feeding duplicate-selection priority, one the final QC
+  flag; the first mutation attempt disabled the wrong one and the test
+  still passed, which itself confirmed the two are independent;
+  disabling the real gate made it fail as expected). Removed two
+  now-unnecessary `temperature=-10.` overrides (with stale comments
+  explaining why they used to be needed) that predated this fix.
+- **The `q_error_rh_percent` config template example was invalid
+  YAML** (Low, `configs/config.yml.template`): written as comma-
+  separated `key: value` pairs with no enclosing `{...}`, unlike the
+  `error_std`/`bg_check` examples right above it. Confirmed with a
+  direct `yaml.safe_load` round-trip: the old text raises
+  `YAMLError: mapping values are not allowed here`; wrapped in `{...}`,
+  it parses to the intended 25-entry dict.
+- **Missing archive cycles (including interior gaps) silently
+  skipped, undetectably** (Medium, `prepbufr_parquet_common.py`):
+  `cycle_directories(..., allow_missing=True)` skipped any missing
+  directory with no distinction between the archive's own date-range
+  edge (expected) and a genuine interior gap (not). Added a `logger`
+  parameter; a skipped directory now gets an INFO line (not WARNING --
+  the expected case and the one worth flagging look identical from
+  here, so a human still has to judge which one occurred) naming the
+  path. Threaded through `_profile_records`/`load_raobs_parquet`,
+  which already received a real `logger` from `get_raobs` in
+  production -- previously just never passed further down.
+
+`make check`: 325 passed (up from 319), same 12 pre-existing unrelated
+failures. `make check-ace2`: passed, no fixture regeneration needed.

@@ -242,11 +242,13 @@ exp:
       # simplification vs. GSI's live background, see
       # docs/integrate_multiple_parquetobs.md). Default is the same
       # prepobs_errtable.global posting's RH/10 column, x10 for percent.
-      #q_error_rh_percent:  # the default, shown explicitly
-      #  1000: 10, 950: 10, 900: 10, 850: 10, 800: 10, 750: 10, 700: 10,
-      #  650: 10, 600: 10, 550: 12, 500: 13, 450: 15, 400: 17, 350: 20,
-      #  300: 20, 250: 20, 200: 20, 150: 20, 100: 20, 70: 20, 50: 20,
-      #  30: 20, 20: 20, 10: 20, 5: 20
+      #q_error_rh_percent:  # the default, shown explicitly -- a flow
+      #  # mapping ({...}), like error_std/bg_check above: comma-separated
+      #  # entries need it, this is not valid YAML as a block mapping.
+      #  {1000: 10, 950: 10, 900: 10, 850: 10, 800: 10, 750: 10, 700: 10,
+      #   650: 10, 600: 10, 550: 12, 500: 13, 450: 15, 400: 17, 350: 20,
+      #   300: 20, 250: 20, 200: 20, 150: 20, 100: 20, 70: 20, 50: 20,
+      #   30: 20, 20: 20, 10: 20, 5: 20}
       # Radiosonde humidity sensors are unreliable above the lower/mid
       # troposphere -- mask 'q' at any matched level with pressure below
       # this (set null to disable the floor entirely).

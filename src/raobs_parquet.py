@@ -143,6 +143,7 @@ def _profile_records(
     q_error_rh_percent=None,
     humidity_min_pressure_hpa=None,
     physical_bounds=None,
+    logger=None,
 ):
     """Return {(slot_index, station_key): record} before fixed-shape padding.
 
@@ -252,7 +253,7 @@ def _profile_records(
         # as before if genuinely missing.
         padded_cycles = common.cycle_directories(
             directory, verification_times, time_tolerance_hours + _RAOBS_MAX_DRIFT_HOURS,
-            allow_missing=True,
+            allow_missing=True, logger=logger,
         )
         cycles = sorted(set(cycles) | set(padded_cycles))
     verification = np.asarray([
@@ -463,12 +464,24 @@ def _profile_records(
                     # mode falls short of.
                     differences = np.abs(variable_levels - pressure_value)
                     level_index = int(np.argmin(differences))
-                    if vertical_interpolation == 'exact':
-                        if differences[level_index] > pressure_match_tolerance_hpa:
-                            continue
-                    # 'nearest'/'log-linear': no distance cutoff -- always
-                    # keep the nearest level, so a coarse model's levels
+                    # 'exact': only a level within pressure_match_tolerance_hpa
+                    # of a model level is eligible for ASSIMILATION (gates the
+                    # time_accepted block below) -- but, like time_accepted
+                    # itself, must NOT also gate the profile-wide height
+                    # tracking further down: a level discarded here for being
+                    # too far from any model level still has a real reported
+                    # height at its own real pressure, and must still be able
+                    # to reject an in-tolerance sibling for a height
+                    # inversion, even though it's never itself assimilated
+                    # (PR #29's review -- the same class of gap already fixed
+                    # for time_accepted, found again for this gate).
+                    # 'nearest'/'log-linear' have no distance cutoff at all --
+                    # every level is exact_ok, so a coarse model's levels
                     # still get an observation instead of possibly none.
+                    exact_ok = (
+                        vertical_interpolation != 'exact'
+                        or differences[level_index] <= pressure_match_tolerance_hpa
+                    )
                     value = level_values[variable][level_row]
                     if not np.isfinite(value):
                         continue
@@ -530,7 +543,7 @@ def _profile_records(
                         differences[level_index] if vertical_interpolation != 'exact' else 0.,
                     )
 
-                    if time_accepted:
+                    if time_accepted and exact_ok:
                         existing_priority = record['priority'].get((variable, level_index))
                         if existing_priority is None or priority < existing_priority:
                             record['values'][(variable, level_index)] = value
@@ -559,16 +572,18 @@ def _profile_records(
                                 record['default_error'].pop((variable, level_index), None)
 
                     # Mirrors the per-slot winner selection just above, but
-                    # runs UNCONDITIONALLY (not gated on time_accepted)
-                    # and is keyed by the whole PROFILE (profile_key, not
-                    # (slot_index, profile_key)) AND the row's own REAL
-                    # reported pressure (not the matched model
-                    # level_index) -- feeds the height-order QC below,
+                    # runs UNCONDITIONALLY (not gated on time_accepted OR
+                    # exact_ok) and is keyed by the whole PROFILE
+                    # (profile_key, not (slot_index, profile_key)) AND the
+                    # row's own REAL reported pressure (not the matched
+                    # model level_index) -- feeds the height-order QC below,
                     # computed once on the COMPLETE sounding rather than
                     # per-slot or per-window, so an inversion spanning two
                     # use_drift_time slots -- or involving a level that
-                    # drifted outside every slot's tolerance and so is
-                    # never itself assimilated -- is still caught.
+                    # drifted outside every slot's tolerance, or (in
+                    # 'exact' mode) outside pressure_match_tolerance_hpa of
+                    # any model level, and so is never itself assimilated --
+                    # is still caught.
                     # Keying by real pressure instead of the
                     # matched bucket means two genuinely different real
                     # levels that snap to the SAME model level
@@ -592,14 +607,16 @@ def _profile_records(
 
     # Non-monotonic height-with-pressure, computed ONCE per complete
     # profile (every RAW level the archive has for this report, whether
-    # or not it won its model-level bucket for assimilation, AND whether
-    # or not its own drift-corrected time fell inside any slot's
-    # tolerance window -- see the winner-selection and time_accepted
-    # comments above), not per-slot or per-matched-bucket or per-window
-    # -- an inversion straddling two use_drift_time slots, hidden behind
-    # a bucket-mate that won the assimilation slot, or involving a level
-    # that drifted outside every slot's tolerance and so is never itself
-    # assimilated, must still reject the whole variable's profile,
+    # or not it won its model-level bucket for assimilation, whether or
+    # not its own drift-corrected time fell inside any slot's tolerance
+    # window, AND whether or not it's within pressure_match_tolerance_hpa
+    # of a model level in 'exact' mode -- see the winner-selection,
+    # time_accepted, and exact_ok comments above), not per-slot or
+    # per-matched-bucket or per-window -- an inversion straddling two
+    # use_drift_time slots, hidden behind a bucket-mate that won the
+    # assimilation slot, or involving a level that drifted outside every
+    # slot's tolerance or sits too far from any model level to be
+    # assimilated itself, must still reject the whole variable's profile,
     # matching the no-drift-time behavior where it's always checked on
     # the complete sounding. Ordered by each level's own REAL reported pressure
     # (not the matched model level) so two raw levels sharing one bucket
@@ -717,7 +734,7 @@ def load_raobs_parquet(
         use_drift_time=use_drift_time,
         vertical_interpolation=vertical_interpolation, use_drift_position=use_drift_position,
         q_error_rh_percent=q_error_rh_percent, humidity_min_pressure_hpa=humidity_min_pressure_hpa,
-        physical_bounds=physical_bounds,
+        physical_bounds=physical_bounds, logger=logger,
     )
     # The q error (RH_fraction * qsat) -- see q_error_rh_percent above.
     default_error_bases = ('q',) if q_error_rh_percent and 'q' in variables else ()
