@@ -2356,9 +2356,38 @@ earlier checkpoints' fixer does.
   `AIFS3Model.prepare_initial_state` packs them into a
   `(1, 2, 40320, 207)` tensor with no NaNs; `decode_state` round-trips
   sane `sp`/`z`/`tcw`.
-- **Not yet done**: any real GPU run (training-data zarr grid/precision
-  confirmed only up to `prepare_initial_state`, not a full differentiable
-  rollout); `learn_rate`/`latent_scale` are carried over untuned from
+- **`advance()` crashed on its first real cycled run** (job 27338508,
+  `run_aifs-r2-t1-longcyc-obsint-1hour-ps_raobs-t2.sh`, 2026-11-24):
+  `KeyError: 'cvh'` inside anemoi-inference's own
+  `add_dynamic_forcings_to_input_tensor`. Root cause: this checkpoint's
+  `cvh`/`cvl`/`lai_hv`/`lai_lv`/`slt`/`fsr` are NOT flagged
+  `is_constant_in_time` by its own metadata (ERA5's real climatology for
+  them varies monthly/seasonally, so anemoi doesn't mark them constant
+  outright, unlike `lsm`/`sdor`/`slor`/`z`) -- confirmed directly by
+  probing `self.handler.dynamic_forcings_providers`: they come back as
+  `CoupledForcings` instances, each delegating to a configured `input:`
+  object to re-fetch the value on EVERY `advance()` step rather than
+  being skipped via `self._reset`'s constant-column mask. This
+  checkpoint's yaml uses `input: empty` (no real IC fetch needed -- ICs
+  come from `aifs_zarr_ic.py` instead), which supplies nothing, so the
+  very first step crashes. Fixed in `aifs3_model.py`
+  (`AIFS3Model._patch_coupled_forcings`, called from
+  `prepare_initial_state`): each `CoupledForcings` provider captures its
+  own `.input` reference at PROVIDER-construction time (inside
+  `create_runner`, before `prepare_initial_state` ever runs), so
+  reassigning `self.handler.dynamic_forcings_input` itself would be too
+  late -- instead each provider's own `.input` is patched to a tiny
+  duck-typed object (`_RepeatForcingsInput`) that replays the value
+  already fetched into `input_state['fields']`, correct because these
+  fields don't change within one cycling window. A no-op for checkpoints
+  with no such providers (`aifs2-1deg-ic1`). Verified on CPU (forcing
+  `ANEMOI_INFERENCE_GRAPHTRANSFORMER_ATTENTION_BACKEND=pyg`, since the
+  checkpoint's default Triton attention kernel is CUDA-only): a real
+  `model.advance(encoded, steps=1)` call now completes end to end, where
+  it previously crashed with the same `KeyError`.
+- **Not yet done**: a real GPU cycled run (CPU-verified through one
+  `advance()` step only, not a full differentiable rollout or a multi-day
+  cycle); `learn_rate`/`latent_scale` are carried over untuned from
   `aifs2-1deg-ic1` (same 10944-node hidden mesh size, otherwise unrelated);
   whether the built-in `GlobalDryMassFixer` actually holds `sp` stable under
   real cycling, the way the earlier checkpoints needed the hand-added fixer

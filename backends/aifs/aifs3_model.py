@@ -39,9 +39,22 @@ import numpy as np
 import torch
 
 from anemoi.inference.config.run import RunConfiguration
+from anemoi.inference.forcings import CoupledForcings
 from anemoi.inference.runners import create_runner
 
 from aifs_model import AIFSModel, AIFSState
+
+
+class _RepeatForcingsInput:
+    """Minimal anemoi `Input` duck-type: `load_forcings_state` always
+    returns the same cached field values, whatever date is asked for. See
+    AIFS3Model._patch_coupled_forcings for why this exists."""
+
+    def __init__(self, fields: dict):
+        self._fields = fields
+
+    def load_forcings_state(self, *, dates, current_state):
+        return {"date": dates[-1], "fields": self._fields, "_input": self, "_variables": {}}
 
 
 class AIFS3Model(AIFSModel):
@@ -51,9 +64,18 @@ class AIFS3Model(AIFSModel):
 
     def __init__(self, checkpoint_path: str, config_path: str, device: str = "cuda",
                  autocast_dtype: Optional[Union[str, torch.dtype]] = None,
-                 compile_wrapper: bool = False):
+                 compile_wrapper: bool = False, attention: Optional[str] = None):
         if compile_wrapper:
             raise NotImplementedError("compile_wrapper is not implemented for AIFS3Model")
+        if attention is not None:
+            # get_model() (long_window_4dvar_utils.py) passes this
+            # unconditionally for model_backend 'aifs' regardless of which
+            # class it dispatches to -- accept the parameter (so that call
+            # doesn't raise a TypeError for every AIFS3Model checkpoint) but
+            # reject any real value: AIFSModel's sliding-window attention
+            # swap (aifs_attention.py) only patches AIFSModel's own manually
+            # unrolled encoder/processor/decoder, never exercised here.
+            raise NotImplementedError("attention is not implemented for AIFS3Model")
         if device == "cuda":
             # same reasoning as AIFSModel.__init__
             torch.backends.cuda.matmul.allow_tf32 = True
@@ -115,10 +137,59 @@ class AIFS3Model(AIFSModel):
         `input_state['fields']` (lsm/sdor/slor/z from the ERA5 GRIB) are used
         as-is; computed forcings come from the handler's own providers."""
         input_state = dict(input_state, fields=dict(input_state["fields"]))
+        self._patch_coupled_forcings(input_state)
         tensor_np = self.handler.prepare_input_tensor(input_state)  # (multi_step, n_vars, n_points)
         tensor_np = np.swapaxes(tensor_np, -2, -1)[np.newaxis, ...]  # (1, multi_step, n_points, n_vars)
         state = torch.from_numpy(np.ascontiguousarray(tensor_np, dtype=np.float32)).to(self.device)
         return AIFSState(state, date)
+
+    def _patch_coupled_forcings(self, input_state: dict) -> None:
+        """Some land-surface fields (e.g. aifs-r2-t1's cvh/cvl/lai_hv/
+        lai_lv/slt/fsr) are genuinely constant within one cycling window
+        but NOT flagged `is_constant_in_time` by the checkpoint's own
+        metadata (ERA5's real climatology for them varies monthly/
+        seasonally, so anemoi doesn't mark them constant outright) --
+        confirmed directly by probing this checkpoint (2026-11-24): they
+        come back as `CoupledForcings`/`ConstantForcings` providers, each
+        delegating to a configured `input:` object to re-fetch the value
+        on EVERY `advance()` step, never from `self._reset`'s constant-
+        column skip. This checkpoint's yaml uses `input: empty` (no real
+        IC fetch needed -- see aifs_zarr_ic.py), which supplies nothing,
+        so the very first `advance()` call crashes with
+        `KeyError: 'cvh'` deep in anemoi-inference's own forcings code
+        (confirmed in a real cycled SLURM run, job 27338508 -- see
+        docs/integrate_multiple_backends.md).
+
+        Each such provider captures its own `.input` reference at
+        PROVIDER-construction time (inside `create_runner`, i.e. model
+        `__init__`, long before `prepare_initial_state` ever runs) --
+        reassigning `self.handler.dynamic_forcings_input` itself would be
+        too late to affect already-built providers. Patch each provider's
+        own `.input` instead, to a tiny duck-typed object that just
+        replays the value already fetched into `input_state['fields']` by
+        whichever `ic_module` built it -- correct because these fields
+        don't change within one cycling window, and a no-op for
+        checkpoints with no such providers (aifs2-1deg-ic1), where
+        `coupled` is empty.
+        """
+        providers = (
+            list(self.handler.dynamic_forcings_providers)
+            + list(self.handler.constant_forcings_providers)
+            + list(self.handler.boundary_forcings_providers)
+        )
+        coupled = [p for p in providers if isinstance(p, CoupledForcings)]
+        if not coupled:
+            return
+        needed = {name for p in coupled for name in p.variables}
+        cache = {}
+        for name in needed:
+            if name not in input_state["fields"]:
+                continue
+            arr = input_state["fields"][name]
+            cache[name] = arr[0] if arr.ndim == 2 else arr  # (multi_step/dates, n_points) -> (n_points,)
+        repeat_input = _RepeatForcingsInput(cache)
+        for p in coupled:
+            p.input = repeat_input
 
     # prime_from_state is inherited: it rebuilds a State dict from the packed
     # tensor and calls prepare_initial_state, which re-primes the handler.

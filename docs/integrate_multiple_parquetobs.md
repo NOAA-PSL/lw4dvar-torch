@@ -1433,13 +1433,20 @@ else, confirms the resolved flat key and its `'exact'` default.
 
 **Not yet done**: the mini-ACE2 CI fixture (`tests/ace2/test_ace2_mini.py`)
 was not extended to exercise `'nearest'`/`'log-linear'` end to end (not
-run in this environment either -- `fme` isn't importable here); the error-
-level tables (`error_std`/`q_error_g_kg`) still evaluate at the nominal
-model-level pressure rather than the kept observation's own real pressure
-for `'nearest'`/`'log-linear'` -- a small, flagged secondary accuracy
-improvement, not bundled into this change; and no tracked config has been
-switched to `'nearest'`/`'log-linear'` yet to see how it affects the
-still-open ACE2 Tropics z500 investigation above.
+run in this environment either -- `fme` isn't importable here); and no
+tracked config has been switched to `'nearest'`/`'log-linear'` yet to see
+how it affects the still-open ACE2 Tropics z500 investigation above.
+
+**Since fixed**: an earlier version of this section flagged that the
+`error_std`/`q_error_g_kg` tables evaluated `t`/`u`/`v`'s error at the
+nominal model-level pressure instead of the kept observation's own real
+pressure, for `'nearest'`/`'log-linear'`. Fixed by commit `7ce5912`
+("raobs: fix all 16 issues from Copilot's third review on PR #29"): see
+`long_window_4dvar_utils.py`'s `isinstance(raw, dict) and
+vertical_interpolation != 'exact'` branch, which now evaluates the table
+at each kept level's own real reported pressure -- the same convention
+`q`'s own error (`RH_fraction * qsat(background)`, always at the real
+level) already used.
 
 ## raobs balloon-drift horizontal position: `use_drift_position`, following JEDI's `ProfileHorizontalDrift` (2026-11-19)
 
