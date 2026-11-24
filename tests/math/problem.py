@@ -188,6 +188,21 @@ class Problem:
                         (n_slots, n_levels, capacity), 0.0005, dtype=torch.float64)
                 else:
                     traj['error_t'] = 0.5
+
+        # Attach the frozen background mask the SAME way compute_optimal
+        # does in production (compute_ps_observation_hx, step_start=0, on
+        # the uncorrected background) -- otherwise compute_loss_4dvar's
+        # frozen_qc stays False for this trajectory (no 'bg_used' key)
+        # and every gate below only ever exercises the LIVE-recompute QC
+        # branch, never the frozen one compute_optimal actually uses
+        # (PR #29's review, follow-up on the previous round's gate
+        # coverage).
+        self.model._prime_noise()  # no-op for ToyModel; matches compute_optimal's own call
+        _, _, raobs_background_hx = utils.compute_ps_observation_hx(
+            self.model, self.state, self.verif_ic, self.psobs_traj, self.exp, self.grid_interp,
+            self.interp_specs, step_start=0, raobs_traj=traj,
+        )
+        traj['bg_used'] = {base: torch.as_tensor(raobs_background_hx[base]['used']) for base in bases}
         return traj
 
     def background_hx(self):

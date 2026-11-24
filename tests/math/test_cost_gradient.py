@@ -31,6 +31,11 @@ VARIANTS = {
     # not just the isolated unit tests of _compute_raobs_observation_
     # diagnostics_at_time in tests/unit/test_solver_helpers.py. Both the
     # background-check-off and -on code paths get their own variant.
+    # Attaches 'bg_used' from the SAME compute_ps_observation_hx call
+    # compute_optimal itself makes, so compute_loss_4dvar's frozen_qc is
+    # True here too -- without it, these gates would only ever exercise
+    # the live-recompute QC branch, never the frozen one production
+    # actually runs (PR #29's review, follow-up).
     'raobs': {'raobs': True},
     'raobs_bg_check': {'raobs': True, 'raobs_bg_check': 3.0},
 }

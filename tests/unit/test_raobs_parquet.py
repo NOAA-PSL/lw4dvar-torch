@@ -699,6 +699,28 @@ def test_non_monotonic_height_visible_across_bucket_sharing_duplicates(tmp_path)
     assert not data['mask_t'][0].any()  # the whole profile is rejected, not just the losing candidate
 
 
+def test_non_monotonic_height_visible_when_sibling_drifts_outside_every_slots_window(tmp_path):
+    # One profile: level A (850 hPa) drifts negligibly and lands in the
+    # only slot; level B (500 hPa) drifts +5h, outside every slot's 3h
+    # tolerance, so it is never itself assimilated. B's height (1000 m)
+    # is LOWER than A's (1500 m) despite being at a much higher altitude
+    # (lower pressure) -- a real inversion. Before this fix, B's height
+    # never reached the profile-wide completeness check at all (the time
+    # cutoff discarded the whole level before any QC bookkeeping ran),
+    # so A sailed through even though the complete sounding it came from
+    # has a genuine inversion (PR #29's review, third round on this
+    # mechanism).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., height=1500., temperature=-10., level_index=0, drift_time_hours=0.0),
+        level(1, pressure=500., height=1000., temperature=-10., level_index=1, drift_time_hours=5.0),
+    ])
+    data = load(tmp_path, [t0], {'t': [850., 500.]}, ['t'], use_drift_time=True)
+    # A (850 hPa) is the only level ever assimilated (B drifted outside
+    # the window) -- its whole station must still be rejected.
+    assert not data['mask_t'][0].any()
+
+
 def test_use_drift_position_gives_each_level_its_own_position(tmp_path):
     # One report launched at (20, 10); two levels with distinct drift
     # positions -- 850 hPa barely drifted, 50 hPa drifted substantially
