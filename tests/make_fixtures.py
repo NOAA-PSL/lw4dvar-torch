@@ -165,9 +165,10 @@ def _ace2_background_profiles(checkpoint, forcing_dir, ic_cache_dir, t_ic, spinu
     (K, m/s, m/s) -- a small Gaussian perturbation around THIS, rather than
     independent standard-atmosphere climatology, is what makes the
     synthetic raobs mismatch something a few epochs of latent-increment
-    optimization can actually reduce (see docs/integrate_multiple_parquetobs.md's
-    "Adding radiosonde (raobs) observations" section -- the same lesson the
-    psobs fixture's own noise-tightening already drew).
+    optimization can actually reduce (see
+    docs/integrate_multiple_parquetobs_history.md's "Adding radiosonde
+    (raobs) observations" section -- the same lesson the psobs fixture's
+    own noise-tightening already drew).
     """
     import torch
 

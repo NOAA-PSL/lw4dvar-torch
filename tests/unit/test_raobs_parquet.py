@@ -258,24 +258,53 @@ def test_quality_mark_qc_rejected(tmp_path):
 
 def test_sensible_temperature_used_instead_of_virtual(tmp_path):
     # The archive's temperature_c is the (virtual) TOB when moisture was
-    # reported; the FIRST non-VIRTMP (program_code != 8) event BY STACK
-    # ORDER (lowest event_index) is the sensible value
-    # common.sensible_temperature must return instead. Multiple non-
-    # VIRTMP candidates, given in shuffled input order with distinct
-    # event_index values, confirm this picks by stack order -- not input-
-    # list order and not value magnitude (PR #29's review).
+    # reported; the LOWEST-event_index event ABOVE the VIRTMP event's own
+    # position is the sensible value common.sensible_temperature must
+    # return instead. Multiple non-VIRTMP candidates, given in shuffled
+    # input order with distinct event_index values, confirm this picks by
+    # stack order -- not input-list order and not value magnitude.
+    # VIRTMP sits at the LOWEST index (0, i.e. most recent) here --
+    # confirmed the realistic/common arrangement against real archive
+    # data (PR #29's review); see
+    # test_sensible_temperature_skips_event_above_virtmp_too below for the
+    # real-world case where a later, non-VIRTMP event sits even more
+    # recently than VIRTMP itself.
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(
         tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=27.0)],
         events=[
-            event(1, value=99.0, event_index=2, program_code=0),  # non-VIRTMP, but not first in stack
-            event(1, value=50.0, event_index=1, program_code=0),  # non-VIRTMP, but not first in stack
-            event(1, value=26.0, event_index=0, program_code=0),  # non-VIRTMP, FIRST in stack -- the answer
-            event(1, value=27.0, event_index=3, program_code=8),  # VIRTMP-corrected (matches levels' temperature_c)
+            event(1, value=99.0, event_index=3, program_code=0),  # non-VIRTMP, but not first above VIRTMP
+            event(1, value=50.0, event_index=2, program_code=0),  # non-VIRTMP, but not first above VIRTMP
+            event(1, value=26.0, event_index=1, program_code=0),  # non-VIRTMP, FIRST above VIRTMP -- the answer
+            event(1, value=27.0, event_index=0, program_code=8),  # VIRTMP-corrected (matches levels' temperature_c)
         ],
     )
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
     assert data['values_t'][0][0, 0] == pytest.approx(26.0 + 273.15)
+
+
+def test_sensible_temperature_skips_event_above_virtmp_too(tmp_path):
+    # Real example from the archive (2015-01-01 00Z, ADPUPA, report_id=621,
+    # level_index=14 -- one of 239 such cases found in that one cycle):
+    # VIRTMP is NOT always at event_index 0. A later, non-VIRTMP event
+    # (program_code 10 here) can sit ABOVE VIRTMP in the stack, carrying
+    # VIRTMP's own (still virtual) value forward unchanged. A filter that
+    # only excludes `program_code == VIRTMP_PROGRAM_CODE` would incorrectly
+    # pick that event up as "sensible" since it isn't itself tagged VIRTMP
+    # -- common.sensible_temperature must instead exclude everything at or
+    # above VIRTMP's own event_index, regardless of program_code, landing
+    # on the real sensible value one level further up the stack.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=14.7)],
+        events=[
+            event(1, value=14.7, event_index=0, program_code=10),  # NOT VIRTMP, but still virtual-valued
+            event(1, value=14.7, event_index=1, program_code=8),   # VIRTMP-corrected (matches levels' temperature_c)
+            event(1, value=14.6, event_index=2, program_code=1),   # the real sensible value -- the answer
+        ],
+    )
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert data['values_t'][0][0, 0] == pytest.approx(14.6 + 273.15)
 
 
 def test_sensible_temperature_falls_back_to_input_when_no_event(tmp_path):

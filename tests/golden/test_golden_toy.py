@@ -98,6 +98,51 @@ def test_save_trajectory_diagnostics_reuses_background_pass(monkeypatch):
     assert (saved_used == cached_used).all()
 
 
+def test_frozen_qc_is_config_driven_and_defaults_to_live_for_both():
+    """compute_optimal's gross-check freezing (psobs_traj['bg_used']/
+    raobs_traj['bg_used']) is config-driven (observations.psobs.frozen_qc
+    / observations.raobs.frozen_qc), not unconditional -- PR #29's
+    review, jswhit's comment on the raobs PR. Both default to False
+    (live QC), matching GSI's own practice: GSI re-evaluates its gross
+    check every outer loop against the current state for BOTH ps and
+    raobs, via the same errormod/convinfo-gross-value mechanism either
+    way -- so live-by-default isn't ps precedent extended to raobs for
+    mere consistency, it's the same GSI practice applying to both. This
+    leaves Copilot's adversarial gaming example (see
+    test_raobs_frozen_qc_prevents_gaming_the_gross_check in
+    tests/unit/test_solver_helpers.py) live-by-default for both obs
+    types, accepted as a known tradeoff. Both flags are independently
+    settable to True to close that example off for a given run.
+    """
+    base = {**toy_golden.BASE, **toy_golden.CONFIGS['default'], 'raobs': True, 'max_epoch': 1}
+
+    def bg_used_flags(**overrides):
+        p = toy_golden.Problem(**{**base, **overrides})
+        # Problem's own harness pre-populates raobs_traj['bg_used']
+        # unconditionally (tests/math/problem.py's _build_raobs_traj),
+        # for its OWN gradient-gate tests (tests/math/test_cost_gradient.py)
+        # -- reset to the unpopulated state compute_optimal actually
+        # receives in production before exercising its own gating.
+        del p.raobs_traj['bg_used']
+        exp = copy.deepcopy(p.exp)
+        with tempfile.TemporaryDirectory() as tmp:
+            exp['path_output'] = tmp + '/'
+            toy_golden.utils.compute_optimal(
+                exp, p.model, p.state, p.verif_ic, p.psobs_traj, p.grid_interp,
+                logging.getLogger('test'), raobs_traj=p.raobs_traj)
+        return 'bg_used' in p.psobs_traj, 'bg_used' in p.raobs_traj
+
+    psobs_used, raobs_used = bg_used_flags()
+    assert psobs_used is False, 'psobs frozen_qc should default to False (live QC)'
+    assert raobs_used is False, 'raobs frozen_qc should default to False (live QC)'
+
+    psobs_used, _ = bg_used_flags(psobs_frozen_qc=True)
+    assert psobs_used is True, 'observations.psobs.frozen_qc: True should freeze psobs QC'
+
+    _, raobs_used = bg_used_flags(raobs_frozen_qc=True)
+    assert raobs_used is True, 'observations.raobs.frozen_qc: True should freeze raobs QC'
+
+
 def test_planted_analysis_permutation_is_caught(monkeypatch):
     """A longitude shift of the returned analysis keeps its channel means
     and stds; the frozen spatial sample must catch it."""

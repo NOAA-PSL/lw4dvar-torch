@@ -161,8 +161,8 @@ class Problem:
             'step_lo': step_lo,
             'alpha': alpha,
             'vertical_interpolation': 'exact',
-            'tuv_bg_check': bg_check,
-            'q_bg_check': bg_check,
+            'bg_check_threshold_t': bg_check,
+            'bg_check_threshold_q': bg_check,
         }
         with torch.no_grad():
             states = [self.state]

@@ -104,7 +104,7 @@ def cycle_time_from_directory(cycle_directory):
     datetime `cycle_directories` above computed before discarding it down
     to a bare `Path`. Used by raobs_parquet.py to anchor HRDR
     (`drift_time_hours`) to the cycle it's actually relative to, without
-    needing a new archive column for it (PR #29's review)."""
+    needing a new archive column for it."""
     cycle_directory = Path(cycle_directory)
     return datetime.strptime(
         cycle_directory.parent.name+' '+cycle_directory.name, '%Y-%m-%d %H'
@@ -138,8 +138,7 @@ def available_columns(path):
     (e.g. raobs_parquet.py's drift_time_hours/drift_longitude/
     drift_latitude) only if it actually exists, instead of
     `read_partition` raising on the whole read because one archive
-    without it is missing a column every other required one still needs
-    (PR #29's review)."""
+    without it is missing a column every other required one still needs."""
     return set(parquet().ParquetFile(path).schema_arrow.names)
 
 
@@ -161,7 +160,7 @@ def timestamps(table, name='observation_time'):
 # dedup below -- confirmed against the real archive (one 2015-01-01 00Z
 # cycle has 2556 of 19653 raw SFCSHP reports sharing the literal id
 # 'MASKSTID', at clearly different lat/lon each) -- see
-# docs/integrate_multiple_parquetobs.md's obs-count-gap investigation.
+# docs/integrate_multiple_parquetobs_history.md's obs-count-gap investigation.
 _GENERIC_STATION_IDS = frozenset({'MASKSTID', 'SHIP'})
 
 
@@ -190,13 +189,58 @@ def sensible_temperature(cycle_directory, prepbufr_class, report_ids, level_indi
     The archive's `temperature_c` is the current (top-of-stack) TOB. Wherever
     moisture was reported, that is virtual temperature, written by PREPBUFR's
     VIRTMP step (program code 8). This returns, for each (report_id,
-    level_index), the first event in the stack whose program is not VIRTMP.
+    level_index), the LOWEST-event_index event with a HIGHER event_index than
+    the VIRTMP event (i.e. chronologically before the T->Tv conversion) --
+    not merely the lowest-index event whose OWN program code isn't VIRTMP.
+    That distinction matters: VIRTMP is not always at event_index 0 --
+    confirmed against a real cycle (2015-01-01 00Z, ADPUPA), in 239 of
+    15,498 VIRTMP-bearing (report_id, level_index) groups, a later event
+    (program_code 10, not VIRTMP) sits ABOVE VIRTMP in the stack (lower
+    event_index), carrying VIRTMP's own value forward unchanged (confirmed
+    exhaustively: its value matches the VIRTMP event's value in all 239
+    cases). A filter that only excludes `program_code == VIRTMP_PROGRAM_CODE`
+    would pick up that event -- still virtual temperature, not sensible.
+    Anchoring on VIRTMP's own event_index instead of its program_code
+    correctly skips it, and everything else at or above VIRTMP's position,
+    regardless of what program code they carry. A group with no VIRTMP
+    event at all excludes nothing (every real event_index is >= 0, so the
+    sentinel "no VIRTMP" position of -1 excludes nothing).
+
+    event_index is confirmed contiguous from 0 with no gaps, checked
+    exhaustively across 252,452 real (report, level) groups spanning 5
+    PREPBUFR classes (ADPUPA, ADPSFC, SFCSHP, AIRCFT, AIRCAR) in the same
+    cycle -- so the kept value's event_index is always exactly
+    `virtmp_event_index + 1` in practice, though the code doesn't assume
+    that specific offset, only "the lowest index above VIRTMP's own."
+
+    Confirmed VIRTMP's own presence/position three independent ways, not
+    just taken on the archive's README's word for it:
+    (1) The converter (`convert_prepbufr_to_parquet.py`, NOAA-EMC/
+        prepbufr_to_parquet) gets `event_index` directly from NCEPLIBS'
+        own `ufbevn` Fortran routine's array index -- not an invented
+        convention, but BUFRLIB's own native event-stack order, the same
+        one GSI itself relies on when reading PREPBUFR. The converter
+        also writes an explicit `is_current = (event_index == 0)` column
+        and `event_order` dataset metadata saying the same thing.
+    (2) The archive's `levels` table independently stores each level's
+        "current" value in its own column (`temperature_c`), written by
+        a SEPARATE code path (not `ufbevn`'s event loop at all). Checked
+        directly against a real cycle (2015-01-01 00Z, ADPUPA): across
+        28,288 real levels with a TOB event stack, `temperature_c`
+        matched `event_index == 0`'s value in ALL 28,288 cases.
+    (3) A real sample (report_id 0, level_index 0): event_index 0 has
+        value 21.5 C, program_code 8 (VIRTMP); event_index 1 has value
+        19.6 C, program_code 1. 21.5 > 19.6 is physically correct for
+        Tv > T (virtual temperature exceeds sensible temperature for any
+        positive humidity) -- confirming event_index 0 really is the
+        VIRTMP-corrected (most recent) value and event_index 1 the
+        pre-VIRTMP sensible one this function is supposed to recover.
     A level whose ONLY TOB event(s) are VIRTMP has no recoverable sensible
     value and comes back NaN, so it gets excluded downstream like any other
     missing value -- the input value is kept as a fallback only for a level
-    with no TOB events in the archive at all (PR #29's review: falling back
-    to the input there previously let a virtual temperature be assimilated
-    as sensible). Values that are NaN on input stay NaN.
+    with no TOB events in the archive at all (falling back to the input
+    there previously let a virtual temperature be assimilated as
+    sensible). Values that are NaN on input stay NaN.
     """
     events = read_partition(class_file(cycle_directory, 'events', prepbufr_class), _EVENT_COLUMNS)
     mnemonic = np.asarray(events['value_mnemonic'].to_pylist())
@@ -207,7 +251,29 @@ def sensible_temperature(cycle_directory, prepbufr_class, report_ids, level_indi
     val_all = column(events, 'value')[keep]
     prog_all = column(events, 'program_code')[keep]
     has_tob_event = set(zip(rid_all.tolist(), lev_all.tolist()))
-    ok = prog_all != VIRTMP_PROGRAM_CODE
+
+    # VIRTMP's own event_index per (report_id, level_index) group -- the
+    # lowest one, if more than one VIRTMP event is ever found for the same
+    # group (not observed in the real archive checked, confirmed exactly
+    # one VIRTMP event per group there, but handled defensively rather
+    # than assumed).
+    virtmp_mask = prog_all == VIRTMP_PROGRAM_CODE
+    v_rid, v_lev, v_idx = rid_all[virtmp_mask], lev_all[virtmp_mask], idx_all[virtmp_mask]
+    v_order = np.lexsort((v_idx, v_lev, v_rid))
+    v_rid, v_lev, v_idx = v_rid[v_order], v_lev[v_order], v_idx[v_order]
+    v_first = np.ones(len(v_rid), bool)
+    v_first[1:] = (v_rid[1:] != v_rid[:-1]) | (v_lev[1:] != v_lev[:-1])
+    virtmp_idx_by_group = dict(zip(
+        zip(v_rid[v_first].tolist(), v_lev[v_first].tolist()), v_idx[v_first].tolist()))
+
+    # -1 ("no VIRTMP for this group") excludes nothing, since every real
+    # event_index is >= 0 -- keep everything, same as before VIRTMP ever
+    # entered the picture for that group.
+    virtmp_idx_per_row = np.fromiter(
+        (virtmp_idx_by_group.get(key, -1) for key in zip(rid_all.tolist(), lev_all.tolist())),
+        dtype=np.int64, count=len(rid_all),
+    )
+    ok = idx_all > virtmp_idx_per_row
     rid, lev, idx, val = rid_all[ok], lev_all[ok], idx_all[ok], val_all[ok]
     order = np.lexsort((idx, lev, rid))
     rid, lev, val = rid[order], lev[order], val[order]

@@ -289,6 +289,7 @@ _PSOBS_CONFIG_KEYS = {
     'time_tolerance_hours': 'psobs_time_tolerance_hours',
     'use_source_error': 'psobs_use_source_error',
     'error_std_hpa': 'surface_pressure_error_std_hpa',
+    'frozen_qc': 'psobs_frozen_qc',
 }
 
 # raobs (radiosonde profile) obs-variable name -> model packed-state base
@@ -373,20 +374,31 @@ RAOBS_TUV_ERROR_STD = {
 RAOBS_Q_ERROR_RH_PERCENT = dict(zip(
     _RAOBS_ERRTABLE_PRESSURES, [v * 10. for v in _RAOBS_ERRTABLE_RH_TENTHS_PERCENT]
 ))
-# GSI's own 'gross' convinfo value for kx 120/220/221 (t/uv/q all share
-# 8.0) -- the multiplier in the background check `|O-B| > bg_check *
-# qc_error`. Previously 4.0 (q_bg_check was independently validated at
-# that value, but only against the OLDER table/fraction q-error path --
-# see docs/integrate_multiple_parquetobs.md -- not yet re-validated at
-# 8.0).
-RAOBS_Q_BG_CHECK = 8.0
-# t/u/v share one background-check multiplier (unlike error_std, which is
-# per-variable -- see RAOBS_TUV_ERROR_STD) -- GSI's conventional-data gross check (errormod,
-# read_prepbufr.F90) rejects/inflates on |O-B| similarly for raobs t/u/v;
-# this repo's raobs previously had no O-B check for them at all, relying
-# only on the read-time PREPBUFR-quality-mark/height QC (see
-# docs/integrate_multiple_parquetobs.md's GSI comparison).
-RAOBS_TUV_BG_CHECK = 8.0
+# Background check: reject (or, for t/u/v, inflate -- see
+# _raobs_gross_check_threshold) |O-B| > threshold * qc_error, OR
+# (if given) |O-B| > absolute, regardless of qc_error. The only default
+# -- `observations.raobs.bg_check` is the only way to configure this,
+# there is no separate scalar knob (an earlier version had
+# tuv_bg_check/q_bg_check scalars, GSI's own flat 8.0 convinfo gross
+# value for kx 120/220/221, as a fallback for variables bg_check didn't
+# list; removed as redundant complexity once bg_check became the only
+# mechanism anyone actually used). These are UFO's real sonde QC config
+# values (sonde_gfs_qc.yaml, PR #29's review), not GSI's: GSI's gross
+# check applies the SAME live, every-outer-loop re-evaluation to raobs
+# as to ps (see compute_optimal's own frozen_qc comment), so there's no
+# more a GSI precedent for THIS module's default to lean on GSI's
+# numbers over UFO's richer per-variable-plus-absolute-limit form.
+# q has no absolute limit in UFO's own config, so none is given here
+# either. A variable not listed in a configured `bg_check` override
+# keeps its DEFAULT dict below (not a per-field merge -- same convention
+# as error_std/physical_bounds); a variable set to `null` disables the
+# check entirely for it.
+RAOBS_BG_CHECK = {
+    't': {'threshold': 7.0, 'absolute': 9.0},
+    'u': {'threshold': 6.0, 'absolute': 19.0},
+    'v': {'threshold': 6.0, 'absolute': 19.0},
+    'q': {'threshold': 8.0},
+}
 
 _RAOBS_CONFIG_KEYS = {
     'path': 'raobs_path',
@@ -402,13 +414,12 @@ _RAOBS_CONFIG_KEYS = {
     'error_std': 'raobs_error_std',
     'use_drift_time': 'raobs_use_drift_time',
     'use_drift_position': 'raobs_use_drift_position',
-    'tuv_bg_check': 'raobs_tuv_bg_check',
     'bg_check': 'raobs_bg_check',
     'q_error_rh_percent': 'raobs_q_error_rh_percent',
-    'q_bg_check': 'raobs_q_bg_check',
     'humidity_min_pressure_hpa': 'raobs_humidity_min_pressure_hpa',
     'station_capacity': 'raobs_station_capacity',
     'physical_bounds': 'raobs_physical_bounds',
+    'frozen_qc': 'raobs_frozen_qc',
 }
 
 _RAOBS_BASE_LONG_NAME = {v: k for k, v in RAOBS_VARIABLE_MODEL_BASE.items()}
@@ -673,7 +684,7 @@ def load_config(config_path='config.yml'):
                 # pass validation and silently replace the default table
                 # with no sample points, failing later in np.interp with an
                 # opaque error -- reject it here instead, at config load
-                # time (PR #29's review).
+                # time.
                 raise ValueError(f"observations.raobs.{name} must not be empty")
             for p, v in table.items():
                 if not (np.isfinite(p) and p > 0):
@@ -697,20 +708,16 @@ def load_config(config_path='config.yml'):
                     _check_level_table(v, f'error_std[{k!r}]')
                 elif not (np.isfinite(v) and v > 0):
                     raise ValueError(f"observations.raobs.error_std[{k!r}] must be positive and finite, got {v!r}")
-        for key in ('raobs_q_bg_check', 'raobs_tuv_bg_check'):
-            v = exp.get(key)
-            if v is not None and not (np.isfinite(v) and v > 0):
-                raise ValueError(f"observations.raobs.{key[len('raobs_'):]} must be positive and finite, got {v!r}")
         q_error_rh_percent = exp.get('raobs_q_error_rh_percent')
         if q_error_rh_percent is not None:
             _check_level_table(q_error_rh_percent, 'q_error_rh_percent')
 
         bg_check = exp.get('raobs_bg_check')
         if bg_check is not None:
-            # Per-variable {threshold, absolute} override of tuv_bg_check/
-            # q_bg_check (e.g. UFO/GSI's T 7.0x+9.0K, wind 6.0x+19m/s, q
-            # 8.0x -- PR #29's review comment) -- optional; unlisted
-            # variables keep using the shared scalar default.
+            # Per-variable {threshold, absolute} override of RAOBS_BG_CHECK
+            # (the only mechanism -- see its own comment) -- unlisted
+            # variables keep using the default dict; a variable set to
+            # `null` disables the check entirely for it.
             bad_keys = set(bg_check) - {'t', 'u', 'v', 'q'}
             if bad_keys:
                 raise ValueError(
@@ -718,9 +725,12 @@ def load_config(config_path='config.yml'):
                     f"got {sorted(bad_keys)}"
                 )
             for k, cfg in bg_check.items():
+                if cfg is None:
+                    continue
                 if not isinstance(cfg, dict) or 'threshold' not in cfg:
                     raise ValueError(
-                        f"observations.raobs.bg_check[{k!r}] must be a dict with a 'threshold' key, got {cfg!r}")
+                        f"observations.raobs.bg_check[{k!r}] must be null or a dict with a "
+                        f"'threshold' key, got {cfg!r}")
                 extra = set(cfg) - {'threshold', 'absolute'}
                 if extra:
                     raise ValueError(f"observations.raobs.bg_check[{k!r}] has unknown keys {sorted(extra)}")
@@ -1311,19 +1321,21 @@ def get_psobs(exp, model, logger, grid_interp):
         vdate = add_hours(vdate, dt_obs)
 
     from psobs_parquet import load_psobs_parquet
-    # Default dt_obs/2 -- exactly half the obs-slot spacing, so consecutive
-    # slots' acceptance windows tile the whole window edge to edge with no
-    # gaps and no overlap, for ANY dt_obs (every raw report is captured by
-    # its single nearest slot; confirmed mathematically and by simulation,
-    # see docs/integrate_multiple_parquetobs.md). Matches raobs's own
-    # time_tolerance_hours default below. At the mainline dt_obs: 6 this is
-    # 3.0h, NOT the legacy psobs1_*.txt archive's generator (/scratch3/
-    # NCEPDEV/da/Jeffrey.Whitaker/psobs/read_ps_prepbufr1.py: halfwindow =
-    # 1800s = 0.5h) -- that narrower, dt_obs-independent value only captured
-    # obs within 0.5h of each cycle hour (~17% of each 6h cycle); pass
-    # observations.psobs.time_tolerance_hours: 0.5 explicitly to reproduce
-    # that legacy-matching behavior instead.
-    time_tolerance_hours = exp.get('psobs_time_tolerance_hours', dt_obs / 2.)
+    # Default 0.5h, matching the legacy psobs1_*.txt archive's own generator
+    # (/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs/read_ps_prepbufr1.py:
+    # halfwindow = 1800s = 0.5h) -- dt_obs-independent, so every mainline
+    # ps-only config's behavior is unchanged by this PR unless it opts in.
+    # A dt_obs/2 tolerance (tiling the window edge to edge with no gaps,
+    # capturing every archived report -- see docs/integrate_
+    # multiple_parquetobs.md) was tried as the new default instead, but
+    # reviewed as an unvalidated ~6x change in assimilated-ob count
+    # for every ps-only run at the mainline dt_obs: 6 (jc_ps_weight/
+    # weight_decay were tuned at the old count) -- pass
+    # observations.psobs.time_tolerance_hours: <dt_obs/2 value> explicitly to
+    # get that behavior instead. raobs has no pre-existing mainline default
+    # to preserve, so its own time_tolerance_hours below still defaults to
+    # dt_obs/2.
+    time_tolerance_hours = exp.get('psobs_time_tolerance_hours', 0.5)
     parquet_data = load_psobs_parquet(
         obspath,
         verification_times,
@@ -1558,7 +1570,7 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     # raobs_parquet.py, so the table is resolved and passed in here
     # rather than applied afterward the way error_std's t/u/v tables are.
     # A configured table REPLACES the default wholesale rather than being
-    # merged knot-by-knot with it (PR #29's review): merging would leave
+    # merged knot-by-knot with it: merging would leave
     # default pressure knots sitting between the user's own entries,
     # silently changing the ln(p)-interpolated value at every pressure
     # that falls near one of those leftover default knots instead of
@@ -1590,10 +1602,10 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
         humidity_min_pressure_hpa=exp.get('raobs_humidity_min_pressure_hpa', 300.),
         # Both drift corrections default to True when raobs is enabled and
         # the key is omitted -- matching the PR description; an explicit
-        # False in the config still disables either one (PR #29's review:
-        # previously False here regardless of the committed template's own
-        # True, so a config built without copying that template line got
-        # no drift correction at all).
+        # False in the config still disables either one (previously False
+        # here regardless of the committed template's own True, so a
+        # config built without copying that template line got no drift
+        # correction at all).
         use_drift_time=exp.get('raobs_use_drift_time', True),
         vertical_interpolation=exp.get('raobs_vertical_interpolation', 'exact'),
         # Independent of use_drift_time: that corrects WHICH slot a level
@@ -1636,12 +1648,13 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
     # BY VARIABLE NAME (t/u/v each override independently, unlike
     # q_error_rh_percent's per-knot table above) -- `or {}` treats an
     # explicit `raobs_error_std: null` the same as omitted, instead of
-    # crashing on `**None` (PR #29's review).
+    # crashing on `**None`.
     error_std = {**RAOBS_TUV_ERROR_STD, **(exp.get('raobs_error_std') or {})}
-    # Per-variable {threshold, absolute} override of tuv_bg_check/
-    # q_bg_check (optional; see RAOBS_TUV_BG_CHECK's docstring and PR #29's
-    # review comment) -- unlisted variables keep using the shared scalar.
-    bg_check_cfg = exp.get('raobs_bg_check') or {}
+    # Per-variable {threshold, absolute} (or null to disable) override of
+    # RAOBS_BG_CHECK -- the only background-check mechanism (see its own
+    # comment); same whole-variable-replacement convention as error_std
+    # above, not a per-field merge.
+    bg_check = {**RAOBS_BG_CHECK, **(exp.get('raobs_bg_check') or {})}
 
     for base in bases:
         n_levels = levels_hpa[base].size
@@ -1706,12 +1719,10 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                 n = data['default_error_q'][j].shape[-1]
                 default[j, :, :n] = torch.as_tensor(data['default_error_q'][j], device=device)
             raobs_traj['default_error_q'] = default
-            bgc = exp.get('raobs_q_bg_check', RAOBS_Q_BG_CHECK)
-            raobs_traj['q_bg_check'] = float(bgc) if bgc else None
-            if 'q' in bg_check_cfg:
-                raobs_traj['bg_check_threshold_q'] = float(bg_check_cfg['q']['threshold'])
-                if bg_check_cfg['q'].get('absolute') is not None:
-                    raobs_traj['bg_check_absolute_q'] = float(bg_check_cfg['q']['absolute'])
+            if bg_check.get('q') is not None:
+                raobs_traj['bg_check_threshold_q'] = float(bg_check['q']['threshold'])
+                if bg_check['q'].get('absolute') is not None:
+                    raobs_traj['bg_check_absolute_q'] = float(bg_check['q']['absolute'])
         else:
             # error_std[base]: a flat scalar, or a {hPa: value} table
             # (same ln(p) interpolation convention as q's own RH-percent
@@ -1724,8 +1735,8 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                 # assigned NOMINAL model level -- evaluate the table at
                 # each cell's own REAL reported pressure
                 # (raobs_traj['pressure_'+base], already built above)
-                # instead, the same convention q's own error already uses
-                # (PR #29's review). NaN where no observation was kept
+                # instead, the same convention q's own error already uses.
+                # NaN where no observation was kept
                 # (pressure_<base> is NaN there) propagates through
                 # np.interp as NaN, same as default_error_q's padding.
                 pressure_cells = raobs_traj['pressure_'+base].detach().cpu().numpy()
@@ -1739,12 +1750,10 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
                 raobs_traj['error_'+base] = flat_error[None, :, None].expand(n_obs, n_levels, capacity)
             else:
                 raobs_traj['error_'+base] = float(raw)
-            bgc = exp.get('raobs_tuv_bg_check', RAOBS_TUV_BG_CHECK)
-            raobs_traj['tuv_bg_check'] = float(bgc) if bgc else None
-            if base in bg_check_cfg:
-                raobs_traj['bg_check_threshold_'+base] = float(bg_check_cfg[base]['threshold'])
-                if bg_check_cfg[base].get('absolute') is not None:
-                    raobs_traj['bg_check_absolute_'+base] = float(bg_check_cfg[base]['absolute'])
+            if bg_check.get(base) is not None:
+                raobs_traj['bg_check_threshold_'+base] = float(bg_check[base]['threshold'])
+                if bg_check[base].get('absolute') is not None:
+                    raobs_traj['bg_check_absolute_'+base] = float(bg_check[base]['absolute'])
 
     # Shared k-NN horizontal interpolation (same mechanism as psobs, but
     # computed independently -- raobs stations are not at the same
@@ -1842,7 +1851,7 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
     `compute_loss_4dvar`'s optimization-loop calls, so the accept/reject
     decision stays fixed throughout the minimization instead of letting
     the optimizer lower Jo by pushing an observation out of QC instead of
-    fitting it (PR #29's review). `compute_ps_observation_hx`'s own
+    fitting it. `compute_ps_observation_hx`'s own
     calls (background AND analysis snapshots) never set this -- both are
     meant to score fresh at whatever state they're handed, not reuse a
     frozen decision. Every other QC component (availability,
@@ -1954,15 +1963,14 @@ def _compute_ps_observation_diagnostics_at_time(model, decoded, verif_ic, psobs_
     return innovation, model_equivalent, effective_error, available, used, qc_flag
 
 
-def _raobs_gross_check_threshold(raobs_traj, base, shared_key):
+def _raobs_gross_check_threshold(raobs_traj, base):
     """The resolved (threshold, absolute) gross-check pair for one raobs
-    variable: `bg_check_threshold_<base>`/`bg_check_absolute_<base>` if
-    `observations.raobs.bg_check` configured one (UFO/GSI's per-variable
-    form -- T 7.0x+9.0K, wind 6.0x+19m/s, q 8.0x, PR #29's review
-    comment), else the shared `shared_key` (`tuv_bg_check`/`q_bg_check`)
-    scalar with no absolute limit. `threshold` is `None` if neither is
-    configured (no gross check at all for this variable)."""
-    threshold = raobs_traj.get('bg_check_threshold_'+base, raobs_traj.get(shared_key))
+    variable, from `bg_check_threshold_<base>`/`bg_check_absolute_<base>`
+    (get_raobs's resolution of `observations.raobs.bg_check`, merged with
+    RAOBS_BG_CHECK's defaults -- the only background-check mechanism).
+    `threshold` is `None` if this variable's check is disabled (`bg_check:
+    {<base>: null}`)."""
+    threshold = raobs_traj.get('bg_check_threshold_'+base)
     return (float(threshold) if threshold else None), raobs_traj.get('bg_check_absolute_'+base)
 
 
@@ -1999,25 +2007,22 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
     `decoded[base]` via `field_level_idx`) rather than gathered out of the
     already-interpolated `model_obspace` -- that would reuse the
     NEIGHBOR's own drift position instead of the current level's,
-    mixing horizontal locations into the vertical correction (PR #29's
-    review).
+    mixing horizontal locations into the vertical correction.
 
     QC is the read-time QC already folded into `mask_<base>`, plus an
     optional background check evaluated at the current state: reject
     |O-B| > threshold * qc_error, OR (if configured) |O-B| > an absolute
     limit -- `threshold`/`absolute` resolved per variable by
-    `_raobs_gross_check_threshold` (UFO/GSI's per-variable form if
-    `observations.raobs.bg_check` configured one, else the shared
-    `q_bg_check`/`tuv_bg_check` scalar with no absolute limit).
-    `qc_error` is always `effective_error` (the actual Jo weight) -- no
-    additional clamp.
+    `_raobs_gross_check_threshold` (RAOBS_BG_CHECK's default, or
+    `observations.raobs.bg_check`'s override). `qc_error` is always
+    `effective_error` (the actual Jo weight) -- no additional clamp.
 
     Regardless of whether a background check is configured, `used` is
     always additionally restricted to cells with a finite, positive
     `effective_error` -- a missing archived background (leaving both the
     default and source q errors NaN) could otherwise pass read-time QC
     and reach `_raobs_term` with no finite weight, making the total loss
-    non-finite (PR #29's review).
+    non-finite.
 
     `frozen_qc`: if True, the background check above is NOT recomputed
     from the live `innovation` -- `raobs_traj['bg_used'][base][oind]`
@@ -2025,7 +2030,7 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
     the uncorrected background) is consulted directly instead. Used
     only by `compute_loss_4dvar`'s optimization-loop calls -- see
     `_compute_ps_observation_diagnostics_at_time`'s matching parameter
-    for the full rationale (PR #29's review) and why
+    for the full rationale and why
     `compute_ps_observation_hx`'s own calls never set this.
     """
     idx = raobs_traj['interp_idx'][oind]
@@ -2052,7 +2057,7 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
                 # neighbor's -- gathering the neighbor's row straight out
                 # of model_obspace (as below) would reuse the neighbor's
                 # OWN position instead, mixing horizontal locations into
-                # the vertical blend (PR #29's review).
+                # the vertical blend.
                 neighbor_vals = _raobs_gather_per_level(
                     decoded[base], own_idx, own_wts, field_level_idx=neighbor_idx)
             else:
@@ -2071,7 +2076,7 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
             if frozen_qc:
                 used = used & raobs_traj['bg_used']['q'][oind]
             else:
-                threshold, absolute = _raobs_gross_check_threshold(raobs_traj, 'q', 'q_bg_check')
+                threshold, absolute = _raobs_gross_check_threshold(raobs_traj, 'q')
                 if threshold:
                     passes = innovation.abs() <= threshold * effective_error
                     if absolute is not None:
@@ -2089,7 +2094,7 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
             if frozen_qc:
                 used = used & raobs_traj['bg_used'][base][oind]
             else:
-                threshold, absolute = _raobs_gross_check_threshold(raobs_traj, base, 'tuv_bg_check')
+                threshold, absolute = _raobs_gross_check_threshold(raobs_traj, base)
                 if threshold:
                     passes = innovation.abs() <= threshold * effective_error
                     if absolute is not None:
@@ -2100,7 +2105,7 @@ def _compute_raobs_observation_diagnostics_at_time(model, decoded, raobs_traj, g
         # archived background left source/default q error NaN, with no
         # bg_check configured to screen it) or non-positive must never be
         # used -- otherwise _raobs_term divides by it and the total loss
-        # goes non-finite (PR #29's review).
+        # goes non-finite.
         used = used & torch.isfinite(effective_error) & (effective_error > 0)
         results[base] = (innovation, safe_model_obspace, effective_error, used)
     return results
@@ -2523,12 +2528,14 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     Jol = [None] * n_obs
     Jraobs = [None] * n_obs if raobs_traj is not None else None
     obs_density_box_deg = float(exp.get('obs_density_box_deg', 0.0))
-    # True for every real run (compute_optimal resolves psobs_traj['bg_used']/
-    # raobs_traj['bg_used'] once, before this loop, against the uncorrected
-    # background); False for a caller (e.g. tests/math/'s toy-model gates)
-    # that built its own psobs_traj/raobs_traj without that step, which then
-    # keeps today's live-recomputed background check unchanged (PR #29's
-    # review).
+    # Derived from whether 'bg_used' is present, not read from exp directly:
+    # compute_optimal resolves psobs_traj['bg_used']/raobs_traj['bg_used']
+    # once before this loop, against the uncorrected background, but only
+    # when observations.psobs.frozen_qc / observations.raobs.frozen_qc
+    # (independently defaulted -- see compute_optimal's own comment) says
+    # to. A caller that builds its own psobs_traj/raobs_traj without that
+    # step at all (e.g. tests/math/'s toy-model gates) also lands here as
+    # False, i.e. today's live-recomputed background check.
     psobs_frozen_qc = psobs_traj.get('bg_used') is not None
     raobs_frozen_qc = raobs_traj is not None and raobs_traj.get('bg_used') is not None
 
@@ -2559,6 +2566,26 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
         # used.sum().item() is a CUDA sync; only pay it when do_print will
         # actually read counts, same as _obs_term's own diagnostic prints.
         counts = {} if do_print else None
+        # Unlike _obs_term above, this has no obs_density_box_deg-style
+        # area weighting, and no normalization by level/variable count
+        #: a straight sum of (innov/err)^2 over every
+        # used (base, level, station) triple. This means the ps/raob Jo
+        # balance -- and so how much each pulls the analysis -- depends
+        # on how many levels and variables each sounding happens to
+        # contribute, not just on how many soundings or how well either
+        # fits; a dense region of deep, multi-variable soundings
+        # contributes disproportionately more total raobs Jo than the
+        # same number of soundings with fewer levels/variables, with no
+        # equivalent of obs_density_box_deg's rescaling to compensate.
+        # Deliberately left this way rather than adding a raobs-specific
+        # weight speculatively: unlike obs_density_box_deg (added and
+        # tuned against a specific documented ps-obs clustering problem),
+        # there is no evidence yet that raobs's imbalance actually causes
+        # one -- raobs soundings are far sparser and more uniform in
+        # per-level/variable count than psobs reports, so the ps problem
+        # this existing mechanism solves may not have a raobs analogue at
+        # all. Revisit with a real weight only if a validation run shows
+        # the balance actually needs it.
         for base, (innovation, model_equivalent, effective_error, used) in results.items():
             innov = torch.where(used, innovation, torch.zeros_like(innovation))
             err = torch.where(used, effective_error, torch.full_like(effective_error, 1.e10))
@@ -2656,7 +2683,7 @@ def compute_loss_4dvar(model, latent_increment, latent_scale, input_state, verif
     # merged into Jol_np -- raobs's own contribution to the scalar total
     # J above was already included, but was invisible in the per-slot
     # diagnostics (Jol_np/jo_per_slot_first/_last), which previously
-    # reported only the surface-pressure contribution (PR #29's review).
+    # reported only the surface-pressure contribution.
     # None when raobs is disabled, so existing psobs-only callers/golden
     # values are unaffected.
     Jraobs_np = np.array([j.item() for j in Jraobs]) if raobs_traj is not None else None
@@ -2768,24 +2795,46 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
 
     device = input_encoded.state.device
 
-    # Background (uncorrected) H(x)/QC, evaluated ONCE here against
-    # input_encoded and frozen for the whole minimization -- otherwise the
-    # optimizer could lower Jo by pushing an observation's live O-A far
-    # enough to fail the gross check instead of actually fitting it
-    # (PR #29's review; matches traditional 4DVar/GSI/JEDI practice, and
-    # this module's own saved-diagnostics convention --
-    # save_trajectory_diagnostics's 'quality_control_reference':
-    # 'background' attribute, previously true only of the SAVED file, not
-    # of what the optimizer itself used). psobs_traj/raobs_traj are
-    # mutated in place: 'bg_used' is read by
-    # _compute_ps_observation_diagnostics_at_time/
+    # Background (uncorrected) H(x), evaluated ONCE here against
+    # input_encoded -- always needed, regardless of frozen_qc below,
+    # since save_trajectory_diagnostics reuses it (via 'background_hx')
+    # instead of recomputing this same no-grad pass a second time, for its
+    # 'quality_control_reference': 'background' saved-diagnostics
+    # convention.
+    #
+    # 'bg_used', by contrast, is populated conditionally -- it freezes the
+    # gross-check accept/reject decision at the background for the whole
+    # minimization, read by _compute_ps_observation_diagnostics_at_time/
     # _compute_raobs_observation_diagnostics_at_time whenever
-    # compute_loss_4dvar sets frozen_qc=True (automatic here, since this
-    # sets 'bg_used' before the AdamW loop below -- a caller that builds
-    # its own psobs_traj/raobs_traj without this step, e.g. tests/math/'s
-    # toy-model gates, keeps today's live-recomputed background check
-    # unchanged); 'background_hx' is reused by save_trajectory_diagnostics
-    # instead of recomputing this same no-grad pass a second time.
+    # compute_loss_4dvar sets frozen_qc=True (automatic below: a dict key
+    # present vs. absent, not a passed-down bool). Without this, the live
+    # gross check is recomputed from the CURRENT, still-optimizing state
+    # every epoch, which lets the optimizer lower Jo by pushing an
+    # observation's live O-A far enough to fail the gross check (and so
+    # drop out of the loss) instead of actually fitting it (Copilot's
+    # adversarial example -- see
+    # test_raobs_frozen_qc_prevents_gaming_the_gross_check) -- matching
+    # traditional 4DVar/GSI/JEDI practice instead.
+    #
+    # Both default to False (live QC), matching GSI/JEDI's own practice:
+    # GSI re-evaluates its gross check every outer loop against the
+    # current state for BOTH obs types, via the same mechanism either
+    # way -- errormod in read_prepbufr.F90, driven by a per-kx convinfo
+    # gross value (this module's own RAOBS_BG_CHECK default now uses
+    # UFO's richer per-variable-plus-absolute-limit numbers instead of
+    # GSI's flat one, but the underlying live-QC practice this defaults
+    # to is GSI's either way). So "live QC" here isn't a ps-specific
+    # precedent extended to raobs for mere consistency -- it's the same
+    # GSI practice applying to both (PR #29's review, jswhit). One
+    # caveat, for either obs type: GSI's own
+    # outer loop runs only ~2-3 times, so its "live" QC is re-derived
+    # only that often; this module's AdamW inner loop runs on the order
+    # of 100 epochs, so "live" here is a finer-grained, more aggressive
+    # version of GSI's practice, with correspondingly more opportunity
+    # for the adversarial gaming example above to matter in practice --
+    # accepted as a known tradeoff rather than closed off by default.
+    # Set observations.psobs.frozen_qc / observations.raobs.frozen_qc:
+    # True (independently) to close it off for a given run.
     model._prime_noise()  # no-op for AIFS
     background_hx, background_model_trajectory, raobs_background_hx = compute_ps_observation_hx(
         model, input_encoded, verif_ic, psobs_traj, exp, grid_interp, interp_specs, step_start=0,
@@ -2793,19 +2842,21 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     )
     psobs_traj['background_hx'] = background_hx
     psobs_traj['background_model_trajectory'] = background_model_trajectory
-    # qc_flag bit 8 == gross_check_failed (_compute_ps_observation_
-    # diagnostics_at_time) -- the ONLY component being frozen; available/
-    # interpolation/orography (bits 1/2/4) stay live on every later call
-    # regardless, so re-deriving just this bit (rather than reusing
-    # background_hx['used'] wholesale) keeps that distinction explicit.
-    psobs_traj['bg_used'] = torch.as_tensor(
-        (background_hx['qc_flag'].astype(np.int64) & 8) == 0, device=device)
+    if exp.get('psobs_frozen_qc', False):
+        # qc_flag bit 8 == gross_check_failed (_compute_ps_observation_
+        # diagnostics_at_time) -- the ONLY component being frozen; available/
+        # interpolation/orography (bits 1/2/4) stay live on every later call
+        # regardless, so re-deriving just this bit (rather than reusing
+        # background_hx['used'] wholesale) keeps that distinction explicit.
+        psobs_traj['bg_used'] = torch.as_tensor(
+            (background_hx['qc_flag'].astype(np.int64) & 8) == 0, device=device)
     if raobs_traj is not None:
         raobs_traj['background_hx'] = raobs_background_hx
-        raobs_traj['bg_used'] = {
-            base: torch.as_tensor(raobs_background_hx[base]['used'], device=device)
-            for base in raobs_traj['variables']
-        }
+        if exp.get('raobs_frozen_qc', False):
+            raobs_traj['bg_used'] = {
+                base: torch.as_tensor(raobs_background_hx[base]['used'], device=device)
+                for base in raobs_traj['variables']
+            }
 
     jb_op = get_jb_operator(exp, model, logger) if exp.get('jb_samples') else None
     jb_weight = float(exp.get('jb_weight', 1.0))
@@ -3118,7 +3169,7 @@ def save_trajectory_diagnostics(exp, model, input_encoded, analysis_state, verif
     # Reuse compute_optimal's own background pass (same model_state,
     # same step_start=0 call) instead of recomputing it here -- also
     # guarantees this saved file's background QC matches exactly what
-    # fed the optimization's frozen gross check (PR #29's review). Falls
+    # fed the optimization's frozen gross check. Falls
     # back to computing it fresh if called without compute_optimal
     # having run first (not the production call pattern, but keeps this
     # function usable standalone).
