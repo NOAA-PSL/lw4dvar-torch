@@ -93,7 +93,19 @@ def report(report_id, lat=10., lon=20., elev=0., report_type=120, time=None, sta
 
 def level(
     report_id, pressure=850., height=1500., height_quality=1., category=1,
-    temperature=300., temperature_quality=1., u=5., v=-5., wind_quality=1.,
+    # 15 C (288.15 K): physically VALID by default (within the 195-327 K
+    # physical_bounds check), so a test that doesn't care about
+    # temperature and never overrides it isn't also, silently, triggering
+    # a physical_bounds rejection of its own -- the old 300. default
+    # (written straight to temperature_c, so 573.15 K) failed that check
+    # unconditionally, meaning every height/below-station/quality-mark/
+    # cross-slot-height-order rejection test using this helper without an
+    # explicit temperature= would still "pass" even if ITS intended QC
+    # mechanism were broken, since physical_bounds would reject it
+    # regardless (PR #29's review). Tests that specifically want an
+    # impossible temperature (the physical_bounds tests themselves) set
+    # it explicitly.
+    temperature=15., temperature_quality=1., u=5., v=-5., wind_quality=1.,
     q=5000., humidity_quality=1., level_index=0,
     temperature_error=None, wind_error=None,
     humidity_error_tenths_percent=None, background_temperature=None, background_pressure=None,
@@ -258,24 +270,53 @@ def test_quality_mark_qc_rejected(tmp_path):
 
 def test_sensible_temperature_used_instead_of_virtual(tmp_path):
     # The archive's temperature_c is the (virtual) TOB when moisture was
-    # reported; the FIRST non-VIRTMP (program_code != 8) event BY STACK
-    # ORDER (lowest event_index) is the sensible value
-    # common.sensible_temperature must return instead. Multiple non-
-    # VIRTMP candidates, given in shuffled input order with distinct
-    # event_index values, confirm this picks by stack order -- not input-
-    # list order and not value magnitude (PR #29's review).
+    # reported; the LOWEST-event_index event ABOVE the VIRTMP event's own
+    # position is the sensible value common.sensible_temperature must
+    # return instead. Multiple non-VIRTMP candidates, given in shuffled
+    # input order with distinct event_index values, confirm this picks by
+    # stack order -- not input-list order and not value magnitude.
+    # VIRTMP sits at the LOWEST index (0, i.e. most recent) here --
+    # confirmed the realistic/common arrangement against real archive
+    # data (PR #29's review); see
+    # test_sensible_temperature_skips_event_above_virtmp_too below for the
+    # real-world case where a later, non-VIRTMP event sits even more
+    # recently than VIRTMP itself.
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(
         tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=27.0)],
         events=[
-            event(1, value=99.0, event_index=2, program_code=0),  # non-VIRTMP, but not first in stack
-            event(1, value=50.0, event_index=1, program_code=0),  # non-VIRTMP, but not first in stack
-            event(1, value=26.0, event_index=0, program_code=0),  # non-VIRTMP, FIRST in stack -- the answer
-            event(1, value=27.0, event_index=3, program_code=8),  # VIRTMP-corrected (matches levels' temperature_c)
+            event(1, value=99.0, event_index=3, program_code=0),  # non-VIRTMP, but not first above VIRTMP
+            event(1, value=50.0, event_index=2, program_code=0),  # non-VIRTMP, but not first above VIRTMP
+            event(1, value=26.0, event_index=1, program_code=0),  # non-VIRTMP, FIRST above VIRTMP -- the answer
+            event(1, value=27.0, event_index=0, program_code=8),  # VIRTMP-corrected (matches levels' temperature_c)
         ],
     )
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
     assert data['values_t'][0][0, 0] == pytest.approx(26.0 + 273.15)
+
+
+def test_sensible_temperature_skips_event_above_virtmp_too(tmp_path):
+    # Real example from the archive (2015-01-01 00Z, ADPUPA, report_id=621,
+    # level_index=14 -- one of 239 such cases found in that one cycle):
+    # VIRTMP is NOT always at event_index 0. A later, non-VIRTMP event
+    # (program_code 10 here) can sit ABOVE VIRTMP in the stack, carrying
+    # VIRTMP's own (still virtual) value forward unchanged. A filter that
+    # only excludes `program_code == VIRTMP_PROGRAM_CODE` would incorrectly
+    # pick that event up as "sensible" since it isn't itself tagged VIRTMP
+    # -- common.sensible_temperature must instead exclude everything at or
+    # above VIRTMP's own event_index, regardless of program_code, landing
+    # on the real sensible value one level further up the stack.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=14.7)],
+        events=[
+            event(1, value=14.7, event_index=0, program_code=10),  # NOT VIRTMP, but still virtual-valued
+            event(1, value=14.7, event_index=1, program_code=8),   # VIRTMP-corrected (matches levels' temperature_c)
+            event(1, value=14.6, event_index=2, program_code=1),   # the real sensible value -- the answer
+        ],
+    )
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert data['values_t'][0][0, 0] == pytest.approx(14.6 + 273.15)
 
 
 def test_sensible_temperature_falls_back_to_input_when_no_event(tmp_path):
@@ -611,13 +652,28 @@ def test_use_drift_time_widens_partition_discovery_for_a_boundary_report(tmp_pat
     cycle = datetime(2014, 12, 31, 18)
     write_cycle(
         tmp_path, cycle, [report(1, time=cycle)],
-        # temperature=-10 (not level()'s own default 300 C -> 573 K, which
-        # fails physical-bounds QC, unrelated to what this test checks).
-        [level(1, pressure=850., temperature=-10., drift_time_hours=3.5)],
+        [level(1, pressure=850., drift_time_hours=3.5)],  # level()'s own default temperature is valid
     )
     write_cycle(tmp_path, t0, [], [])  # the 00Z cycle directory must exist too
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True)
     assert data['mask_t'][0][0, 0]
+
+
+def test_use_drift_time_reports_a_genuinely_missing_padding_cycle(tmp_path):
+    # Same widened-margin geometry as the test above (00Z's own 3h
+    # tolerance widens by use_drift_time's own extra margin on BOTH
+    # sides -- to the 18Z cycle the day before AND the 06Z cycle the
+    # same day), but this time neither padding directory is written at
+    # all -- a genuine gap, not a report that happens to need one of
+    # them. cycle_directories's allow_missing=True must still not
+    # raise, but the gap must be programmatically detectable, not just
+    # silently absorbed (PR #29's review, follow-up: a log line alone is
+    # still only as loud as whoever is watching logs).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [], [])  # only the 00Z cycle directory exists
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True)
+    skipped = {(p.parent.name, p.name) for p in data['skipped_padding_cycles']}
+    assert skipped == {('2014-12-31', '18'), ('2015-01-01', '06')}
 
 
 def test_use_drift_time_anchors_to_cycle_time_not_report_time(tmp_path):
@@ -686,11 +742,9 @@ def test_non_monotonic_height_visible_across_bucket_sharing_duplicates(tmp_path)
     # review, second round).
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, time=t0)], [
-        # temperature=-10 (not level()'s own default 300 C -> 573 K,
-        # which fails physical-bounds QC, unrelated to what this checks).
-        level(1, pressure=900., height=100., temperature=-10., level_index=0),
-        level(1, pressure=830.5, height=2500., temperature=-10., level_index=1),  # wins the 830 hPa bucket (closer)
-        level(1, pressure=829., height=50., temperature=-10., level_index=2),     # loses the bucket, height=50 < 100
+        level(1, pressure=900., height=100., level_index=0),
+        level(1, pressure=830.5, height=2500., level_index=1),  # wins the 830 hPa bucket (closer)
+        level(1, pressure=829., height=50., level_index=2),     # loses the bucket, height=50 < 100
     ])
     data = load(
         tmp_path, [t0], {'t': [900., 830.]}, ['t'],
@@ -718,6 +772,29 @@ def test_non_monotonic_height_visible_when_sibling_drifts_outside_every_slots_wi
     data = load(tmp_path, [t0], {'t': [850., 500.]}, ['t'], use_drift_time=True)
     # A (850 hPa) is the only level ever assimilated (B drifted outside
     # the window) -- its whole station must still be rejected.
+    assert not data['mask_t'][0].any()
+
+
+def test_non_monotonic_height_visible_when_sibling_fails_exact_mode_tolerance(tmp_path):
+    # Copilot's review example: the model has only one 't' level (850
+    # hPa). Level A (850 hPa, 1500 m) matches it exactly and is kept for
+    # assimilation under the default 'exact' mode. Level B (830 hPa,
+    # 1000 m) is 20 hPa from the model's only level -- way outside
+    # pressure_match_tolerance_hpa, so 'exact' mode discards it for
+    # ASSIMILATION -- but B is at LOWER pressure than A, so B's height
+    # must be HIGHER than A's, not lower: a real inversion. Before this
+    # fix, the 'exact'-mode tolerance discard skipped the profile-wide
+    # height-order bookkeeping entirely (the same class of gap already
+    # fixed for time_accepted), so A sailed through even though the
+    # complete sounding it came from has a genuine inversion.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., height=1500., temperature=27.0, level_index=0),
+        level(1, pressure=830., height=1000., temperature=26.0, level_index=1),
+    ])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    # A (850 hPa) is the only level ever assimilated (B fails the 'exact'
+    # tolerance) -- its whole station must still be rejected.
     assert not data['mask_t'][0].any()
 
 

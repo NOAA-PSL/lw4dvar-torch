@@ -125,7 +125,11 @@ class _FakeRaobsGridInterp:
 
 
 def _raobs_traj_case(observation, error, tuv_bg_check):
-    # one obs slot, one level, two stations -- (n_obs, n_levels, capacity)
+    # one obs slot, one level, two stations -- (n_obs, n_levels, capacity).
+    # `tuv_bg_check` sets 't's resolved threshold directly (as get_raobs
+    # itself would, from RAOBS_BG_CHECK/observations.raobs.bg_check) --
+    # no absolute limit, matching the old tuv_bg_check scalar's own
+    # behavior this helper is named after.
     background = torch.zeros(1, 2)
     return {
         'variables': ['t'],
@@ -133,7 +137,7 @@ def _raobs_traj_case(observation, error, tuv_bg_check):
         'values_t': torch.as_tensor([[observation]], dtype=torch.float32),
         'mask_t': torch.as_tensor([[[True, True]]]),
         'error_t': error,
-        'tuv_bg_check': tuv_bg_check,
+        'bg_check_threshold_t': tuv_bg_check,
     }, background
 
 
@@ -150,7 +154,7 @@ def test_raobs_term_cost_gradient_matches_finite_difference():
         'values_t': torch.tensor([[[279.0, 283.5, 290.0]]], dtype=torch.float64),
         'mask_t': torch.tensor([[[True, True, False]]]),  # third station masked out at read time
         'error_t': 1.5,
-        'tuv_bg_check': None,  # no background check: keep every masked-in ob
+        # no background check: keep every masked-in ob
     }
 
     def cost(b):
@@ -271,7 +275,6 @@ def test_raobs_log_linear_blends_adjacent_model_level():
         'values_t': torch.as_tensor([[[12.5, 10.0], [0., 0.]]], dtype=torch.float32),
         'mask_t': torch.as_tensor([[[True, True], [False, False]]]),
         'error_t': 1.0,
-        'tuv_bg_check': None,
         'vertical_interpolation': 'log-linear',
         'vert_neighbor_idx_t': torch.as_tensor([[[1, 1], [0, 0]]], dtype=torch.int64),
         'vert_alpha_t': torch.as_tensor([[[0.25, 0.0], [0.0, 0.0]]], dtype=torch.float32),
@@ -345,7 +348,6 @@ def test_raobs_log_linear_with_drift_position_uses_current_levels_horizontal_wei
         'values_t': torch.as_tensor([[[0.], [0.]]], dtype=torch.float32),
         'mask_t': torch.as_tensor([[[True], [True]]]),
         'error_t': 1.0,
-        'tuv_bg_check': None,
         'vertical_interpolation': 'log-linear',
         # level0's vertical neighbor is level1, level1's is level0; alpha=1
         # so the blend is fully the neighbor value, making a wrong
@@ -375,7 +377,6 @@ def test_raobs_use_drift_position_applies_per_level_horizontal_weights():
         'values_t': torch.as_tensor([[[1000.], [6000.]]], dtype=torch.float32),
         'mask_t': torch.as_tensor([[[True], [True]]]),
         'error_t': 1.0,
-        'tuv_bg_check': None,
     }
     results = utils._compute_raobs_observation_diagnostics_at_time(
         None, decoded, raobs_traj, _FakeRaobsGridInterp(None), 0)
@@ -409,7 +410,6 @@ def test_raobs_effective_error_nonfinite_rejected_even_with_bg_check_disabled():
         'values_q': torch.as_tensor([[[0.01, 0.01]]], dtype=torch.float32),
         'mask_q': torch.as_tensor([[[True, True]]]),
         'default_error_q': torch.as_tensor([[[float('nan'), 0.002]]]),
-        'q_bg_check': None,
     }
     results = utils._compute_raobs_observation_diagnostics_at_time(
         None, {'q': background}, raobs_traj, _FakeRaobsGridInterp(background), 0)
@@ -469,21 +469,22 @@ def test_raobs_error_std_table_tensor_used_per_level():
     assert used.tolist() == [[False, False]]  # bg_check=4*0.5=2.0 < |O-B|=3.0 -> rejected
 
 
-def test_raobs_gross_check_threshold_resolves_override_then_shared():
-    raobs_traj = {'tuv_bg_check': 8.0}
-    assert utils._raobs_gross_check_threshold(raobs_traj, 't', 'tuv_bg_check') == (8.0, None)
-    raobs_traj['bg_check_threshold_t'] = 7.0
-    raobs_traj['bg_check_absolute_t'] = 9.0
-    assert utils._raobs_gross_check_threshold(raobs_traj, 't', 'tuv_bg_check') == (7.0, 9.0)
-    # a variable with no override still falls back to the shared scalar
-    assert utils._raobs_gross_check_threshold(raobs_traj, 'u', 'tuv_bg_check') == (8.0, None)
+def test_raobs_gross_check_threshold_reads_resolved_fields():
+    # get_raobs resolves observations.raobs.bg_check (merged with
+    # RAOBS_BG_CHECK's defaults) into bg_check_threshold_<base>/
+    # bg_check_absolute_<base> before this ever runs -- bg_check is the
+    # only mechanism, so this just reads those fields back, with no
+    # scalar fallback of its own.
+    raobs_traj = {'bg_check_threshold_t': 7.0, 'bg_check_absolute_t': 9.0}
+    assert utils._raobs_gross_check_threshold(raobs_traj, 't') == (7.0, 9.0)
+    # a variable with neither field configured has no gross check at all
+    assert utils._raobs_gross_check_threshold(raobs_traj, 'u') == (None, None)
 
 
 def test_raobs_tuv_bg_check_per_variable_override_and_absolute_limit():
-    # UFO/GSI's per-variable gross check (PR #29's review comment):
-    # bg_check_threshold_t/bg_check_absolute_t override the shared
-    # tuv_bg_check (deliberately set loose, 100.0, so it would pass
-    # everything below if it were used instead of the override).
+    # UFO's per-variable gross check (PR #29's review comment):
+    # bg_check_threshold_t/bg_check_absolute_t -- get_raobs's resolution
+    # of observations.raobs.bg_check (or RAOBS_BG_CHECK's default).
     background = torch.zeros(1, 3)
     raobs_traj = {
         'variables': ['t'],
@@ -491,7 +492,6 @@ def test_raobs_tuv_bg_check_per_variable_override_and_absolute_limit():
         'values_t': torch.as_tensor([[[3.0, 1.0, 3.0]]], dtype=torch.float32),
         'mask_t': torch.as_tensor([[[True, True, True]]]),
         'error_t': torch.as_tensor([[[1.0, 1.0, 10.0]]]),
-        'tuv_bg_check': 100.0,
         'bg_check_threshold_t': 2.0,
         'bg_check_absolute_t': 1.5,
     }
@@ -514,7 +514,6 @@ def test_raobs_q_bg_check_per_variable_override_and_absolute_limit():
         'values_q': torch.as_tensor([[[0.01, 0.01]]], dtype=torch.float32),
         'mask_q': torch.as_tensor([[[True, True]]]),
         'default_error_q': torch.as_tensor([[[0.01, 0.01]]]),  # effective_error == observation here
-        'q_bg_check': 100.0,                  # deliberately loose shared default
         'bg_check_threshold_q': 2.0,
         'bg_check_absolute_q': 0.005,
     }
@@ -523,6 +522,6 @@ def test_raobs_q_bg_check_per_variable_override_and_absolute_limit():
     _, _, _, used = results['q']
     # Both stations: effective_error = 1.0 * 0.01 = 0.01, |O-B| = 0.01.
     # Ratio: 0.01 <= 2.0*0.01=0.02 -> passes. Absolute: 0.01 > 0.005 ->
-    # rejected -- the absolute limit firing even though the ratio (and
-    # the loose shared q_bg_check, were it used) would both pass.
+    # rejected -- the absolute limit firing even though the ratio alone
+    # would pass.
     assert used.tolist() == [[False, False]]

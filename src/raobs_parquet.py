@@ -73,7 +73,7 @@ _HEIGHT_COLUMNS = ('height_m', 'height_quality')
 
 # `use_drift_time` can shift a level's EFFECTIVE time away from its
 # report's own (un-drifted) observation_time by up to this much (a real
-# deep sounding: +1.62h by 5 hPa, PR #29's drift-time discussion) --
+# deep sounding: +1.62h by 5 hPa, confirmed against real data) --
 # `_profile_records` widens which cycle PARTITIONS it opens by this
 # margin so a level whose drift-corrected time falls inside the
 # verification window, but whose report's own un-corrected time doesn't
@@ -143,6 +143,7 @@ def _profile_records(
     q_error_rh_percent=None,
     humidity_min_pressure_hpa=None,
     physical_bounds=None,
+    logger=None,
 ):
     """Return {(slot_index, station_key): record} before fixed-shape padding.
 
@@ -187,9 +188,9 @@ def _profile_records(
 
     `use_drift_time`: assign EACH LEVEL to its own nearest slot using that
     level's own balloon-drift-corrected time (`drift_time_hours`, an
-    archive column -- confirmed against real data, PR #29's drift-time
-    discussion: near 0 at the surface, growing smoothly to +1.6h by 5 hPa
-    for a real deep sounding) instead of the report's single launch time
+    archive column -- confirmed against real data: near 0 at the
+    surface, growing smoothly to +1.6h by 5 hPa for a real deep sounding)
+    instead of the report's single launch time
     for every level. Falls back to the report's own time wherever
     `drift_time_hours` is missing/non-finite for a given level. This can
     split one profile's levels across multiple slots -- no special
@@ -199,7 +200,7 @@ def _profile_records(
     `_RAOBS_MAX_DRIFT_HOURS` to cover this -- otherwise a report sitting
     right at (or just outside) the un-drifted tolerance window's edge
     could have its home cycle directory never opened at all, even though
-    its drift-corrected time belongs inside the window (PR #29's review).
+    its drift-corrected time belongs inside the window.
 
     `humidity_min_pressure_hpa`: if set, a 'q' candidate row is dropped
     entirely -- not even a duplicate-selection candidate -- whenever its
@@ -211,7 +212,7 @@ def _profile_records(
     290 hPa snapped to a 300 hPa model level), so checking the model level
     would let a floor-violating candidate win a duplicate slot over a
     candidate that would have passed, permanently losing the usable
-    observation (PR #29's review).
+    observation.
 
     `levels_hpa`: {model_base_name: 1D array of exact pressures (hPa) to
     match} -- a level row is kept only when its `pressure_mb` is within
@@ -230,7 +231,7 @@ def _profile_records(
     (the only criterion previously used) could retain a row with a
     garbage height or an impossible value over an available row that
     would have passed every check, which then wrongly fails QC downstream
-    with the usable duplicate already discarded (PR #29's review). Within
+    with the usable duplicate already discarded. Within
     the same pass/fail bucket, lower (better) quality mark still wins, so
     an all-bad set of duplicates still keeps its best candidate
     (`load_raobs_parquet` still flags it bad via its own QC pass over the
@@ -243,16 +244,22 @@ def _profile_records(
     prepbufr_classes = tuple(str(c).upper() for c in prepbufr_classes)
     physical_bounds = _RAOBS_PHYSICAL_BOUNDS if physical_bounds is None else physical_bounds
 
+    skipped_padding_cycles = []
     cycles = common.cycle_directories(directory, verification_times, time_tolerance_hours)
     if use_drift_time:
         # See the docstring above: widen which partitions get opened by
         # the maximum supported drift, tolerating missing directories in
         # just that extra margin (e.g. at the archive's own date-range
         # boundary) -- the original, unwidened `cycles` above still raise
-        # as before if genuinely missing.
+        # as before if genuinely missing. `skipped_padding_cycles`
+        # collects every directory this widening tolerated missing, so
+        # `load_raobs_parquet` can surface it in its own return value --
+        # programmatically detectable, not just a log line (PR #29's
+        # review, follow-up: a WARNING alone is still only as loud as
+        # whoever is watching logs).
         padded_cycles = common.cycle_directories(
             directory, verification_times, time_tolerance_hours + _RAOBS_MAX_DRIFT_HOURS,
-            allow_missing=True,
+            allow_missing=True, logger=logger, skipped=skipped_padding_cycles,
         )
         cycles = sorted(set(cycles) | set(padded_cycles))
     verification = np.asarray([
@@ -280,8 +287,7 @@ def _profile_records(
     # reported pressure), not the matched model level, so two genuinely
     # different real levels that happen to snap to the same model-level
     # bucket (vertical_interpolation != 'exact') both stay visible to the
-    # monotonicity check below instead of one hiding the other's height
-    # (PR #29's review).
+    # monotonicity check below instead of one hiding the other's height.
     profile_source_priority = {}
     profile_source_heights = {}
     for cycle in cycles:
@@ -296,7 +302,7 @@ def _profile_records(
             # e.g. tests/data/mini_ace2/raobs) without them falls back to
             # the documented launch-time/launch-position behavior instead
             # of read_partition raising on the WHOLE read over one
-            # missing optional column (PR #29's review).
+            # missing optional column.
             partition_columns = common.available_columns(level_path)
             this_use_drift_time = use_drift_time and 'drift_time_hours' in partition_columns
             this_use_drift_position = (
@@ -320,7 +326,7 @@ def _profile_records(
             # read_prepbufr.F90 and the RDASApp bufr2ioda_adpupa_prepbufr.py
             # converter both anchor it to cycle_time directly). Anchoring
             # to report_time (== cycle_time + DHR) instead would double-
-            # count DHR (PR #29's review). `cycle` is the archive's own
+            # count DHR. `cycle` is the archive's own
             # <root>/<YYYY-MM-DD>/<HH> partition directory for this cycle
             # -- parsed back into the same cycle datetime
             # cycle_directories (common.py) computed before discarding it
@@ -389,7 +395,7 @@ def _profile_records(
                     # Same range check the launch latitude gets above --
                     # a finite-but-out-of-range drift latitude (garbage
                     # data) would otherwise reach horizontal
-                    # interpolation directly (PR #29's review).
+                    # interpolation directly.
                     if np.isfinite(drift_lat) and np.isfinite(drift_lon) and -90. <= drift_lat <= 90.:
                         level_lat, level_lon = drift_lat, drift_lon
                 level_time = report_time
@@ -409,11 +415,10 @@ def _profile_records(
                 # still sees this level's height regardless, so a level
                 # that drifts just outside the window can't hide an
                 # inversion that would otherwise reject an IN-WINDOW
-                # sibling level of the same sounding (PR #29's review,
-                # third round on this mechanism -- this gap can only
+                # sibling level of the same sounding. This gap can only
                 # actually occur with use_drift_time: without it every
                 # level of one report shares the same report_time, and so
-                # the same accept/reject verdict, making the gap moot).
+                # the same accept/reject verdict, making the gap moot.
                 time_accepted = delta_seconds[slot_index] <= tolerance_seconds
 
                 station_key = common.station_key(
@@ -426,7 +431,7 @@ def _profile_records(
                 # special/extra sounding near a regular one) into one
                 # profile, letting their levels silently replace each other
                 # by quality and corrupting the height-order QC below with
-                # levels from different soundings (PR #29's review).
+                # levels from different soundings.
                 # Genuinely repeated rows of the SAME launch still share one
                 # report_time, so they keep merging as before.
                 profile_key = (station_key, report_time)
@@ -447,14 +452,42 @@ def _profile_records(
                     ):
                         continue  # not an obs at all here, not even QC-flagged -- see docstring above
                     variable_levels = levels_hpa[variable]
+                    # Nearest by raw hPa distance, not ln(p) -- confirmed
+                    # consistent with JEDI's own nearest-neighbor method,
+                    # not a deviation from it (an earlier version of this
+                    # comment claimed otherwise). Read directly from the
+                    # real ufo source (src/ufo/operators/vertinterp/
+                    # ufo_vertinterp_mod.F90): `log()` is applied to the
+                    # model profile and the observation's own coordinate
+                    # ONLY on the log-linear branch (`tmp`/`tmp2 =
+                    # log(...)`); the nearest-neighbor branch feeds the
+                    # same `nearestneighbor_interp_index`
+                    # (src/ufo/utils/vert_interp.F90) raw, un-logged
+                    # values (`tmp2 = obsvcoord(iobs)`). ln(p) is a
+                    # log-linear-specific step in JEDI, not a general
+                    # "JEDI always works in ln(p) vertically" rule --
+                    # there is no JEDI nearest-neighbor convention this
+                    # mode falls short of.
                     differences = np.abs(variable_levels - pressure_value)
                     level_index = int(np.argmin(differences))
-                    if vertical_interpolation == 'exact':
-                        if differences[level_index] > pressure_match_tolerance_hpa:
-                            continue
-                    # 'nearest'/'log-linear': no distance cutoff -- always
-                    # keep the nearest level, so a coarse model's levels
+                    # 'exact': only a level within pressure_match_tolerance_hpa
+                    # of a model level is eligible for ASSIMILATION (gates the
+                    # time_accepted block below) -- but, like time_accepted
+                    # itself, must NOT also gate the profile-wide height
+                    # tracking further down: a level discarded here for being
+                    # too far from any model level still has a real reported
+                    # height at its own real pressure, and must still be able
+                    # to reject an in-tolerance sibling for a height
+                    # inversion, even though it's never itself assimilated
+                    # (PR #29's review -- the same class of gap already fixed
+                    # for time_accepted, found again for this gate).
+                    # 'nearest'/'log-linear' have no distance cutoff at all --
+                    # every level is exact_ok, so a coarse model's levels
                     # still get an observation instead of possibly none.
+                    exact_ok = (
+                        vertical_interpolation != 'exact'
+                        or differences[level_index] <= pressure_match_tolerance_hpa
+                    )
                     value = level_values[variable][level_row]
                     if not np.isfinite(value):
                         continue
@@ -496,7 +529,7 @@ def _profile_records(
                     # quality-2 row with a finite error, only to be
                     # rejected later by the forward operator's own
                     # isfinite(effective_error) guard, losing the level
-                    # entirely (PR #29's review).
+                    # entirely.
                     error_bad = False
                     if variable in level_default_error:
                         default_error_value = level_default_error[variable][level_row]
@@ -516,7 +549,7 @@ def _profile_records(
                         differences[level_index] if vertical_interpolation != 'exact' else 0.,
                     )
 
-                    if time_accepted:
+                    if time_accepted and exact_ok:
                         existing_priority = record['priority'].get((variable, level_index))
                         if existing_priority is None or priority < existing_priority:
                             record['values'][(variable, level_index)] = value
@@ -545,18 +578,19 @@ def _profile_records(
                                 record['default_error'].pop((variable, level_index), None)
 
                     # Mirrors the per-slot winner selection just above, but
-                    # runs UNCONDITIONALLY (not gated on time_accepted)
-                    # and is keyed by the whole PROFILE (profile_key, not
-                    # (slot_index, profile_key)) AND the row's own REAL
-                    # reported pressure (not the matched model
-                    # level_index) -- feeds the height-order QC below,
+                    # runs UNCONDITIONALLY (not gated on time_accepted OR
+                    # exact_ok) and is keyed by the whole PROFILE
+                    # (profile_key, not (slot_index, profile_key)) AND the
+                    # row's own REAL reported pressure (not the matched
+                    # model level_index) -- feeds the height-order QC below,
                     # computed once on the COMPLETE sounding rather than
                     # per-slot or per-window, so an inversion spanning two
                     # use_drift_time slots -- or involving a level that
-                    # drifted outside every slot's tolerance and so is
-                    # never itself assimilated -- is still caught
-                    # (PR #29's review, now three rounds on this
-                    # mechanism). Keying by real pressure instead of the
+                    # drifted outside every slot's tolerance, or (in
+                    # 'exact' mode) outside pressure_match_tolerance_hpa of
+                    # any model level, and so is never itself assimilated --
+                    # is still caught.
+                    # Keying by real pressure instead of the
                     # matched bucket means two genuinely different real
                     # levels that snap to the SAME model level
                     # (vertical_interpolation != 'exact') both stay
@@ -565,8 +599,7 @@ def _profile_records(
                     # reporting the IDENTICAL real pressure -- a genuine
                     # duplicate (e.g. a retransmitted message), same
                     # convention this module's own duplicate-selection
-                    # tests use -- still collapse to one winner
-                    # (PR #29's review, second round).
+                    # tests use -- still collapse to one winner.
                     source_key = (variable, float(pressure_value))
                     profile_key_priority = profile_source_priority.setdefault(profile_key, {})
                     existing_profile_priority = profile_key_priority.get(source_key)
@@ -580,17 +613,18 @@ def _profile_records(
 
     # Non-monotonic height-with-pressure, computed ONCE per complete
     # profile (every RAW level the archive has for this report, whether
-    # or not it won its model-level bucket for assimilation, AND whether
-    # or not its own drift-corrected time fell inside any slot's
-    # tolerance window -- see the winner-selection and time_accepted
-    # comments above), not per-slot or per-matched-bucket or per-window
-    # -- an inversion straddling two use_drift_time slots, hidden behind
-    # a bucket-mate that won the assimilation slot, or involving a level
-    # that drifted outside every slot's tolerance and so is never itself
-    # assimilated, must still reject the whole variable's profile,
+    # or not it won its model-level bucket for assimilation, whether or
+    # not its own drift-corrected time fell inside any slot's tolerance
+    # window, AND whether or not it's within pressure_match_tolerance_hpa
+    # of a model level in 'exact' mode -- see the winner-selection,
+    # time_accepted, and exact_ok comments above), not per-slot or
+    # per-matched-bucket or per-window -- an inversion straddling two
+    # use_drift_time slots, hidden behind a bucket-mate that won the
+    # assimilation slot, or involving a level that drifted outside every
+    # slot's tolerance or sits too far from any model level to be
+    # assimilated itself, must still reject the whole variable's profile,
     # matching the no-drift-time behavior where it's always checked on
-    # the complete sounding (PR #29's review, now three rounds on this
-    # mechanism). Ordered by each level's own REAL reported pressure
+    # the complete sounding. Ordered by each level's own REAL reported pressure
     # (not the matched model level) so two raw levels sharing one bucket
     # still sort correctly relative to each other. Consumed by
     # load_raobs_parquet instead of that function recomputing it from
@@ -617,13 +651,13 @@ def _profile_records(
     # a q-only sounding with every level below humidity_min_pressure_hpa)
     # -- otherwise they still consume a station slot downstream, wasting
     # raobs_station_capacity and potentially displacing a station that
-    # would have had usable observations (PR #29's review).
+    # would have had usable observations.
     records = {
         key: record for key, record in records.items() if record['values']
     }
     for (slot_index, profile_key), record in records.items():
         record['height_order_bad'] = profile_height_order_bad.get(profile_key, set())
-    return records
+    return records, skipped_padding_cycles
 
 
 def load_raobs_parquet(
@@ -699,14 +733,14 @@ def load_raobs_parquet(
     variables = tuple(variables)
     levels_hpa = {v: np.asarray(levels_hpa[v], dtype=np.float64) for v in variables}
     physical_bounds = _RAOBS_PHYSICAL_BOUNDS if physical_bounds is None else physical_bounds
-    records = _profile_records(
+    records, skipped_padding_cycles = _profile_records(
         directory, verification_times, levels_hpa, variables, time_tolerance_hours,
         prepbufr_classes, quality_mark_max, pressure_match_tolerance_hpa,
         geopotential_height_min_m, geopotential_height_max_m, below_station_tolerance_m,
         use_drift_time=use_drift_time,
         vertical_interpolation=vertical_interpolation, use_drift_position=use_drift_position,
         q_error_rh_percent=q_error_rh_percent, humidity_min_pressure_hpa=humidity_min_pressure_hpa,
-        physical_bounds=physical_bounds,
+        physical_bounds=physical_bounds, logger=logger,
     )
     # The q error (RH_fraction * qsat) -- see q_error_rh_percent above.
     default_error_bases = ('q',) if q_error_rh_percent and 'q' in variables else ()
@@ -811,8 +845,7 @@ def load_raobs_parquet(
             # _profile_records across the COMPLETE source profile (every
             # level, before use_drift_time splits it across slots), not
             # just this slot's own subset -- an inversion straddling two
-            # slots must reject both, matching the no-drift-time behavior
-            # (PR #29's review).
+            # slots must reject both, matching the no-drift-time behavior.
             for v in record.get('height_order_bad', ()):
                 mask[v][:, station_index] = False
 
@@ -837,6 +870,20 @@ def load_raobs_parquet(
             'raobs parquet: '+str(len(records))+' (slot, station) profile reports; '
             'accepted obs by variable '+str(counts)
         )
+        if skipped_padding_cycles:
+            # One aggregate summary in addition to cycle_directories' own
+            # per-cycle WARNING -- easy to miss a single line among many
+            # when several cycles are skipped at once (PR #29's review,
+            # follow-up).
+            logger.warning(
+                'raobs parquet: '+str(len(skipped_padding_cycles))+' use_drift_time padding '
+                'cycle(s) missing from the archive, skipped: '+str(sorted(skipped_padding_cycles))
+            )
     result['levels_hpa'] = levels_hpa
     result['counts'] = counts
+    # Programmatically detectable, not just a log line (PR #29's review,
+    # follow-up): empty unless use_drift_time actually needed to widen
+    # partition discovery AND at least one of those extra cycles was
+    # missing from the archive.
+    result['skipped_padding_cycles'] = skipped_padding_cycles
     return result

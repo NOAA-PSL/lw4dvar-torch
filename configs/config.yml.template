@@ -46,21 +46,35 @@ exp:
       # psobs/read_ps_prepbufr1.py: psqm<=4) -- not independently derived
       # for this archive, just carried over from the ported reference
       # repo's own (unrelated) default until checked against it.
-      # time_tolerance_hours defaults to dt_obs/2 (same formula raobs uses
-      # below), NOT the legacy generator's own fixed 0.5h (halfwindow=1800s)
-      # -- dt_obs/2 exactly tiles the window edge to edge with no gaps for
-      # any dt_obs, so it captures every archived report, just distributed
-      # across however many slots dt_obs creates (verified mathematically
-      # and by simulation; docs/integrate_multiple_parquetobs.md). At the
-      # mainline dt_obs: 6 this is 3.0h, not 0.5h -- set this explicitly to
-      # 0.5 to reproduce the legacy reader's narrower, dt_obs-independent
-      # window instead.
-      #time_tolerance_hours: 3.0 # default dt_obs/2; max |report time - slot time| accepted
+      # time_tolerance_hours defaults to 0.5h, matching the legacy
+      # psobs1_*.txt archive's own generator (/scratch3/NCEPDEV/da/
+      # Jeffrey.Whitaker/psobs/read_ps_prepbufr1.py: halfwindow = 1800s)
+      # -- dt_obs-independent, so every mainline config's behavior is
+      # unchanged by the parquet reader unless this is set explicitly. A
+      # dt_obs/2 tolerance (same formula raobs uses below -- tiles the
+      # window edge to edge with no gaps for any dt_obs, capturing every
+      # archived report, just distributed across however many slots
+      # dt_obs creates; verified mathematically and by simulation,
+      # docs/integrate_multiple_parquetobs.md) is also available by
+      # setting this explicitly -- e.g. 3.0 at the mainline dt_obs: 6 --
+      # but was reviewed (PR #29) as an unvalidated ~6x change in
+      # assimilated-ob count for every ps-only run if made the default
+      # (jc_ps_weight/weight_decay were tuned at the old, narrower count).
+      #time_tolerance_hours: 0.5 # default 0.5h; max |report time - slot time| accepted
       #prepbufr_classes: ['ADPSFC', 'SFCSHP']
       #report_types: [180, 181, 187] # PREPBUFR report_type codes kept (null = no filter)
       #quality_mark_max: 4 # max accepted PREPBUFR pressure quality mark
       #error_std_hpa: 1.0 # flat ob error (hPa) unless use_source_error
       #use_source_error: False # True: use each report's own pressure_error_mb instead of the flat value above
+      # frozen_qc (default False, i.e. LIVE QC): if True, the background
+      # gross check is evaluated ONCE against the uncorrected background
+      # before optimization and held fixed for the whole minimization,
+      # instead of being recomputed from the live, still-optimizing state
+      # every epoch -- see observations.raobs.frozen_qc below for what
+      # frozen QC fixes (an adversarial gaming example) and why both
+      # default to False anyway (PR #29's review;
+      # docs/integrate_multiple_parquetobs.md).
+      #frozen_qc: False
 
     # raobs (radiosonde profile) settings -- omit this whole block (the
     # default) or leave `enabled: False` to assimilate surface pressure
@@ -134,7 +148,11 @@ exp:
       #   regardless of distance (no discard) -- so a model with few/
       #   coarse levels still gets an observation at each one. Still no
       #   vertical correction: the comparison still pretends the ob sits
-      #   exactly on that level.
+      #   exactly on that level. "Nearest" is by raw hPa distance, not
+      #   ln(p) -- confirmed consistent with JEDI's own nearest-neighbor
+      #   method (read directly from its real source): JEDI only applies
+      #   ln(p) on the log-linear branch, not nearest-neighbor, so this
+      #   isn't a deviation from JEDI's own convention.
       # 'log-linear' -- same relaxed matching as 'nearest', PLUS a vertical
       #   correction: the model is log-linearly interpolated between the
       #   assigned level and its adjacent neighbor to the observation's
@@ -188,24 +206,25 @@ exp:
       #      200: 3.2, 150: 2.8, 100: 2.5, 70: 2.2, 50: 2.0, 30: 2.1,
       #      20: 2.2, 10: 2.5, 5: 3.0}
       #  v: *raob_wind_err
-      # Background check shared by t/u/v (like error_std above): reject
-      # |O-B| > tuv_bg_check * qc_error, at the current state (default
-      # 8.0, GSI's own 'gross' convinfo value for kx 120/220/221; null
-      # turns it off). Mirrors GSI's conventional-data gross check
-      # (errormod in read_prepbufr.F90) -- without this, a bad ob that
-      # still passes its PREPBUFR quality mark has no check against the
-      # background at all.
-      #tuv_bg_check: 8.0
-      # Optional per-variable override of tuv_bg_check/q_bg_check, with an
-      # additional absolute limit -- UFO/GSI's actual form (PR #29's
-      # review comment: T 7.0x+9.0K, wind 6.0x+19m/s, q 8.0x). A variable
-      # not listed here keeps using the shared scalar above, no absolute
-      # limit. Rejects if EITHER the ratio or the absolute limit fires.
-      #bg_check:
+      # Background check, evaluated at the current state: reject
+      # |O-B| > threshold * qc_error, OR (if given) |O-B| > an absolute
+      # limit regardless of qc_error -- UFO's real sonde QC config form
+      # (sonde_gfs_qc.yaml, PR #29's review comment), the ONLY background-
+      # check mechanism (no separate flat-scalar knob -- mirrors GSI's own
+      # conventional-data gross check, errormod in read_prepbufr.F90, in
+      # effect but not in form: GSI's own equivalent is a flat 8.0
+      # multiplier with no absolute limit, dropped here in favor of UFO's
+      # richer form). Without this, a bad ob that still passes its
+      # PREPBUFR quality mark has no check against the background at all.
+      # A variable not listed here keeps using the DEFAULT dict below (not
+      # a per-field merge -- same convention as error_std above); a
+      # variable set to `null` disables the check entirely for it. Rejects
+      # if EITHER the ratio or the absolute limit fires.
+      #bg_check:  # the default, shown explicitly
       #  t: {threshold: 7.0, absolute: 9.0}
       #  u: {threshold: 6.0, absolute: 19.0}
       #  v: {threshold: 6.0, absolute: 19.0}
-      #  q: {threshold: 8.0}
+      #  q: {threshold: 8.0}  # no absolute limit in UFO's own config
       # Specific humidity error: GSI's real mechanism, confirmed directly
       # by a GSI-source maintainer (PR #29 review comment #6992427303):
       # "specific humidity error computed using rh error * qsat (where
@@ -223,15 +242,13 @@ exp:
       # simplification vs. GSI's live background, see
       # docs/integrate_multiple_parquetobs.md). Default is the same
       # prepobs_errtable.global posting's RH/10 column, x10 for percent.
-      #q_error_rh_percent:  # the default, shown explicitly
-      #  1000: 10, 950: 10, 900: 10, 850: 10, 800: 10, 750: 10, 700: 10,
-      #  650: 10, 600: 10, 550: 12, 500: 13, 450: 15, 400: 17, 350: 20,
-      #  300: 20, 250: 20, 200: 20, 150: 20, 100: 20, 70: 20, 50: 20,
-      #  30: 20, 20: 20, 10: 20, 5: 20
-      # Background check on q: reject |O-B| > q_bg_check * qc_error, at
-      # the current state (default 8.0, GSI's own 'gross' convinfo value;
-      # null turns it off).
-      #q_bg_check: 8.0
+      #q_error_rh_percent:  # the default, shown explicitly -- a flow
+      #  # mapping ({...}), like error_std/bg_check above: comma-separated
+      #  # entries need it, this is not valid YAML as a block mapping.
+      #  {1000: 10, 950: 10, 900: 10, 850: 10, 800: 10, 750: 10, 700: 10,
+      #   650: 10, 600: 10, 550: 12, 500: 13, 450: 15, 400: 17, 350: 20,
+      #   300: 20, 250: 20, 200: 20, 150: 20, 100: 20, 70: 20, 50: 20,
+      #   30: 20, 20: 20, 10: 20, 5: 20}
       # Radiosonde humidity sensors are unreliable above the lower/mid
       # troposphere -- mask 'q' at any matched level with pressure below
       # this (set null to disable the floor entirely).
@@ -241,6 +258,31 @@ exp:
       # explicit integer only if you need a stable shape across
       # configs/runs.
       #station_capacity: 1000
+      # frozen_qc (default False, same as observations.psobs.frozen_qc):
+      # if True, the background check above (bg_check) is evaluated ONCE
+      # against the uncorrected background before optimization and held
+      # fixed for the whole minimization, instead of being recomputed from
+      # the live, still-optimizing state every epoch. Without it, the
+      # optimizer can lower Jo by pushing an observation's live O-A far
+      # enough to fail the gross check (so it drops out of the loss)
+      # instead of actually fitting it (PR #29's review, Copilot's
+      # adversarial example -- tests/unit/test_solver_helpers.py's
+      # test_raobs_frozen_qc_prevents_gaming_the_gross_check -- live QC
+      # drops an observation entirely rather than fit it, cost 72 -> 0;
+      # frozen QC removes that incentive, cost 72 -> 144 instead). raobs
+      # defaults to False just like observations.psobs.frozen_qc -- not
+      # merely for consistency, but because GSI applies the SAME live,
+      # every-outer-loop gross check to raobs as to ps (errormod in
+      # read_prepbufr.F90, driven by a per-kx convinfo gross value -- this
+      # module's own bg_check default above uses UFO's richer numbers
+      # instead of GSI's flat one, but the underlying live-QC practice
+      # this defaults to is GSI's either way), so there is no more a GSI
+      # precedent for freezing raobs than for freezing ps. The adversarial
+      # example above is therefore live-by-default, accepted as a known
+      # tradeoff rather than the safer, directly-tested fix. Set True to
+      # close it off for a given run (independently of
+      # observations.psobs.frozen_qc).
+      #frozen_qc: False
   ic_suffix: '96h_100it' # pkl file info for restart
   sdate: '2015-01-01T00' # experiment start date; if restart, use date in pkl filename
   n_init: 24 # number of DA cycles
@@ -635,9 +677,13 @@ windows:
     # background each raob level is compared against to within dt_obs/2 of
     # that level's own report time, instead of up to dt_verif/2 away at the
     # dt_obs: 6 default -- e.g. dt_obs: 1 gets every raob within 30 min.
-    # observations.raobs.time_tolerance_hours (and psobs's) both default to
-    # dt_obs/2, which stays safe (no coverage loss, any dt_obs -- see that
-    # key's own comment) with no change needed here; optionally pair with
+    # observations.raobs.time_tolerance_hours defaults to dt_obs/2, which
+    # stays safe (no coverage loss, any dt_obs -- see that key's own
+    # comment) with no change needed here; psobs's own time_tolerance_hours
+    # instead defaults to a flat 0.5h, independent of dt_obs (see that
+    # key's own comment for why) -- pair psobs.time_tolerance_hours:
+    # <dt_obs/2 value> explicitly if ps obs should get the same no-
+    # coverage-loss treatment at a lowered dt_obs. Optionally pair with
     # raobs.use_drift_time: True to also correct each level's own
     # comparison time for balloon drift, closing the remaining gap this
     # doesn't. Try this before any per-observation (rather than

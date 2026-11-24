@@ -27,17 +27,26 @@ VARIANTS = {
     # A toy t/q radiosonde trajectory (Problem._build_raobs_traj), sharing
     # psobs's own obs-slot grid so it includes a between-step slot for
     # free -- independent finite-difference coverage of the raobs cost
-    # term through the real compute_loss_4dvar path (PR #29's review),
-    # not just the isolated unit tests of _compute_raobs_observation_
-    # diagnostics_at_time in tests/unit/test_solver_helpers.py. Both the
-    # background-check-off and -on code paths get their own variant.
-    # Attaches 'bg_used' from the SAME compute_ps_observation_hx call
-    # compute_optimal itself makes, so compute_loss_4dvar's frozen_qc is
-    # True here too -- without it, these gates would only ever exercise
-    # the live-recompute QC branch, never the frozen one production
-    # actually runs (PR #29's review, follow-up).
+    # term through the real compute_loss_4dvar path, not just the
+    # isolated unit tests of _compute_raobs_observation_diagnostics_
+    # at_time in tests/unit/test_solver_helpers.py. 'raobs' has no
+    # background check at all (bg_check=None -- frozen vs. live QC is
+    # moot, there's no state-dependent threshold either way). The other
+    # two both DO have a real, state-dependent 3-sigma threshold, so
+    # frozen vs. live actually matters for them:
+    # 'raobs_bg_check' (frozen -- matches this module's own already-
+    # validated behavior, Problem's own default, NOT production's own
+    # default) attaches 'bg_used' from the SAME compute_ps_observation_hx
+    # call compute_optimal itself makes for observations.raobs.
+    # frozen_qc: True.
+    # 'raobs_bg_check_live' (install_raobs_bg_used=False) instead leaves
+    # 'bg_used' unset, exercising the LIVE-recompute QC branch --
+    # production's own default (observations.raobs.frozen_qc: False,
+    # PR #29's review) -- which nothing here covered before this
+    # variant existed.
     'raobs': {'raobs': True},
     'raobs_bg_check': {'raobs': True, 'raobs_bg_check': 3.0},
+    'raobs_bg_check_live': {'raobs': True, 'raobs_bg_check': 3.0, 'install_raobs_bg_used': False},
 }
 
 
@@ -88,15 +97,28 @@ def test_checkpointing_does_not_change_the_gradient(stride, x0):
     torch.testing.assert_close(g, g0, rtol=1e-12, atol=0)
 
 
-def test_raobs_taylor_remainder_is_second_order(x0):
-    p = Problem(raobs=True, raobs_bg_check=3.0, checkpoint_stride=2)
+@pytest.mark.parametrize('frozen_qc', [True, False])
+def test_raobs_taylor_remainder_is_second_order(frozen_qc, x0):
+    # Both the cached (production opt-in) and live-recompute (production
+    # default) background-check masks get their own Taylor check -- see
+    # VARIANTS['raobs_bg_check']/['raobs_bg_check_live']'s own comment for
+    # why this only matters with a real bg_check threshold (PR #29's
+    # review).
+    p = Problem(raobs=True, raobs_bg_check=3.0, install_raobs_bg_used=frozen_qc, checkpoint_stride=2)
     assert taylor_order(p.cost_and_grad, p.cost, x0) > 1.9
 
 
 @pytest.mark.parametrize('stride', [1, 2, 3])
-def test_raobs_checkpointing_does_not_change_the_gradient(stride, x0):
-    J0, g0 = Problem(raobs=True, checkpoint_stride=0).cost_and_grad(x0)
-    J, g = Problem(raobs=True, checkpoint_stride=stride).cost_and_grad(x0)
+@pytest.mark.parametrize('frozen_qc', [True, False])
+def test_raobs_checkpointing_does_not_change_the_gradient(frozen_qc, stride, x0):
+    # A real bg_check threshold (3.0), unlike the plain 'raobs' VARIANTS
+    # entry -- otherwise this gate would never exercise any gross-check/
+    # checkpointing interaction at all, with either mask (PR #29's
+    # review).
+    J0, g0 = Problem(
+        raobs=True, raobs_bg_check=3.0, install_raobs_bg_used=frozen_qc, checkpoint_stride=0).cost_and_grad(x0)
+    J, g = Problem(
+        raobs=True, raobs_bg_check=3.0, install_raobs_bg_used=frozen_qc, checkpoint_stride=stride).cost_and_grad(x0)
     assert float(J) == float(J0)
     torch.testing.assert_close(g, g0, rtol=1e-12, atol=0)
 

@@ -29,7 +29,7 @@ BASE_EXP = {
 
 
 class Problem:
-    def __init__(self, model=None, seed=0, raobs=False, raobs_bg_check=None, **exp):
+    def __init__(self, model=None, seed=0, raobs=False, raobs_bg_check=None, install_raobs_bg_used=True, **exp):
         self.model = model if model is not None else ToyModel()
         # a None value drops the key, so the solver applies its own default
         self.exp = {k: v for k, v in {**BASE_EXP, **exp}.items() if v is not None}
@@ -126,9 +126,9 @@ class Problem:
             w = torch.as_tensor(m.area_weights)
             self.jcz_ref = (w / w.sum(), float(self.exp['jc_z_weight']) * int(traj['n_valid'].sum()))
 
-        self.raobs_traj = self._build_raobs_traj(rng, raobs_bg_check) if raobs else None
+        self.raobs_traj = self._build_raobs_traj(rng, raobs_bg_check, install_raobs_bg_used) if raobs else None
 
-    def _build_raobs_traj(self, rng, bg_check):
+    def _build_raobs_traj(self, rng, bg_check, frozen_qc):
         """A toy t/q radiosonde trajectory sharing psobs's own obs-slot
         grid (step_lo/alpha -- same convention get_raobs uses in
         production), so it automatically includes a between-step slot
@@ -142,7 +142,11 @@ class Problem:
         independent finite-difference/checkpointing coverage through the
         real compute_loss_4dvar, not just the isolated unit tests of
         _compute_raobs_observation_diagnostics_at_time in
-        tests/unit/test_solver_helpers.py (PR #29's review)."""
+        tests/unit/test_solver_helpers.py. `frozen_qc`: whether to install
+        the cached background mask (see below) -- production defaults to
+        live QC for raobs (observations.raobs.frozen_qc: False), so tests
+        need both paths covered, not just the frozen one (PR #29's
+        review)."""
         m = self.model
         bases = ('t', 'q')
         levels_hpa = {b: np.asarray(m.pressure_levels(b), dtype=np.float64) for b in bases}
@@ -161,8 +165,8 @@ class Problem:
             'step_lo': step_lo,
             'alpha': alpha,
             'vertical_interpolation': 'exact',
-            'tuv_bg_check': bg_check,
-            'q_bg_check': bg_check,
+            'bg_check_threshold_t': bg_check,
+            'bg_check_threshold_q': bg_check,
         }
         with torch.no_grad():
             states = [self.state]
@@ -189,20 +193,27 @@ class Problem:
                 else:
                     traj['error_t'] = 0.5
 
-        # Attach the frozen background mask the SAME way compute_optimal
-        # does in production (compute_ps_observation_hx, step_start=0, on
-        # the uncorrected background) -- otherwise compute_loss_4dvar's
-        # frozen_qc stays False for this trajectory (no 'bg_used' key)
-        # and every gate below only ever exercises the LIVE-recompute QC
-        # branch, never the frozen one compute_optimal actually uses
-        # (PR #29's review, follow-up on the previous round's gate
-        # coverage).
-        self.model._prime_noise()  # no-op for ToyModel; matches compute_optimal's own call
-        _, _, raobs_background_hx = utils.compute_ps_observation_hx(
-            self.model, self.state, self.verif_ic, self.psobs_traj, self.exp, self.grid_interp,
-            self.interp_specs, step_start=0, raobs_traj=traj,
-        )
-        traj['bg_used'] = {base: torch.as_tensor(raobs_background_hx[base]['used']) for base in bases}
+        if frozen_qc:
+            # Attach the cached background mask the SAME way compute_optimal
+            # does for observations.raobs.frozen_qc: True (compute_
+            # ps_observation_hx, step_start=0, on the uncorrected
+            # background). This Problem default (True) matches this
+            # module's own pre-existing 'raobs'/'raobs_bg_check' variants'
+            # already-validated behavior -- production itself defaults
+            # observations.raobs.frozen_qc to False (live QC) instead, see
+            # compute_optimal's own frozen_qc comment; pass
+            # install_raobs_bg_used=False explicitly for a variant that needs
+            # that path covered too (e.g. test_cost_gradient.py's
+            # 'raobs_bg_check_live'). frozen_qc=False here leaves
+            # 'bg_used' unset, so compute_loss_4dvar's frozen_qc
+            # derivation (psobs_traj.get('bg_used') is not None) naturally
+            # picks the live-recompute branch instead.
+            self.model._prime_noise()  # no-op for ToyModel; matches compute_optimal's own call
+            _, _, raobs_background_hx = utils.compute_ps_observation_hx(
+                self.model, self.state, self.verif_ic, self.psobs_traj, self.exp, self.grid_interp,
+                self.interp_specs, step_start=0, raobs_traj=traj,
+            )
+            traj['bg_used'] = {base: torch.as_tensor(raobs_background_hx[base]['used']) for base in bases}
         return traj
 
     def background_hx(self):

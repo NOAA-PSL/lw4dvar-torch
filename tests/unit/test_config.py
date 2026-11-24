@@ -72,10 +72,12 @@ def test_missing_file_returns_none(tmp_path):
      r"observations.raobs.variables entries must be a subset of .*got unsupported entries \['bogus'\]"),
     ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'variables': []}}},
      'observations.raobs.variables must be non-empty'),
-    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'tuv_bg_check': -1.0}}},
-     'observations.raobs.tuv_bg_check must be positive and finite'),
-    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'q_bg_check': 0.0}}},
-     'observations.raobs.q_bg_check must be positive and finite'),
+    # tuv_bg_check/q_bg_check (flat scalar fallbacks) were removed --
+    # bg_check (per-variable, see below) is the only mechanism now.
+    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'tuv_bg_check': 8.0}}},
+     'observations.raobs has unknown keys'),
+    ({'observations': {'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'q_bg_check': 8.0}}},
+     'observations.raobs has unknown keys'),
     ({'observations': {'psobs': {'path': './psobs'},
                        'raobs': {'enabled': True, 'error_std': {'t': {1000.: -1.0}}}}},
      r"observations.raobs.error_std\['t'\]\[1000.0\] must be positive and finite"),
@@ -90,7 +92,7 @@ def test_missing_file_returns_none(tmp_path):
      r"observations.raobs.bg_check keys must be a subset of .*got \['z'\]"),
     ({'observations': {'psobs': {'path': './psobs'},
                        'raobs': {'enabled': True, 'bg_check': {'t': {'absolute': 9.0}}}}},
-     r"observations.raobs.bg_check\['t'\] must be a dict with a 'threshold' key"),
+     r"observations.raobs.bg_check\['t'\] must be null or a dict with a 'threshold' key"),
     ({'observations': {'psobs': {'path': './psobs'},
                        'raobs': {'enabled': True, 'bg_check': {'t': {'threshold': 7.0, 'bogus': 1}}}}},
      r"observations.raobs.bg_check\['t'\] has unknown keys \['bogus'\]"),
@@ -138,7 +140,7 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
             'psobs': {'path': './psobs'},
             'raobs': {
                 'enabled': True, 'variables': ['temperature', 'u_component_of_wind'],
-                'quality_mark_max': 2, 'q_bg_check': None, 'tuv_bg_check': 3.5,
+                'quality_mark_max': 2, 'bg_check': {'q': None, 't': {'threshold': 3.5}},
                 'use_drift_time': True, 'use_drift_position': True,
                 'physical_bounds': {'t': [100., 400.]},
             },
@@ -147,8 +149,7 @@ def test_observations_raobs_resolved_to_flat_keys(tmp_path):
     assert exp['raobs_enabled'] is True
     assert exp['raobs_variables'] == ['temperature', 'u_component_of_wind']
     assert exp['raobs_quality_mark_max'] == 2
-    assert exp['raobs_q_bg_check'] is None
-    assert exp['raobs_tuv_bg_check'] == 3.5
+    assert exp['raobs_bg_check'] == {'q': None, 't': {'threshold': 3.5}}
     assert exp['raobs_physical_bounds'] == {'t': [100., 400.]}
     assert exp['raobs_use_drift_time'] is True
     assert exp['raobs_use_drift_position'] is True
@@ -206,9 +207,11 @@ def test_observations_raobs_q_error_rh_percent_table_accepted(tmp_path):
 
 
 def test_observations_raobs_bg_check_accepted(tmp_path):
-    # UFO/GSI's per-variable gross-check form (PR #29's review comment):
-    # threshold + an optional absolute limit, per variable.
-    cfg = {'t': {'threshold': 7.0, 'absolute': 9.0}, 'q': {'threshold': 8.0}}
+    # UFO's per-variable gross-check form (PR #29's review comment):
+    # threshold + an optional absolute limit, per variable -- the only
+    # background-check mechanism (no separate flat-scalar fallback).
+    # `null` for a listed variable disables the check entirely for it.
+    cfg = {'t': {'threshold': 7.0, 'absolute': 9.0}, 'q': {'threshold': 8.0}, 'u': None}
     exp, _ = utils.load_config(write_config(
         tmp_path, observations={'psobs': {'path': './psobs'}, 'raobs': {'enabled': True, 'bg_check': cfg}},
     ))
