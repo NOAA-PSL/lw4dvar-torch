@@ -299,6 +299,13 @@ exp:
   #   path_model: './backends/aifs/aifs-single-2.0/'
   #   model_name: 'aifs-single-mse-2.0.ckpt'
   #   aifs_config: 'backends/aifs/aifs_inference.yaml' # static anemoi-inference config (pre/post-processors, typed_variables)
+  #   aifs_ic_module: 'aifs_zarr_ic' # optional: override the default ic_module
+  #     (aifs_ic/aifs3_ic, ERA5 GRIB via CDS) with a different IC/verification
+  #     reader. 'aifs_zarr_ic' (backends/aifs/aifs_zarr_ic.py) reads straight
+  #     from a shared anemoi-datasets zarr training archive instead -- no
+  #     ic_cache/login-node prefetch needed -- for checkpoints trained
+  #     against it (aifs2-1.0deg-v1.0, aifs-r2-t1; see
+  #     docs/integrate_multiple_backends.md).
   # FCN3: path_model IS the vendored HF checkpoint clone directory itself
   # (config.json, checkpoint, orography.nc, land_mask.nc, ...) -- no
   # separate model_name key.

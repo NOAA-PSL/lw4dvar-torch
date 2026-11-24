@@ -2289,3 +2289,77 @@ observations" section for how raobs itself was added.
   "Latent-increment injection timing" section for the full writeup and
   `probe_t0_correction.py` for the measurement -- both backends here still
   use the `t+timestep` injection point, unchanged.
+
+## A third AIFS checkpoint, `aifs-r2-t1`: shared-env, shared-zarr ICs (2026-11-23)
+
+S. Frolov's `aifs-r2-t1` checkpoint (`.../EAGLE/run/aifs-r2-t1/training/
+outputs/checkpoint/fa3cac00bd764adf83ec79e518456601/inference-last.ckpt`):
+multi-dataset anemoi API, single dataset, O96 grid (40320 points), 2 input
+time levels, 207 variables (incl. `cvh`/`cvl`/`lai_hv`/`lai_lv`/`slt`/`fsr`,
+not used by any previously-integrated checkpoint), hidden mesh 10944 nodes
+x channels. Has its own built-in dry-air-mass fixer baked into the
+checkpoint's output bounding stack (`anemoi.models.layers.bounding.
+GlobalDryMassFixer` on `sp`, `water_var: tcw`) -- runs automatically through
+`AIFS3Model`'s unmodified forward pass, so `dry_mass_fixer` (the fixer added
+by hand for the earlier checkpoints) is left off for this one; not yet
+confirmed by a real cycled run whether that keeps `sp` as stable as the
+earlier checkpoints' fixer does.
+
+- **Needs AIFS3Model (`model_backend: aifs`, unchanged) but NOT the shared
+  `aifs3` env.** Confirmed directly (CPU, `create_runner`): `aifs3`'s
+  anemoi-models (0.19.0.post35) raises `AttributeError: Can't get attribute
+  'FlexAttentionWrapper' on anemoi.models.layers.attention` unpickling this
+  checkpoint -- a class added upstream after post35 (this checkpoint
+  recorded post36). `aifs3` isn't group-writable by this account to bump in
+  place (same gap pattern as `aifs2-1.0deg-v1.0`'s hydra-core/`lwaifs2`
+  case, below). Loads cleanly instead in S. Frolov's own `anemoi-dev` env
+  (`/scratch4/BMC/gsienkf/Sergey.Frolov/eagle/latent/EAGLE/conda/envs/
+  anemoi-dev`): CUDA torch 2.10/12.9 (not the ROCm build this checkpoint
+  was trained with on `anemoi-rocm`/MI300X -- checkpoints are
+  hardware-agnostic), anemoi-inference @2169c56 (the exact commit already
+  pinned in `aifs3`), anemoi-models 0.19.0.post38. `slurm/run_aifs-r2-t1.sh`
+  calls that env's python directly (ships its own CUDA runtime, same as
+  `run_aifs3.sh`); `aifs_inference_aifs-r2-t1.yaml` / `config_test_aifs-
+  r2-t1.yml` follow the `aifs2-1deg-ic1` pattern otherwise.
+- **ICs/verification come from a shared training-data zarr join, not ERA5
+  GRIB** -- a new `backends/aifs/aifs_zarr_ic.py`, selected via
+  `exp.aifs_ic_module: 'aifs_zarr_ic'` (a new, generic override on
+  `model.ic_module`, wired in `get_model()`; omitted, every other
+  checkpoint's `ic_module` default is unchanged). Reads
+  `anemoi.datasets.open_dataset(join=...)` directly off `/scratch4` --
+  confirmed to need no login-node prefetch and no `ic_cache` (a single-date
+  read completes in well under a second). The join is exactly
+  `aifs-r2-t1`'s own training join from its `.hydra/config.yaml`: Bo
+  Huang's own O96 surface zarr (`.../aifs-single-mse-2.0-1deg/data/
+  training/era5-o96-1979-2023-6h-v8.zarr`) + S. Frolov's 37-level pressure
+  zarr + his single-field soil-temperature zarr, 1979-01-01..2023-12-31,
+  6-hourly, grid point ordering confirmed bit-identical (max abs diff 0.0)
+  to the checkpoint's own `latitudes`/`longitudes` on every checkpoint
+  checked so far.
+- **The same shared join also covers `aifs2-1.0deg-v1.0`'s needs.**
+  Confirmed directly: every one of that checkpoint's 89 input variables is
+  present in the shared join (it's a strict superset -- that checkpoint's
+  own training join only needed 2 of the 3 zarrs, since it was trained at
+  fewer pressure levels and without the land-constant fields), on the same
+  bit-identical grid. `aifs_zarr_ic.py`'s functions are generic over the
+  model instance (`_metadata`/`_needed_variables` work for both `AIFSModel`
+  and `AIFS3Model`), so `aifs2-1.0deg-v1.0` could switch to
+  `aifs_ic_module: 'aifs_zarr_ic'` too and drop its GRIB/CDS dependency
+  entirely -- not done yet, since its existing cycled-run results
+  (dry-air-mass drift analysis, above) were produced against the GRIB path
+  and a switch is worth a side-by-side sanity check first, not assumed
+  identical.
+- **Verified end-to-end on CPU** (not yet on GPU): `aifs_zarr_ic.
+  build_input_state`/`read_single_date_fields` against the real checkpoint
+  produce 198 fields (207 minus the 9 analytically-computed ones) with
+  physically sane values (e.g. 2015-01-02: `sp` 985.5 hPa, `tcw` 24.6 mm);
+  `AIFS3Model.prepare_initial_state` packs them into a
+  `(1, 2, 40320, 207)` tensor with no NaNs; `decode_state` round-trips
+  sane `sp`/`z`/`tcw`.
+- **Not yet done**: any real GPU run (training-data zarr grid/precision
+  confirmed only up to `prepare_initial_state`, not a full differentiable
+  rollout); `learn_rate`/`latent_scale` are carried over untuned from
+  `aifs2-1deg-ic1` (same 10944-node hidden mesh size, otherwise unrelated);
+  whether the built-in `GlobalDryMassFixer` actually holds `sp` stable under
+  real cycling, the way the earlier checkpoints needed the hand-added fixer
+  for.

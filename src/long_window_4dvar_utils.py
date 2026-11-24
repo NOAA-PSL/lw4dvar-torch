@@ -871,6 +871,12 @@ def get_model(exp):
             compile_wrapper=exp.get('compile_wrapper', False),
             attention=exp.get('aifs_attention'),
         )
+        if exp.get('aifs_ic_module'):
+            # Override the IC/verification reader aifs_ic/aifs3_ic's
+            # ic_module default picks -- e.g. 'aifs_zarr_ic' for checkpoints
+            # whose ICs come from a shared training-data zarr join instead
+            # of ERA5 GRIB (see aifs_zarr_ic.py).
+            model.ic_module = exp['aifs_ic_module']
         model.set_dry_mass_fixer(_dry_mass_fixer_hpa(exp))
         return model
     elif backend == 'fcn3':

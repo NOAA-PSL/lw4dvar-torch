@@ -1,0 +1,29 @@
+description: |
+  Static anemoi-inference config for S. Frolov's AIFS-r2-t1 checkpoint (O96,
+  40320-point reduced-Gaussian grid; 2 input time levels; 207 variables;
+  single dataset) -- trained with the multi-dataset anemoi API (recorded
+  anemoi-models 0.19.0.post36, anemoi-inference @2169c56 -- the same commit
+  already pinned for aifs2-1deg-ic1) -- loaded by aifs3_model.AIFS3Model, run
+  in S. Frolov's own `anemoi-dev` conda env (run_aifs-r2-t1.sh) rather than
+  the repo's shared `aifs3` env: `aifs3`'s anemoi-models (0.19.0.post35)
+  can't unpickle this checkpoint (AttributeError on
+  anemoi.models.layers.attention.FlexAttentionWrapper, added upstream after
+  post35) and isn't group-writable by this account to bump in place -- see
+  docs/integrate_multiple_backends.md. The checkpoint path here is a
+  placeholder: config.yml's path_model/model_name override it.
+
+  Unlike aifs2-1deg-ic1, ICs/verification come from the shared training-data
+  zarr join (backends/aifs/aifs_zarr_ic.py, selected via
+  exp.aifs_ic_module: 'aifs_zarr_ic'), not GRIB -- so `input`/`output`/`date`/
+  `lead_time` below really are unused placeholders, more so than usual: the
+  runner never reads its own `input` for anything, and constant forcings
+  come straight from the zarr rather than from `runner.create_*_input()`.
+
+checkpoint: /scratch4/BMC/gsienkf/Sergey.Frolov/eagle/long-window/EAGLE/run/aifs-r2-t1/training/outputs/checkpoint/fa3cac00bd764adf83ec79e518456601/inference-last.ckpt
+
+date: 2015-01-01T00
+lead_time: 6
+input: empty
+output:
+  grib:
+    path: /dev/null
