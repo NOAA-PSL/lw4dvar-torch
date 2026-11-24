@@ -1899,3 +1899,362 @@ no per-variable merging -- that's `get_raobs`'s job), `tests/unit/
 test_config.py` (the per-variable merge, via a real `get_raobs` call; the
 three new validation-rejection cases). `make check` (292 passed) and
 `make check-ace2` both pass.
+
+## PR #29's third Copilot review: 15 of 16 findings fixed (2026-11-23)
+
+Diagnosed and fixed in order of severity (reasoning and exact code checked
+against upstream references before any fix -- see the PR discussion for
+the full diagnosis):
+
+- **Virtual-temperature-only levels assimilated as sensible** (High,
+  `common.sensible_temperature`): a level whose TOB event stack is 100%
+  VIRTMP (no plain non-VIRTMP event at all) silently kept the virtual
+  temperature as if it were sensible. Now returns NaN for that case
+  (excluded downstream like any other missing value); the input-value
+  fallback is kept only for a level with no TOB events in the archive at
+  all.
+- **Balloon drift time double-counted DHR** (High, `raobs_parquet.py`):
+  `drift_time_hours` (PREPBUFR's HRDR) is cycle-relative, the SAME
+  referent as the report's own DHR -- confirmed against both GSI's
+  `read_prepbufr.F90` (HRDR replaces, not adds to, the header time) and
+  the RDASApp `bufr2ioda_adpupa_prepbufr.py` converter (`hrdr*3600 +
+  cycleTimeSinceEpoch`). The code was anchoring to `report_time` (==
+  `cycle_time + DHR`) instead of `cycle_time`, double-counting DHR.
+  Fixed by parsing the cycle time back out of the archive's own
+  `<root>/<YYYY-MM-DD>/<HH>` partition directory (`common.
+  cycle_time_from_directory`, new) rather than adding an archive column.
+- **Gross-check mask recomputed against the live optimization state**
+  (High, deferred): matches an existing, pre-PR-29 pattern already in
+  the ps-obs path (`_compute_ps_observation_diagnostics_at_time`'s own
+  `gross_check_failed`) -- fixing it properly needs a reusable "decode
+  the background once" mechanism for both obs types, planned as its own
+  follow-up task rather than a narrow raobs-only patch that would
+  diverge from psobs's behavior.
+- **Both drift corrections now default to True in code** (`get_raobs`),
+  not just in the committed template, per explicit request -- matches
+  the PR description's own stated default.
+- **Empty `error_std`/`q_error_rh_percent` pressure tables rejected at
+  config-load time** instead of reaching `np.interp` with no sample
+  points.
+- **t/u/v error tables evaluated at each observation's own real reported
+  pressure in `nearest`/`log-linear` modes** (`get_raobs`), not the
+  nominal model-level pressure -- matches what `q`'s error already did.
+- **raobs cost now included in the per-slot loss output**
+  (`compute_loss_4dvar` returns a third value, `Jraobs_np`/
+  `all_loss_raobs`, kept separate from the existing `all_loss` so
+  psobs-only golden values are unaffected).
+- **Non-positive reported pressure rejected** before matching/
+  interpolation (was reaching `np.log` in `log-linear` mode).
+- **Profile identity now includes the report's own launch time**
+  (`raobs_parquet.py`'s `profile_key = (station_key, report_time)`), so
+  two different launches from the same physical station landing in the
+  same slot no longer merge into one profile.
+- **Duplicate humidity ranking now also requires a usable computed
+  error** (finite, positive `default_error_q`) before ranking by quality
+  mark, so an unusable-background duplicate can't win over a usable one.
+- **Station records with no retained observation at all are dropped**
+  (e.g. a q-only sounding with every level below
+  `humidity_min_pressure_hpa`) instead of consuming a station slot with
+  an all-False mask.
+- **Non-monotonic-height QC now checked once on the COMPLETE profile**
+  (across every `use_drift_time` slot it was split into), not per-slot
+  -- an inversion straddling two slots was previously invisible to
+  either slot's own check.
+- Added: a VIRTMP-only-stack test, a duplicate-q-by-usable-error test, a
+  two-launches-same-station test, a non-monotonic-height-across-slots
+  test, a non-positive-pressure test, a cycle-time-vs-report-time
+  anchoring regression test (`tests/unit/test_raobs_parquet.py`); a
+  multi-dimensional `_interp_level_table` test and an independent
+  finite-difference gradient check on the raobs cost term
+  (`tests/unit/test_solver_helpers.py`, since `tests/math/`'s toy-model
+  gates never pass `raobs_traj` at all); an assertion that the mini-ACE2
+  raobs diagnostics record nonzero `t_used`/`u_used`/`v_used`
+  (`tests/ace2/test_ace2_mini.py` -- not run in this session, no fme/
+  checkpoint/network available; syntax-checked only). `tests/ace2/
+  mini_ace2.py`'s raobs config now explicitly sets `use_drift_time:
+  False, use_drift_position: False`, since that fixture's reports have
+  no `drift_time_hours`/`drift_longitude`/`drift_latitude` columns at
+  all and would otherwise hit the new True-by-default (PR #29's review,
+  this round).
+- One existing test (`test_use_drift_time_widens_partition_discovery_
+  for_a_boundary_report`) was built around the OLD, double-counting
+  formula's arithmetic and needed its scenario reworked; one
+  (`test_humidity_pressure_floor_checked_against_real_pressure_not_
+  nominal_level`) now asserts zero stations landed instead of one
+  all-False station, per the dropped-empty-record fix above.
+- Not fixed (acceptable per Copilot's own stated alternative): the
+  `psobs.time_tolerance_hours` default change from the earlier
+  `dt_obs/2` entry above is already extensively documented, including
+  the exact override (`time_tolerance_hours: 0.5`) for anyone who needs
+  the old legacy-matching density -- no code change needed.
+- `make check`: 300 passed (up from 292), plus 12 **pre-existing,
+  unrelated** failures (`test_tracked_configs_load`) -- `_RAOBS_CONFIG_KEYS`
+  dropped `q_error_fraction`/`q_error_g_kg`/`q_error_floor_kg_kg` in the
+  JEDI-only-error/QC simplification above, but 12 tracked
+  `config_test_*.yml` files still set them; confirmed present before any
+  of this round's changes (`git stash` + rerun). Not fixed in this round
+  (out of scope for the Copilot review); flagged to the user instead.
+  `make check-ace2` not run (no fme/checkpoint/network in this session).
+
+## Finding #1, fixed: gross-check QC frozen at the background (2026-11-23)
+
+The one deferred finding from the round above: both `_compute_ps_
+observation_diagnostics_at_time` and `_compute_raobs_observation_
+diagnostics_at_time` recomputed their background/gross check from the
+LIVE, currently-optimizing state at every epoch, not the background --
+letting the optimizer lower Jo by pushing an observation out of QC
+instead of actually fitting it (Copilot's own worked example: two unit-
+error wind obs at 0 and 12, 8-sigma threshold -- state 6 costs 72 fitting
+both; state 12 drops the first observation and costs 0, a LOWER cost
+from a worse fit). Confirmed this is not raobs-specific: psobs's own
+`gross_check_failed` had the identical pattern already, pre-dating PR #29
+entirely. Fixed for both, unconditionally (no new config flag) -- this
+is a correctness fix matching traditional 4DVar/GSI/JEDI practice, and
+this module's own saved-diagnostics file already claimed
+`'quality_control_reference': 'background'`, previously true only of
+what got saved after the fact, not what the optimizer itself used.
+
+**Mechanism**: `compute_ps_observation_hx` (`@torch.no_grad()`) already
+existed for exactly this -- `save_trajectory_diagnostics` was already
+calling it with `step_start=0` on the uncorrected background, purely for
+post-hoc reporting. `compute_optimal` now makes that SAME call once,
+before the AdamW loop, and stores the result (`psobs_traj['background_hx']`/
+`raobs_traj['background_hx']`, plus the derived boolean `bg_used`:
+psobs's qc_flag bit 8 resolved once; raobs's full per-base `used`).
+Both diagnostics functions gained `frozen_qc=False`: when `True`, the
+background-check comparison is replaced by a lookup into `bg_used`
+instead of being recomputed from the live innovation -- availability/
+interpolation/orography (raobs: the archive mask/isfinite(error)) stay
+live either way, since orography is state-independent anyway and
+interpolation must keep catching a live state going non-finite.
+`compute_loss_4dvar`'s `_obs_term`/`_raobs_term` pass `frozen_qc=(psobs_
+traj.get('bg_used') is not None)` (automatically True via `compute_optimal`,
+automatically False -- today's behavior, unchanged -- for a caller like
+`tests/math/`'s toy-model gates that builds its own `psobs_traj` without
+that step). `compute_ps_observation_hx`'s own calls (used for BOTH the
+background bootstrap above and `save_trajectory_diagnostics`'s analysis-
+side snapshot) never set it -- both must always score fresh at whatever
+state they're handed, not reuse the frozen decision; freezing the
+analysis-side snapshot too would have defeated its entire point ("what
+does the final analysis score right now"). `save_trajectory_diagnostics`
+now reuses `psobs_traj['background_hx']`/`raobs_traj['background_hx']`
+instead of recomputing that same no-grad pass a second time (falls back
+to recomputing if called without `compute_optimal` having run first --
+not the production call pattern, but keeps the function usable
+standalone).
+
+**Golden values moved** (expected -- QC active in all 5 toy configs,
+with 4 planted gross-error obs specifically meant to exercise the
+background check): regenerated via `python tests/make_fixtures.py
+golden`. `tests/data/golden/mini_ace2.json` **was** also regenerated in
+this session, via `python tests/make_fixtures.py golden --ace2` run
+against this same, fully-fixed solver code, using the `ace2` conda env
+(`/scratch4/BMC/gsienkf/whitaker/conda/envs/ace2` -- has fme/pyarrow/
+pytest already; confirmed) and the mini-ACE2 test checkpoint already
+cached at `~/.cache/lw4dvar` (no network needed). Its loss trajectory
+moved as expected: last-epoch cost 2721 -> 1255 (was 1493 pre-fix,
+i.e. -54% now vs. -45% before) -- `make check-ace2` passed against it
+(1 passed, 1 unrelated jax skip). `tests/ace2/test_ace2_mini.py:35`'s
+comment is updated below to cite these new numbers instead of the
+pre-fix ones it was never updated to reflect.
+
+**Tests**: `tests/unit/test_solver_helpers.py` -- Copilot's own worked
+example reproduced directly (`frozen_qc=False` reproduces the pathology
+byte-for-byte: cost 72 at state 6, 0 at state 12, obs dropped;
+`frozen_qc=True` fixes it: cost 144 at state 12, obs kept).
+`tests/golden/test_golden_toy.py` -- a new test confirms
+`save_trajectory_diagnostics`'s saved `surface_pressure_used` matches
+`compute_optimal`'s own cached `background_hx['used']` exactly (not just
+"doesn't crash" -- genuinely the same values), with `save_xr_trajectory`
+stubbed out since `ToyModel` has no `_levels_by_base` (a real backend's
+attribute the toy model never needed before this test). `make check`:
+302 passed (up from 300), same 12 pre-existing unrelated failures.
+
+## PR #29's fourth Copilot review: 5 of 8 findings fixed (2026-11-23)
+
+Submitted right after the previous round's push; 13 of the previous
+round's 16 findings marked resolved. Diagnosed and fixed:
+
+- **Missing drift columns crashed the whole levels read** (High,
+  `raobs_parquet.py`): flipping `use_drift_time`/`use_drift_position` to
+  default True (previous round) meant any archive without
+  `drift_time_hours`/`drift_longitude`/`drift_latitude` -- not missing a
+  VALUE, missing the COLUMN entirely, e.g. `tests/data/mini_ace2/raobs`
+  -- failed to load outright, instead of falling back as documented.
+  Fixed by checking each partition's own schema (`common.
+  available_columns`, new) before requesting the optional drift columns,
+  independently per `(cycle, prepbufr_class)` -- a required column
+  missing still raises as before. Confirmed end to end: temporarily
+  removed `tests/ace2/mini_ace2.py`'s explicit `use_drift_time: False`/
+  `use_drift_position: False` (added last round specifically to dodge
+  this crash) and reran `make check-ace2` -- no crash, identical
+  computed values, the only diff was the now-absent config echo. Kept
+  the explicit config anyway (clearer documented intent for this
+  fixture), just softened its comment: no longer *required* to avoid a
+  crash, kept for clarity.
+- **Mini-ACE2 golden fixture "predates frozen-background QC"** (High):
+  the data was actually already correct -- verified the committed
+  `mini_ace2.json`'s loss trajectory had genuinely moved (1493 -> 1255
+  last-epoch cost) consistent with the frozen-QC fix actually running.
+  The bug was in the *documentation*: this doc's earlier revision left
+  the golden-regeneration status claim unresolved after the fact (see
+  git history for the exact wording at the time), and `tests/ace2/
+  test_ace2_mini.py:35`'s comment still cited the pre-fix observed
+  numbers (-46%, not the new -54%). Both corrected below/above -- this
+  doc now consistently states the fixture was regenerated with the
+  final solver, with no stale claim left anywhere in it.
+- **Drift latitude not range-checked before overwriting launch
+  coordinates** (Medium, `raobs_parquet.py`): the launch latitude gets
+  `-90 <= lat <= 90`; the drift-position override only checked
+  `isfinite`. A finite-but-garbage drift latitude would have reached
+  horizontal interpolation directly. Added the same range check.
+- **Non-monotonic-height QC still hid a losing bucket-mate's height**
+  (Medium, `raobs_parquet.py`, second round on the same mechanism): the
+  previous round's profile-wide height tracking still collapsed to one
+  winner per *(variable, matched-model-level)* bucket -- inherited from
+  the pre-existing per-slot duplicate-selection design, just applied
+  profile-wide. In `nearest`/`log-linear` modes, two genuinely different
+  real levels from different `use_drift_time` slots that happen to snap
+  to the same coarse model bucket could still hide an inversion: only
+  the bucket's assimilation WINNER's height ever reached the check.
+  Re-keyed the tracking by the row's own REAL reported pressure instead
+  (`profile_source_priority`/`profile_source_heights`, replacing
+  `profile_priority`/`profile_heights`) -- two rows at the SAME real
+  pressure are still one genuine duplicate (same convention this
+  module's own duplicate-selection tests already used); two different
+  real pressures now both stay visible regardless of which one wins its
+  model-level bucket for assimilation. The monotonicity check itself now
+  sorts by real pressure (descending) instead of by matched model level,
+  so it still orders correctly when two rows share one bucket. Hit the
+  exact class of test-construction bug the first round's own docstring
+  warned about: three existing duplicate-selection tests gave competing
+  rows the SAME default height, which used to be invisible (only one
+  winner's height ever reached the old bucket-keyed check) but is now
+  correctly visible and triggered false monotonicity failures -- fixed
+  by giving `test_relaxed_modes_distance_tiebreak_prefers_closer_
+  duplicate` physically distinct heights; the other two already had one
+  row's height excluded before reaching the check (ineligible/wrong
+  bucket) so needed no change once the real-pressure key stopped
+  conflating them. Still NOT a check of the literal complete archive
+  sounding -- a level whose drift-corrected time falls outside every
+  slot's tolerance window is never read into any record at all, same as
+  every other QC here; the fix's own comment says so now instead of
+  overclaiming completeness.
+- **VIRTMP event-selection test only had one candidate after filtering**
+  (Medium, test coverage, carried over from two rounds ago):
+  `test_sensible_temperature_used_instead_of_virtual` couldn't actually
+  tell "first non-VIRTMP event by stack order" apart from "the only one
+  left" -- strengthened with three non-VIRTMP candidates at distinct
+  `event_index` values, given in shuffled input-list order, confirming
+  the selection is by stack order and not list order or value magnitude.
+- **Independent radiosonde cost/gradient coverage, broadened** (Medium,
+  test coverage, carried over from two rounds ago): the previous round's
+  gradient check was an isolated unit test of the diagnostics function
+  alone. Added a toy t/q radiosonde trajectory to `tests/math/
+  problem.py`'s `Problem` (`raobs=True`, sharing psobs's own obs-slot
+  grid, so it gets a between-step slot for free; one masked-at-read-time
+  cell per slot; `q` uses a tensor `default_error_q`, `t` a flat scalar
+  error -- both real code paths), wired through the REAL
+  `compute_loss_4dvar`, with new `gradient_error`/`taylor_order`/
+  checkpointing-consistency gate tests (`tests/math/
+  test_cost_gradient.py`) for both the background-check-off and -on
+  paths, plus a sanity check that the added cost is actually nonzero.
+  Needed `_resolve_loss_interp_specs` to see `raobs_enabled`/
+  `raobs_variables` in `Problem.exp` before `interp_specs` is resolved --
+  already handled correctly in the real code (folds raobs's variables
+  into the sub-6h time-interpolation set), `Problem` just hadn't been
+  exercising that path before.
+- Not fixed (no code change needed): "document the widened psobs
+  tolerance" -- `configs/config.yml.template` and this doc already
+  explain the `dt_obs/2` default, why, and the `time_tolerance_hours:
+  0.5` override; the only thing not mentioning it is the PR's own
+  GitHub description text, which isn't a code change.
+- `make check`: 312 passed (up from 302), same 12 pre-existing unrelated
+  failures. `make check-ace2`: passed, confirmed on the `ace2` conda env
+  (has fme/pyarrow/pytest already) with the cached mini-ACE2 checkpoint.
+
+## PR #29's fifth Copilot review: the math gates' frozen-QC gap (2026-11-24)
+
+3 of the previous round's 6 open findings resolved; one genuinely new
+one -- the previous round's own toy-raobs gate coverage never actually
+exercised the production QC path it was meant to validate.
+
+**"Test gates with frozen background QC masks"** (Medium, `tests/math/
+problem.py`): `Problem._build_raobs_traj` set `tuv_bg_check`/
+`q_bg_check` (the LIVE-recompute QC branch) but never populated
+`raobs_traj['bg_used']` (the FROZEN-mask branch `compute_optimal` itself
+always uses in production, per two rounds ago's fix). Since
+`compute_loss_4dvar` only sets `frozen_qc=True` when `bg_used` is
+present, every gradient/Taylor/checkpointing gate added last round was
+silently running the live branch -- the one real runs never take.
+Fixed by calling the SAME `compute_ps_observation_hx(step_start=0)`
+`compute_optimal` calls, on the toy problem's own uncorrected background
+state, and attaching the resulting `used` mask as `bg_used` before
+returning the trajectory -- now `frozen_qc` resolves to `True`
+automatically for every `raobs=True` gate test, exactly matching
+production. Confirmed: `gradient_error`/`taylor_order` unchanged in
+magnitude (expected -- at a random `x0` close to the background, the
+frozen and live verdicts agree; the whole point is that they can
+diverge once the state actually moves, which these gates don't do).
+
+Carried over, assessed as already resolved or out of scope (no new
+information since the previous round):
+- "Regenerate the ACE2 golden fixture with the final solver" -- the
+  data and the live documentation were already correct; the flag looks
+  triggered by this doc's OWN historical narration quoting the old
+  stale phrasing verbatim for context. Reworded above to stop citing
+  that exact phrase, with no data or code change.
+- "Check complete source profiles before slot and bucket filtering" --
+  only the bucket-collapsing half was fixed two rounds ago; the time-
+  cutoff-excludes-out-of-window-levels half remains a deliberate,
+  documented, pre-existing architectural limitation (same before any of
+  this work), not reopened this round.
+- "Document the widened psobs tolerance" / "Preserve the psobs default
+  window" -- unchanged assessment: already documented in code, only the
+  PR's own description text doesn't mention it.
+- "Add independent radiosonde cost and gradient coverage" -- was the
+  parent of this round's actual fix; resolves together with it.
+
+`make check`: 312 passed, same 12 pre-existing unrelated failures. No
+golden fixtures affected (this is test-only plumbing, not solver code).
+
+## Closing the remaining half of "check complete source profiles" (2026-11-24)
+
+The other half of a finding Copilot kept re-raising across three
+reviews: `_profile_records`'s per-level loop discarded a level entirely
+-- before any height-order bookkeeping ran -- whenever its drift-
+corrected time missed every verification slot's tolerance window. A
+sounding where that excluded level was inverted relative to a kept,
+in-window sibling therefore had its inversion go completely undetected:
+the in-window level would pass height-order QC even though the complete
+sounding it came from was bad. This can only happen with
+`use_drift_time: True` (now the code default) -- without drift every
+level of one report shares the same `report_time` and so the same
+accept/reject verdict, making the gap moot.
+
+**Explicitly requested** (reproducibility with the earlier `-ps_raobs-
+t*` runs' exact obs counts is not a concern here): replaced the early
+`continue` on the time-tolerance check with a `time_accepted` flag.
+`records.setdefault(...)` (and everything that writes into that per-
+slot `record`) is now gated on `time_accepted`; the profile-wide
+`profile_source_priority`/`profile_source_heights` tracking (added two
+rounds ago) runs unconditionally, regardless of `time_accepted` -- so
+an out-of-window level's height still reaches the monotonicity check
+and can still reject an in-window sibling's whole variable, even though
+the out-of-window level itself is never assimilated. This only
+*tightens* QC (an out-of-window level can newly cause an in-window
+level to be rejected; it can never newly cause one to be accepted),
+and the gap it closes requires a fairly specific combination
+(`use_drift_time: True`, a level drifting outside every slot's
+tolerance, and a real inversion against a kept sibling) that none of
+the tracked configs have been run against yet.
+
+**Test**: `tests/unit/test_raobs_parquet.py::
+test_non_monotonic_height_visible_when_sibling_drifts_outside_every_
+slots_window` -- one profile, one level in-window (850 hPa) and one
+drifted 5h outside the only slot's 3h tolerance (500 hPa), inverted
+relative to each other. Confirmed this test fails against the pre-fix
+code (`git stash` the source change, rerun) and passes with the fix.
+
+`make check`: 313 passed (up from 312), same 12 pre-existing unrelated
+failures.

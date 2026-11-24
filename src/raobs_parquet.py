@@ -264,47 +264,82 @@ def _profile_records(
         'report_id', 'observation_time', 'station_id', 'latitude',
         'longitude', 'elevation_m', 'report_type',
     ]
-    level_columns = ['report_id', 'level_index', 'category', 'pressure_mb'] + list(_HEIGHT_COLUMNS)
+    base_level_columns = ['report_id', 'level_index', 'category', 'pressure_mb'] + list(_HEIGHT_COLUMNS)
     for variable in variables:
-        level_columns.extend(_VARIABLE_COLUMNS[variable])
+        base_level_columns.extend(_VARIABLE_COLUMNS[variable])
     # background_temperature_c/background_pressure_mb feed the qsat
     # conversion for q's error (RH_percent * qsat -- see q_error_rh_percent
     # above).
     if 'q' in variables and q_error_rh_percent:
-        level_columns.extend(('background_temperature_c', 'background_pressure_mb'))
-    if use_drift_time:
-        level_columns.append('drift_time_hours')
-    if use_drift_position:
-        level_columns.extend(('drift_longitude', 'drift_latitude'))
-    level_columns = list(dict.fromkeys(level_columns))
+        base_level_columns.extend(('background_temperature_c', 'background_pressure_mb'))
+    base_level_columns = list(dict.fromkeys(base_level_columns))
 
     records = {}
+    # Profile-wide (not per-slot) winner tracking for the height-order QC
+    # below -- keyed by (profile identity, variable, the row's own REAL
+    # reported pressure), not the matched model level, so two genuinely
+    # different real levels that happen to snap to the same model-level
+    # bucket (vertical_interpolation != 'exact') both stay visible to the
+    # monotonicity check below instead of one hiding the other's height
+    # (PR #29's review).
+    profile_source_priority = {}
+    profile_source_heights = {}
     for cycle in cycles:
         for prepbufr_class in prepbufr_classes:
             reports = common.read_partition(
                 common.class_file(cycle, 'reports', prepbufr_class), report_columns
             )
-            levels = common.read_partition(
-                common.class_file(cycle, 'levels', prepbufr_class), level_columns
+            level_path = common.class_file(cycle, 'levels', prepbufr_class)
+            # drift_time_hours/drift_longitude/drift_latitude are read
+            # only if both requested AND actually present in THIS
+            # partition's schema -- an archive (or synthetic fixture,
+            # e.g. tests/data/mini_ace2/raobs) without them falls back to
+            # the documented launch-time/launch-position behavior instead
+            # of read_partition raising on the WHOLE read over one
+            # missing optional column (PR #29's review).
+            partition_columns = common.available_columns(level_path)
+            this_use_drift_time = use_drift_time and 'drift_time_hours' in partition_columns
+            this_use_drift_position = (
+                use_drift_position
+                and 'drift_longitude' in partition_columns and 'drift_latitude' in partition_columns
             )
+            level_columns = list(base_level_columns)
+            if this_use_drift_time:
+                level_columns.append('drift_time_hours')
+            if this_use_drift_position:
+                level_columns.extend(('drift_longitude', 'drift_latitude'))
+            levels = common.read_partition(level_path, level_columns)
             report_ids = common.column(reports, 'report_id', np.int64)
             report_rows = {
                 int(report_id): row for row, report_id in enumerate(report_ids)
             }
             report_times = common.timestamps(reports)
+            # HRDR ('drift_time_hours') is cycle-relative, the SAME
+            # referent as DHR -- a per-level REPLACEMENT for the report's
+            # single DHR-based time, not an increment on top of it (GSI's
+            # read_prepbufr.F90 and the RDASApp bufr2ioda_adpupa_prepbufr.py
+            # converter both anchor it to cycle_time directly). Anchoring
+            # to report_time (== cycle_time + DHR) instead would double-
+            # count DHR (PR #29's review). `cycle` is the archive's own
+            # <root>/<YYYY-MM-DD>/<HH> partition directory for this cycle
+            # -- parsed back into the same cycle datetime
+            # cycle_directories (common.py) computed before discarding it
+            # down to a bare Path, rather than adding a new archive column.
+            cycle_datetime = np.datetime64(common.cycle_time_from_directory(cycle), 's')
             station_ids = reports['station_id'].to_pylist()
             latitude = common.column(reports, 'latitude')
             longitude = common.column(reports, 'longitude')
             elevation = common.column(reports, 'elevation_m')
 
             level_report_ids = common.column(levels, 'report_id', np.int64)
+            raw_level_index = common.column(levels, 'level_index', np.int64)
             category = common.column(levels, 'category', np.int16)
             pressure = common.column(levels, 'pressure_mb')
             height = common.column(levels, 'height_m')
             height_quality = common.column(levels, 'height_quality')
-            drift_time_hours = common.column(levels, 'drift_time_hours') if use_drift_time else None
-            drift_longitude = common.column(levels, 'drift_longitude') if use_drift_position else None
-            drift_latitude = common.column(levels, 'drift_latitude') if use_drift_position else None
+            drift_time_hours = common.column(levels, 'drift_time_hours') if this_use_drift_time else None
+            drift_longitude = common.column(levels, 'drift_longitude') if this_use_drift_position else None
+            drift_latitude = common.column(levels, 'drift_latitude') if this_use_drift_position else None
             level_values = {
                 v: common.column(levels, _VARIABLE_COLUMNS[v][0]) for v in variables
             }
@@ -329,8 +364,7 @@ def _profile_records(
                 # current TOB is virtual temperature where moisture was
                 # reported (VIRTMP); the model's t is sensible temperature
                 level_values['t'] = common.sensible_temperature(
-                    cycle, prepbufr_class, level_report_ids,
-                    common.column(levels, 'level_index', np.int64), level_values['t'],
+                    cycle, prepbufr_class, level_report_ids, raw_level_index, level_values['t'],
                 )
 
             for level_row, report_id in enumerate(level_report_ids):
@@ -342,7 +376,7 @@ def _profile_records(
                 pressure_value = pressure[level_row]
                 if not (
                     np.isfinite(lat) and np.isfinite(lon)
-                    and -90. <= lat <= 90. and np.isfinite(pressure_value)
+                    and -90. <= lat <= 90. and np.isfinite(pressure_value) and pressure_value > 0.
                 ):
                     continue
                 report_time = report_times[report_row]
@@ -352,32 +386,59 @@ def _profile_records(
                 if drift_longitude is not None and drift_latitude is not None:
                     drift_lat = drift_latitude[level_row]
                     drift_lon = drift_longitude[level_row]
-                    if np.isfinite(drift_lat) and np.isfinite(drift_lon):
+                    # Same range check the launch latitude gets above --
+                    # a finite-but-out-of-range drift latitude (garbage
+                    # data) would otherwise reach horizontal
+                    # interpolation directly (PR #29's review).
+                    if np.isfinite(drift_lat) and np.isfinite(drift_lon) and -90. <= drift_lat <= 90.:
                         level_lat, level_lon = drift_lat, drift_lon
                 level_time = report_time
                 if drift_time_hours is not None:
                     drift_h = drift_time_hours[level_row]
                     if np.isfinite(drift_h):
-                        level_time = report_time + np.timedelta64(int(round(drift_h * 3600.)), 's')
+                        level_time = cycle_datetime + np.timedelta64(int(round(drift_h * 3600.)), 's')
                 delta_seconds = np.abs(
                     (verification - level_time).astype('timedelta64[s]')
                     .astype(np.int64)
                 )
                 slot_index = int(np.argmin(delta_seconds))
-                if delta_seconds[slot_index] > tolerance_seconds:
-                    continue
+                # Does NOT skip the rest of this level row when outside
+                # every slot's tolerance -- only the ASSIMILATION
+                # bookkeeping (the per-slot `record` below) is gated on
+                # this. The profile-wide height-order QC further below
+                # still sees this level's height regardless, so a level
+                # that drifts just outside the window can't hide an
+                # inversion that would otherwise reject an IN-WINDOW
+                # sibling level of the same sounding (PR #29's review,
+                # third round on this mechanism -- this gap can only
+                # actually occur with use_drift_time: without it every
+                # level of one report shares the same report_time, and so
+                # the same accept/reject verdict, making the gap moot).
+                time_accepted = delta_seconds[slot_index] <= tolerance_seconds
 
                 station_key = common.station_key(
                     station_ids[report_row], lat, lon,
                     str(cycle)+':'+str(report_id),
                 )
-                key = (slot_index, station_key)
+                # Include the report's own (un-drifted) launch time in the
+                # profile identity: a bare station_key collapses two
+                # DIFFERENT launches from the same physical station (e.g. a
+                # special/extra sounding near a regular one) into one
+                # profile, letting their levels silently replace each other
+                # by quality and corrupting the height-order QC below with
+                # levels from different soundings (PR #29's review).
+                # Genuinely repeated rows of the SAME launch still share one
+                # report_time, so they keep merging as before.
+                profile_key = (station_key, report_time)
                 elevation_m = elevation[report_row]
-                record = records.setdefault(key, {
-                    'lat': lat, 'lon': lon, 'elev': elevation_m,
-                    'values': {}, 'quality': {}, 'height': {}, 'height_quality': {}, 'priority': {},
-                    'default_error': {}, 'pressure': {}, 'level_position': {},
-                })
+                record = None
+                if time_accepted:
+                    key = (slot_index, profile_key)
+                    record = records.setdefault(key, {
+                        'lat': lat, 'lon': lon, 'elev': elevation_m,
+                        'values': {}, 'quality': {}, 'height': {}, 'height_quality': {}, 'priority': {},
+                        'default_error': {}, 'pressure': {}, 'level_position': {},
+                    })
 
                 for variable in variables:
                     if (
@@ -428,6 +489,18 @@ def _profile_records(
                     # docstring above).
                     bounds = physical_bounds.get(variable)
                     physical_bad = bounds is not None and not (bounds[0] <= value <= bounds[1])
+                    # A 'q' candidate whose computed default_error (RH_frac
+                    # * qsat(background)) isn't usable ranks as bad too --
+                    # otherwise a quality-1 row with a missing/invalid
+                    # archived background could win the slot over a
+                    # quality-2 row with a finite error, only to be
+                    # rejected later by the forward operator's own
+                    # isfinite(effective_error) guard, losing the level
+                    # entirely (PR #29's review).
+                    error_bad = False
+                    if variable in level_default_error:
+                        default_error_value = level_default_error[variable][level_row]
+                        error_bad = not (np.isfinite(default_error_value) and default_error_value > 0.)
                     # (worse-bucket-first, then numeric quality mark -- a
                     # non-finite quality sorts last within its bucket, same
                     # as the pre-existing tie-break). 'nearest'/'log-linear'
@@ -438,37 +511,118 @@ def _profile_records(
                     # win (irrelevant for 'exact', where the tight tolerance
                     # already made this moot).
                     priority = (
-                        quality_bad or height_bad or physical_bad,
+                        quality_bad or height_bad or physical_bad or error_bad,
                         quality if np.isfinite(quality) else np.inf,
                         differences[level_index] if vertical_interpolation != 'exact' else 0.,
                     )
 
-                    existing_priority = record['priority'].get((variable, level_index))
-                    if existing_priority is None or priority < existing_priority:
-                        record['values'][(variable, level_index)] = value
-                        record['quality'][(variable, level_index)] = quality
-                        record['priority'][(variable, level_index)] = priority
-                        if vertical_interpolation != 'exact':
-                            record['pressure'][(variable, level_index)] = pressure_value
-                        if use_drift_position:
-                            record['level_position'][(variable, level_index)] = (level_lat, level_lon)
-                        # Clear any height left over from the row this one
-                        # is replacing before conditionally attaching the
-                        # new row's own -- otherwise a stale height from
-                        # the discarded row survives whenever the
-                        # replacement itself has no eligible height,
-                        # corrupting the physical-height/monotonicity QC
-                        # checks downstream.
-                        record['height'].pop((variable, level_index), None)
-                        record['height_quality'].pop((variable, level_index), None)
+                    if time_accepted:
+                        existing_priority = record['priority'].get((variable, level_index))
+                        if existing_priority is None or priority < existing_priority:
+                            record['values'][(variable, level_index)] = value
+                            record['quality'][(variable, level_index)] = quality
+                            record['priority'][(variable, level_index)] = priority
+                            if vertical_interpolation != 'exact':
+                                record['pressure'][(variable, level_index)] = pressure_value
+                            if use_drift_position:
+                                record['level_position'][(variable, level_index)] = (level_lat, level_lon)
+                            # Clear any height left over from the row this one
+                            # is replacing before conditionally attaching the
+                            # new row's own -- otherwise a stale height from
+                            # the discarded row survives whenever the
+                            # replacement itself has no eligible height,
+                            # corrupting the physical-height/monotonicity QC
+                            # checks downstream.
+                            record['height'].pop((variable, level_index), None)
+                            record['height_quality'].pop((variable, level_index), None)
+                            if height_eligible:
+                                record['height'][(variable, level_index)] = height_m
+                                record['height_quality'][(variable, level_index)] = height_quality_value
+                            if variable in level_default_error:
+                                record['default_error'][(variable, level_index)] = \
+                                    level_default_error[variable][level_row]
+                            else:
+                                record['default_error'].pop((variable, level_index), None)
+
+                    # Mirrors the per-slot winner selection just above, but
+                    # runs UNCONDITIONALLY (not gated on time_accepted)
+                    # and is keyed by the whole PROFILE (profile_key, not
+                    # (slot_index, profile_key)) AND the row's own REAL
+                    # reported pressure (not the matched model
+                    # level_index) -- feeds the height-order QC below,
+                    # computed once on the COMPLETE sounding rather than
+                    # per-slot or per-window, so an inversion spanning two
+                    # use_drift_time slots -- or involving a level that
+                    # drifted outside every slot's tolerance and so is
+                    # never itself assimilated -- is still caught
+                    # (PR #29's review, now three rounds on this
+                    # mechanism). Keying by real pressure instead of the
+                    # matched bucket means two genuinely different real
+                    # levels that snap to the SAME model level
+                    # (vertical_interpolation != 'exact') both stay
+                    # visible here, even though only one of them can win
+                    # that bucket for assimilation above; two rows
+                    # reporting the IDENTICAL real pressure -- a genuine
+                    # duplicate (e.g. a retransmitted message), same
+                    # convention this module's own duplicate-selection
+                    # tests use -- still collapse to one winner
+                    # (PR #29's review, second round).
+                    source_key = (variable, float(pressure_value))
+                    profile_key_priority = profile_source_priority.setdefault(profile_key, {})
+                    existing_profile_priority = profile_key_priority.get(source_key)
+                    if existing_profile_priority is None or priority < existing_profile_priority:
+                        profile_key_priority[source_key] = priority
+                        profile_key_heights = profile_source_heights.setdefault(profile_key, {})
                         if height_eligible:
-                            record['height'][(variable, level_index)] = height_m
-                            record['height_quality'][(variable, level_index)] = height_quality_value
-                        if variable in level_default_error:
-                            record['default_error'][(variable, level_index)] = \
-                                level_default_error[variable][level_row]
+                            profile_key_heights[source_key] = (pressure_value, height_m)
                         else:
-                            record['default_error'].pop((variable, level_index), None)
+                            profile_key_heights.pop(source_key, None)
+
+    # Non-monotonic height-with-pressure, computed ONCE per complete
+    # profile (every RAW level the archive has for this report, whether
+    # or not it won its model-level bucket for assimilation, AND whether
+    # or not its own drift-corrected time fell inside any slot's
+    # tolerance window -- see the winner-selection and time_accepted
+    # comments above), not per-slot or per-matched-bucket or per-window
+    # -- an inversion straddling two use_drift_time slots, hidden behind
+    # a bucket-mate that won the assimilation slot, or involving a level
+    # that drifted outside every slot's tolerance and so is never itself
+    # assimilated, must still reject the whole variable's profile,
+    # matching the no-drift-time behavior where it's always checked on
+    # the complete sounding (PR #29's review, now three rounds on this
+    # mechanism). Ordered by each level's own REAL reported pressure
+    # (not the matched model level) so two raw levels sharing one bucket
+    # still sort correctly relative to each other. Consumed by
+    # load_raobs_parquet instead of that function recomputing it from
+    # its own (slot-limited, bucket-collapsed) record['height'].
+    profile_height_order_bad = {}
+    for profile_key, heights_by_key in profile_source_heights.items():
+        bad_variables = set()
+        for variable in variables:
+            pairs = sorted(
+                (
+                    (pressure_value, height_m)
+                    for (var, _), (pressure_value, height_m) in heights_by_key.items()
+                    if var == variable
+                ),
+                key=lambda pair: -pair[0],  # descending pressure == surface-to-top, same as before
+            )
+            ordered = [height_m for _, height_m in pairs]
+            if len(ordered) > 1 and np.any(np.diff(ordered) <= 0.):
+                bad_variables.add(variable)
+        if bad_variables:
+            profile_height_order_bad[profile_key] = bad_variables
+
+    # Drop records that ended up with no retained observation at all (e.g.
+    # a q-only sounding with every level below humidity_min_pressure_hpa)
+    # -- otherwise they still consume a station slot downstream, wasting
+    # raobs_station_capacity and potentially displacing a station that
+    # would have had usable observations (PR #29's review).
+    records = {
+        key: record for key, record in records.items() if record['values']
+    }
+    for (slot_index, profile_key), record in records.items():
+        record['height_order_bad'] = profile_height_order_bad.get(profile_key, set())
     return records
 
 
@@ -565,8 +719,8 @@ def load_raobs_parquet(
     position_bases = tuple(variables) if use_drift_position else ()
 
     by_slot = {}
-    for (slot_index, station_key), record in records.items():
-        by_slot.setdefault(slot_index, {})[station_key] = record
+    for (slot_index, profile_key), record in records.items():
+        by_slot.setdefault(slot_index, {})[profile_key] = record
 
     n_slots = len(verification_times)
     result = {'lat': [None]*n_slots, 'lon': [None]*n_slots, 'elev': [None]*n_slots}
@@ -584,11 +738,11 @@ def load_raobs_parquet(
 
     for slot_index in range(n_slots):
         stations = by_slot.get(slot_index, {})
-        station_keys = sorted(stations)
-        capacity = len(station_keys) if station_capacity is None else int(station_capacity)
-        if len(station_keys) > capacity:
+        profile_keys = sorted(stations)
+        capacity = len(profile_keys) if station_capacity is None else int(station_capacity)
+        if len(profile_keys) > capacity:
             raise ValueError(
-                'raobs slot '+str(slot_index)+' has '+str(len(station_keys))
+                'raobs slot '+str(slot_index)+' has '+str(len(profile_keys))
                 +' stations, exceeding fixed capacity '+str(capacity)+'.'
             )
         lat = np.zeros(capacity, dtype=np.float32)
@@ -605,8 +759,8 @@ def load_raobs_parquet(
         lat_level = {v: np.zeros((levels_hpa[v].size, capacity), dtype=np.float32) for v in position_bases}
         lon_level = {v: np.zeros((levels_hpa[v].size, capacity), dtype=np.float32) for v in position_bases}
 
-        for station_index, station_key in enumerate(station_keys):
-            record = stations[station_key]
+        for station_index, profile_key in enumerate(profile_keys):
+            record = stations[profile_key]
             lat[station_index] = record['lat']
             lon[station_index] = np.mod(record['lon'], 360.)
             elev[station_index] = record['elev']
@@ -653,21 +807,14 @@ def load_raobs_parquet(
                         if default is not None and np.isfinite(default) and default > 0.:
                             default_error[v][level_index, station_index] = default
 
-            # Non-monotonic height-with-pressure, checked per variable (each
-            # variable's own level/height collocations), excluding category-4
-            # rows already filtered out of `record['height']`.
-            for v in variables:
-                heights = {
-                    level_index: record['height'][(v, level_index)]
-                    for level_index in range(levels_hpa[v].size)
-                    if (v, level_index) in record['height']
-                }
-                ordered = [
-                    heights[idx] for idx in np.argsort(-levels_hpa[v])
-                    if idx in heights
-                ]
-                if len(ordered) > 1 and np.any(np.diff(ordered) <= 0.):
-                    mask[v][:, station_index] = False
+            # Non-monotonic height-with-pressure: computed in
+            # _profile_records across the COMPLETE source profile (every
+            # level, before use_drift_time splits it across slots), not
+            # just this slot's own subset -- an inversion straddling two
+            # slots must reject both, matching the no-drift-time behavior
+            # (PR #29's review).
+            for v in record.get('height_order_bad', ()):
+                mask[v][:, station_index] = False
 
         for v in variables:
             counts[v] += int(mask[v].sum())

@@ -21,6 +21,7 @@ import os
 import sys
 
 import pytest
+import xarray as xr
 
 pytest.importorskip('fme')
 
@@ -31,9 +32,12 @@ from golden_compare import compare, report  # noqa: E402
 
 pytestmark = [pytest.mark.ace2, pytest.mark.slow]
 
-# observed: 2722 -> 1465 (-46%, synthetic parquet psobs+raobs fixture, raobs
+# observed: 2721 -> 1255 (-54%, synthetic parquet psobs+raobs fixture, raobs
 # t/u/v sampled from the real background + noise -- see
-# tests/make_fixtures.py's _ace2_background_profiles); the margin absorbs
+# tests/make_fixtures.py's _ace2_background_profiles; -54%, not the
+# pre-frozen-background-QC -46%, since PR #29's review -- the gross
+# check no longer loosens as the state moves away from the background).
+# The margin absorbs
 # CPU/BLAS differences
 MAX_FINAL_TO_FIRST = 0.6
 
@@ -55,12 +59,24 @@ def test_ace2_mini_window(tmp_path, checkpoint):
         f'cost fell only {losses[1]:.0f} -> {losses[epochs]:.0f} in {epochs} epochs')
 
     stem = f"{exp['sdate']}_"
+    raobs_hits = None
     for kind in (
         'latent_increment', 'observation_diagnostics', 'control_forecast', 'optimal_forecast',
         'raobs_diagnostics',
     ):
         hits = [f for f in os.listdir(out) if f.startswith(stem + kind)]
         assert hits, f'no {kind} output in {out}: {sorted(os.listdir(out))}'
+        if kind == 'raobs_diagnostics':
+            raobs_hits = hits
+
+    # The aggregate cost-drop check above can pass on psobs alone even if
+    # every radiosonde profile is silently dropped (e.g. masked out
+    # entirely by QC) -- check the diagnostics themselves record used
+    # observations for every raobs variable this config requests, not
+    # just that the file exists (PR #29's review).
+    with xr.open_dataset(os.path.join(out, raobs_hits[0])) as ds:
+        for base in ('t', 'u', 'v'):
+            assert int(ds[base + '_used'].sum()) > 0, f'no {base} raobs observations used'
 
     with open(mini_ace2.GOLDEN) as f:
         golden = json.load(f)

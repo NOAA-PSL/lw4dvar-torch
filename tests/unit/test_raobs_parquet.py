@@ -3,7 +3,7 @@
 archive per test (not tests/data/mini_ace2's fixture) so each check has an
 independent, known-by-construction expected result."""
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import pytest
@@ -37,20 +37,25 @@ _FLOAT_COLUMNS = {
 EVENT_COLUMNS = ['report_id', 'level_index', 'value_mnemonic', 'event_index', 'value', 'program_code']
 
 
-def write_cycle(root, cycle_time, reports, levels, events=(), prepbufr_class='ADPUPA'):
+def write_cycle(root, cycle_time, reports, levels, events=(), prepbufr_class='ADPUPA', omit_level_columns=()):
     """`reports`/`levels` are lists of dicts with exactly REPORT_COLUMNS/
     LEVEL_COLUMNS keys (observation_time as a `datetime`). `events` (TOB
     event-stack rows, for the sensible-temperature lookup) defaults to
     empty -- common.sensible_temperature falls back to the input
-    temperature_c when no event matches, so most tests don't need any."""
+    temperature_c when no event matches, so most tests don't need any.
+    `omit_level_columns`: column names to leave entirely out of the
+    written levels schema (not just null-valued) -- simulates an archive
+    that never had them at all, e.g. one predating drift_time_hours/
+    drift_longitude/drift_latitude (PR #29's review)."""
     cycle_dir = root / f'{cycle_time:%Y-%m-%d}' / f'{cycle_time:%H}'
     for table_name, columns, rows in (
         ('reports', REPORT_COLUMNS, reports), ('levels', LEVEL_COLUMNS, levels),
     ):
         path = cycle_dir / table_name / prepbufr_class / 'part-00000.parquet'
         path.parent.mkdir(parents=True, exist_ok=True)
+        cols = columns if table_name != 'levels' else [c for c in columns if c not in omit_level_columns]
         arrays = {}
-        for col in columns:
+        for col in cols:
             values = [row[col] for row in rows]
             col_type = (
                 pa.timestamp('s') if col == 'observation_time'
@@ -123,6 +128,16 @@ def test_mandatory_level_matched_within_tolerance(tmp_path):
     assert data['values_t'][0][1, 0] == pytest.approx(300.0)  # 26.85 C -> K
 
 
+def test_non_positive_pressure_rejected(tmp_path):
+    # A non-positive reported pressure is physically meaningless and
+    # would reach np.log in 'log-linear' mode with an invalid argument
+    # (PR #29's review) -- rejected up front, same as a non-finite one.
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=0., temperature=10.)])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], vertical_interpolation='nearest')
+    assert data['mask_t'][0].shape[-1] == 0  # no station: its only level was rejected outright
+
+
 def test_level_outside_pressure_match_tolerance_rejected(tmp_path):
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=849.9)])
@@ -164,8 +179,12 @@ def test_relaxed_modes_distance_tiebreak_prefers_closer_duplicate(tmp_path, vert
     write_cycle(
         tmp_path, t0, [report(1, time=t0)],
         [
-            level(1, pressure=830., temperature=10., level_index=0),  # 20 hPa from 850
-            level(1, pressure=860., temperature=20., level_index=1),  # 10 hPa from 850 -- closer
+            # heights must increase as pressure drops (830 < 860) or the
+            # profile-wide non-monotonic-height QC rejects both -- these
+            # are two genuinely different real levels now visible to that
+            # check (PR #29's review), not just competing for one bucket.
+            level(1, pressure=830., height=1600., temperature=10., level_index=0),  # 20 hPa from 850
+            level(1, pressure=860., height=1400., temperature=20., level_index=1),  # 10 hPa from 850 -- closer
         ],
     )
     data = load(
@@ -239,14 +258,20 @@ def test_quality_mark_qc_rejected(tmp_path):
 
 def test_sensible_temperature_used_instead_of_virtual(tmp_path):
     # The archive's temperature_c is the (virtual) TOB when moisture was
-    # reported; the first non-VIRTMP (program_code != 8) event stack entry
-    # is the sensible value common.sensible_temperature must return instead.
+    # reported; the FIRST non-VIRTMP (program_code != 8) event BY STACK
+    # ORDER (lowest event_index) is the sensible value
+    # common.sensible_temperature must return instead. Multiple non-
+    # VIRTMP candidates, given in shuffled input order with distinct
+    # event_index values, confirm this picks by stack order -- not input-
+    # list order and not value magnitude (PR #29's review).
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(
         tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=27.0)],
         events=[
-            event(1, value=26.0, program_code=0),   # sensible (pre-VIRTMP)
-            event(1, value=27.0, program_code=8),    # VIRTMP-corrected (matches levels' temperature_c)
+            event(1, value=99.0, event_index=2, program_code=0),  # non-VIRTMP, but not first in stack
+            event(1, value=50.0, event_index=1, program_code=0),  # non-VIRTMP, but not first in stack
+            event(1, value=26.0, event_index=0, program_code=0),  # non-VIRTMP, FIRST in stack -- the answer
+            event(1, value=27.0, event_index=3, program_code=8),  # VIRTMP-corrected (matches levels' temperature_c)
         ],
     )
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
@@ -258,6 +283,23 @@ def test_sensible_temperature_falls_back_to_input_when_no_event(tmp_path):
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=10.0)], events=[])
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
     assert data['values_t'][0][0, 0] == pytest.approx(10.0 + 273.15)
+
+
+def test_sensible_temperature_nan_when_only_virtmp_event(tmp_path):
+    # Every TOB event for this level is VIRTMP (program_code 8) -- there
+    # is no recoverable sensible value, so sensible_temperature must
+    # return NaN (not silently keep the virtual temperature as if it
+    # were sensible) and the level must be excluded like any other
+    # missing value (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850., temperature=27.0)],
+        events=[
+            event(1, value=27.0, program_code=8),  # VIRTMP-corrected -- the ONLY event
+        ],
+    )
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert data['mask_t'][0].shape[-1] == 0  # no station at all: its only level was NaN'd out
 
 
 def test_humidity_masked_above_pressure_floor(tmp_path):
@@ -283,14 +325,17 @@ def test_humidity_pressure_floor_checked_against_real_pressure_not_nominal_level
     # level -- checking the NOMINAL level (300, not itself below the
     # 300 hPa floor) would wrongly keep this observation; the candidate's
     # own REAL reported pressure (290, below the floor) must exclude it
-    # (PR #29's review).
+    # (PR #29's review). With its only candidate excluded, the record has
+    # no retained value at all and is dropped entirely (PR #29's review,
+    # second round) rather than consuming a station slot with an all-
+    # False mask.
     t0 = datetime(2015, 1, 1, 0)
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=290., q=4000.)])
     data = load(
         tmp_path, [t0], {'q': [300.]}, ['q'],
         humidity_min_pressure_hpa=300., vertical_interpolation='nearest',
     )
-    assert not data['mask_q'][0][0, 0]
+    assert data['mask_q'][0].shape[-1] == 0  # no station at all landed in this slot
 
 
 def test_humidity_pressure_floor_excluded_candidate_cannot_displace_a_valid_one(tmp_path):
@@ -344,6 +389,27 @@ def test_station_capacity_overflow_raises(tmp_path):
         load(tmp_path, [t0], {'t': [850.]}, ['t'], station_capacity=1)
 
 
+def test_two_launches_from_same_station_stay_separate_profiles(tmp_path):
+    # Two DIFFERENT launches (report_id 1 and 2, one hour apart) from the
+    # SAME physical station landing in the same slot: a bare station_key
+    # would merge them into one profile, letting their levels compete/
+    # replace each other and corrupting the per-profile height-order QC
+    # with levels from different soundings. Including each report's own
+    # launch time in the profile identity keeps them as two separate
+    # stations (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0,
+        [
+            report(1, time=t0, station_id='SAME', lat=10., lon=20.),
+            report(2, time=t0 + timedelta(hours=1), station_id='SAME', lat=10., lon=20.),
+        ],
+        [level(1, pressure=850., temperature=10.), level(2, pressure=850., temperature=20.)],
+    )
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'])
+    assert data['lat'][0].size == 2
+
+
 def test_default_q_error_rh_percent_times_static_qsat(tmp_path):
     # GSI/UFO's real q-error mechanism (RH_fraction * qsat(background),
     # per jswhit's PR #29 review comment) -- the table is interpolated
@@ -367,6 +433,31 @@ def test_default_q_error_absent_without_table(tmp_path):
     write_cycle(tmp_path, t0, [report(1, time=t0)], [level(1, pressure=850.)])
     data = load(tmp_path, [t0], {'q': [850.]}, ['q'])
     assert 'default_error_q' not in data
+
+
+def test_duplicate_q_selection_prefers_usable_error_over_quality_mark(tmp_path):
+    # Two rows compete for the same matched model level (850 hPa): one
+    # has the BETTER quality mark but a missing archived background (so
+    # its computed default_error_q is NaN -- unusable), the other a
+    # worse-but-passing quality mark with a valid background. Ranking by
+    # quality mark alone (the old behavior) would select the unusable
+    # one, which the forward operator then rejects outright via its own
+    # isfinite(effective_error) guard -- losing the usable duplicate
+    # entirely (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0)],
+        [
+            level(1, pressure=850., q=4000., humidity_quality=1, level_index=0,
+                  background_temperature=None, background_pressure=None),
+            level(1, pressure=850., q=3000., humidity_quality=2, level_index=1,
+                  background_temperature=20., background_pressure=1000.),
+        ],
+    )
+    data = load(tmp_path, [t0], {'q': [850.]}, ['q'], q_error_rh_percent={1000.: 20., 500.: 10.})
+    assert data['mask_q'][0][0, 0]
+    assert data['values_q'][0][0, 0] == pytest.approx(3000. / 1.e6)
+    assert np.isfinite(data['default_error_q'][0][0, 0])
 
 
 def test_physical_bounds_qc_rejects_impossible_temperature(tmp_path):
@@ -474,6 +565,25 @@ def test_use_drift_time_false_keeps_whole_profile_in_one_slot(tmp_path):
     assert data['mask_t'][1].shape[-1] == 0  # no station at all landed in slot 1
 
 
+def test_non_monotonic_height_spanning_use_drift_time_slots_rejects_both(tmp_path):
+    # One profile, split across two use_drift_time slots: level 0 (1000
+    # hPa, height 500) stays in slot 0; level 1 (850 hPa, height 400 --
+    # LOWER despite being at higher altitude, an inversion) drifts into
+    # slot 1. Checked per-slot (the old behavior), neither slot has a
+    # second level to compare against, so the inversion is invisible and
+    # both wrongly pass. Checked on the COMPLETE profile (PR #29's
+    # review), the inversion is caught and BOTH slots are rejected.
+    t0, t1 = datetime(2015, 1, 1, 0), datetime(2015, 1, 1, 6)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=1000., height=500., level_index=0, drift_time_hours=0.0),
+        level(1, pressure=850., height=400., level_index=1, drift_time_hours=6.0),
+    ])
+    write_cycle(tmp_path, t1, [], [])  # empty -- just needs the cycle directory to exist
+    data = load(tmp_path, [t0, t1], {'t': [1000., 850.]}, ['t'], use_drift_time=True)
+    assert not data['mask_t'][0].any()  # slot 0 (1000 hPa level) rejected too
+    assert not data['mask_t'][1].any()  # slot 1 (850 hPa level) rejected too
+
+
 def test_use_drift_time_falls_back_to_report_time_when_missing(tmp_path):
     # drift_time_hours missing (None/NaN) for this level -- even with
     # use_drift_time=True, it must fall back to the report's own time,
@@ -493,20 +603,122 @@ def test_use_drift_time_widens_partition_discovery_for_a_boundary_report(tmp_pat
     # 3h midpoint (_nearest_cycle's own tie-break favors the query's own
     # cycle) -- so the 18Z partition, which actually holds this report,
     # would never be opened without widening discovery for
-    # use_drift_time. The report itself launched at 20:30Z (just outside
-    # the un-drifted window); +1h of drift puts its one level at 21:30Z,
-    # inside the 3h window around 00Z (PR #29's review).
+    # use_drift_time. The report itself launched ON its own 18Z cycle
+    # (DHR 0); +3.5h of drift_time_hours (cycle-relative HRDR -- anchored
+    # to the 18Z cycle, not the report's own time, PR #29's review) puts
+    # its one level at 21:30Z, inside the 3h window around 00Z.
     t0 = datetime(2015, 1, 1, 0)
-    launch = datetime(2014, 12, 31, 20, 30)
+    cycle = datetime(2014, 12, 31, 18)
     write_cycle(
-        tmp_path, datetime(2014, 12, 31, 18), [report(1, time=launch)],
+        tmp_path, cycle, [report(1, time=cycle)],
         # temperature=-10 (not level()'s own default 300 C -> 573 K, which
         # fails physical-bounds QC, unrelated to what this test checks).
-        [level(1, pressure=850., temperature=-10., drift_time_hours=1.0)],
+        [level(1, pressure=850., temperature=-10., drift_time_hours=3.5)],
     )
     write_cycle(tmp_path, t0, [], [])  # the 00Z cycle directory must exist too
     data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True)
     assert data['mask_t'][0][0, 0]
+
+
+def test_use_drift_time_anchors_to_cycle_time_not_report_time(tmp_path):
+    # HRDR ('drift_time_hours') is cycle-relative, the SAME referent as
+    # the report's own DHR -- a per-level REPLACEMENT for the report's
+    # DHR-based time, not an increment on top of it (PR #29's review:
+    # anchoring to report_time instead double-counts DHR). A report
+    # launched well off its own cycle hour (DHR +2.9h) with a small drift
+    # (+0.2h) must land at cycle_time + drift (00:12, well inside the 3h
+    # tolerance around the 00Z verification time), not report_time +
+    # drift (03:06, just outside it) -- this test would fail under the
+    # old (report_time-anchored) formula.
+    cycle = datetime(2015, 1, 1, 0)
+    launch = datetime(2015, 1, 1, 2, 54)  # DHR +2.9h
+    write_cycle(
+        tmp_path, cycle, [report(1, time=launch)],
+        [level(1, pressure=850., temperature=-10., drift_time_hours=0.2)],
+    )
+    data = load(tmp_path, [cycle], {'t': [850.]}, ['t'], use_drift_time=True)
+    assert data['mask_t'][0][0, 0]  # cycle_time + drift (00:12) is inside the 3h window
+
+
+def test_use_drift_time_falls_back_when_archive_has_no_drift_columns(tmp_path):
+    # use_drift_time/use_drift_position default to True in get_raobs
+    # (long_window_4dvar_utils.py), so an archive that simply predates
+    # drift_time_hours/drift_longitude/drift_latitude -- not just missing
+    # a VALUE, missing the COLUMN entirely, e.g. tests/data/mini_ace2/
+    # raobs -- must still load via the documented launch-time/position
+    # fallback instead of common.read_partition raising on the whole
+    # levels read over one missing optional column (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(
+        tmp_path, t0, [report(1, time=t0, lat=10., lon=20.)],
+        [level(1, pressure=850., temperature=-10.)],
+        omit_level_columns=('drift_time_hours', 'drift_longitude', 'drift_latitude'),
+    )
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True, use_drift_position=True)
+    assert data['mask_t'][0][0, 0]
+    assert data['lat_t'][0][0, 0] == pytest.approx(10.)  # launch position, not drift (column absent)
+    assert data['lon_t'][0][0, 0] == pytest.approx(20.)
+
+
+def test_use_drift_position_rejects_out_of_range_drift_latitude(tmp_path):
+    # A finite but out-of-range drift latitude (garbage/corrupted data)
+    # must not overwrite the already-validated launch coordinates --
+    # same range check the launch latitude itself gets (PR #29's review).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0, lat=10., lon=20.)], [
+        level(1, pressure=850., temperature=-10., drift_latitude=190., drift_longitude=20.05),
+    ])
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_position=True)
+    assert data['mask_t'][0][0, 0]
+    assert data['lat_t'][0][0, 0] == pytest.approx(10.)  # launch fallback, not the bad drift value
+    assert data['lon_t'][0][0, 0] == pytest.approx(20.)
+
+
+def test_non_monotonic_height_visible_across_bucket_sharing_duplicates(tmp_path):
+    # Two genuinely different real levels (830.5/829 hPa) both snap to
+    # the single model level (830 hPa) in 'nearest' mode -- the 830.5 hPa
+    # row wins that bucket for assimilation (0.5 hPa away vs. 1 hPa), but
+    # the 829 hPa row's height must still be visible to the profile-wide
+    # non-monotonic-height check: it's inverted (50 m, LOWER) relative to
+    # a third, higher-pressure level (900 hPa, 100 m) that IS kept.
+    # Before this fix, only the bucket's WINNING height ever reached the
+    # check, hiding the losing candidate's inversion entirely (PR #29's
+    # review, second round).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        # temperature=-10 (not level()'s own default 300 C -> 573 K,
+        # which fails physical-bounds QC, unrelated to what this checks).
+        level(1, pressure=900., height=100., temperature=-10., level_index=0),
+        level(1, pressure=830.5, height=2500., temperature=-10., level_index=1),  # wins the 830 hPa bucket (closer)
+        level(1, pressure=829., height=50., temperature=-10., level_index=2),     # loses the bucket, height=50 < 100
+    ])
+    data = load(
+        tmp_path, [t0], {'t': [900., 830.]}, ['t'],
+        vertical_interpolation='nearest',
+    )
+    assert not data['mask_t'][0].any()  # the whole profile is rejected, not just the losing candidate
+
+
+def test_non_monotonic_height_visible_when_sibling_drifts_outside_every_slots_window(tmp_path):
+    # One profile: level A (850 hPa) drifts negligibly and lands in the
+    # only slot; level B (500 hPa) drifts +5h, outside every slot's 3h
+    # tolerance, so it is never itself assimilated. B's height (1000 m)
+    # is LOWER than A's (1500 m) despite being at a much higher altitude
+    # (lower pressure) -- a real inversion. Before this fix, B's height
+    # never reached the profile-wide completeness check at all (the time
+    # cutoff discarded the whole level before any QC bookkeeping ran),
+    # so A sailed through even though the complete sounding it came from
+    # has a genuine inversion (PR #29's review, third round on this
+    # mechanism).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [report(1, time=t0)], [
+        level(1, pressure=850., height=1500., temperature=-10., level_index=0, drift_time_hours=0.0),
+        level(1, pressure=500., height=1000., temperature=-10., level_index=1, drift_time_hours=5.0),
+    ])
+    data = load(tmp_path, [t0], {'t': [850., 500.]}, ['t'], use_drift_time=True)
+    # A (850 hPa) is the only level ever assimilated (B drifted outside
+    # the window) -- its whole station must still be rejected.
+    assert not data['mask_t'][0].any()
 
 
 def test_use_drift_position_gives_each_level_its_own_position(tmp_path):

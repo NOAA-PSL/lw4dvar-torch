@@ -101,19 +101,19 @@ exp:
       # GSI-matching number regardless of what dt_obs ends up being (at
       # dt_obs: 6 it's the same as the default anyway).
       #time_tolerance_hours: 3.0 # default dt_obs/2 (also GSI's own twindow for kx 120/220/221)
-      # Code default False if omitted; this template turns it on: assign
-      # EACH LEVEL to its own nearest obs slot using the archive's own
-      # balloon-drift-corrected drift_time_hours (how many hours after/
-      # before the report's own launch time that level was actually
-      # observed -- verified against real data: near 0 at the surface,
-      # growing smoothly to +1.6h by 5 hPa for a deep sounding), instead
-      # of every level of a profile sharing the report's single launch
-      # time. Falls back to the launch time wherever drift_time_hours is
-      # missing for a level. See docs/integrate_multiple_parquetobs.md.
+      # Also the code's own default when omitted: assign EACH LEVEL to
+      # its own nearest obs slot using the archive's own balloon-drift-
+      # corrected drift_time_hours (cycle-relative, same referent as the
+      # report's own DHR -- verified against real data: near 0 at the
+      # surface, growing smoothly to +1.6h by 5 hPa for a deep sounding),
+      # instead of every level of a profile sharing the report's single
+      # launch time. Falls back to the launch time wherever
+      # drift_time_hours is missing for a level. Set False to disable.
+      # See docs/integrate_multiple_parquetobs.md.
       use_drift_time: True
-      # Code default False if omitted; this template turns it on,
-      # independent of use_drift_time (that corrects WHICH slot/
-      # background a level is compared against; this corrects WHERE,
+      # Also the code's own default when omitted, independent of
+      # use_drift_time (that corrects WHICH slot/background a level is
+      # compared against; this corrects WHERE,
       # horizontally): compare each level against the model at that
       # level's own balloon-drift-corrected position (drift_longitude/
       # drift_latitude -- absolute degrees, same convention as latitude/
