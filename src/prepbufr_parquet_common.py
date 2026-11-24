@@ -58,7 +58,7 @@ def _nearest_cycle(moment, prefer):
     return floor_cycle + _CYCLE_SPAN
 
 
-def cycle_directories(directory, verification_times, tolerance_hours, allow_missing=False, logger=None):
+def cycle_directories(directory, verification_times, tolerance_hours, allow_missing=False, logger=None, skipped=None):
     """Return the six-hourly archive cycle directories that can hold a
     report within `tolerance_hours` of each verification time.
 
@@ -74,11 +74,15 @@ def cycle_directories(directory, verification_times, tolerance_hours, allow_miss
     tolerates the archive's own date-range edge -- there is no way to
     distinguish the two from here, so a report whose drift-corrected time
     falls inside that gap is silently never read, same as if it didn't
-    exist (PR #29's review). Pass `logger` to at least make a skipped
-    cycle detectable (an INFO line, not a WARNING -- skipping the archive's
-    own date-range edge is the common, expected case this exists for; an
-    unexpected interior gap looks the same from here and needs a human to
-    notice the log and judge which one it is).
+    exist (PR #29's review).
+
+    Every skip is made detectable two ways, not just one: `logger`, if
+    given, gets a WARNING line (not INFO -- a silently incomplete
+    assimilation is worth a human noticing even though skipping the
+    archive's own date-range edge is also the common, expected case this
+    mechanism exists for); `skipped`, if given a list, gets each missing
+    `path` appended to it IN PLACE, so a caller can check programmatically
+    (and a test can assert on it) instead of only being able to watch logs.
     """
     directory = Path(os.path.expanduser(directory)).resolve()
     if not directory.is_dir():
@@ -101,11 +105,13 @@ def cycle_directories(directory, verification_times, tolerance_hours, allow_miss
         if not path.is_dir():
             if allow_missing:
                 if logger is not None:
-                    logger.info(
+                    logger.warning(
                         'PREPBUFR parquet cycle directory missing, skipped (padding margin -- '
                         'this is expected at the archive\'s own date-range edge, but also the '
                         'only sign of an unexpected interior gap): '+str(path)
                     )
+                if skipped is not None:
+                    skipped.append(path)
                 continue
             raise FileNotFoundError(
                 'PREPBUFR parquet cycle directory not found: '+str(path)

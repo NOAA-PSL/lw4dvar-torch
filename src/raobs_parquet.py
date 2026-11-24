@@ -244,16 +244,22 @@ def _profile_records(
     prepbufr_classes = tuple(str(c).upper() for c in prepbufr_classes)
     physical_bounds = _RAOBS_PHYSICAL_BOUNDS if physical_bounds is None else physical_bounds
 
+    skipped_padding_cycles = []
     cycles = common.cycle_directories(directory, verification_times, time_tolerance_hours)
     if use_drift_time:
         # See the docstring above: widen which partitions get opened by
         # the maximum supported drift, tolerating missing directories in
         # just that extra margin (e.g. at the archive's own date-range
         # boundary) -- the original, unwidened `cycles` above still raise
-        # as before if genuinely missing.
+        # as before if genuinely missing. `skipped_padding_cycles`
+        # collects every directory this widening tolerated missing, so
+        # `load_raobs_parquet` can surface it in its own return value --
+        # programmatically detectable, not just a log line (PR #29's
+        # review, follow-up: a WARNING alone is still only as loud as
+        # whoever is watching logs).
         padded_cycles = common.cycle_directories(
             directory, verification_times, time_tolerance_hours + _RAOBS_MAX_DRIFT_HOURS,
-            allow_missing=True, logger=logger,
+            allow_missing=True, logger=logger, skipped=skipped_padding_cycles,
         )
         cycles = sorted(set(cycles) | set(padded_cycles))
     verification = np.asarray([
@@ -651,7 +657,7 @@ def _profile_records(
     }
     for (slot_index, profile_key), record in records.items():
         record['height_order_bad'] = profile_height_order_bad.get(profile_key, set())
-    return records
+    return records, skipped_padding_cycles
 
 
 def load_raobs_parquet(
@@ -727,7 +733,7 @@ def load_raobs_parquet(
     variables = tuple(variables)
     levels_hpa = {v: np.asarray(levels_hpa[v], dtype=np.float64) for v in variables}
     physical_bounds = _RAOBS_PHYSICAL_BOUNDS if physical_bounds is None else physical_bounds
-    records = _profile_records(
+    records, skipped_padding_cycles = _profile_records(
         directory, verification_times, levels_hpa, variables, time_tolerance_hours,
         prepbufr_classes, quality_mark_max, pressure_match_tolerance_hpa,
         geopotential_height_min_m, geopotential_height_max_m, below_station_tolerance_m,
@@ -864,6 +870,20 @@ def load_raobs_parquet(
             'raobs parquet: '+str(len(records))+' (slot, station) profile reports; '
             'accepted obs by variable '+str(counts)
         )
+        if skipped_padding_cycles:
+            # One aggregate summary in addition to cycle_directories' own
+            # per-cycle WARNING -- easy to miss a single line among many
+            # when several cycles are skipped at once (PR #29's review,
+            # follow-up).
+            logger.warning(
+                'raobs parquet: '+str(len(skipped_padding_cycles))+' use_drift_time padding '
+                'cycle(s) missing from the archive, skipped: '+str(sorted(skipped_padding_cycles))
+            )
     result['levels_hpa'] = levels_hpa
     result['counts'] = counts
+    # Programmatically detectable, not just a log line (PR #29's review,
+    # follow-up): empty unless use_drift_time actually needed to widen
+    # partition discovery AND at least one of those extra cycles was
+    # missing from the archive.
+    result['skipped_padding_cycles'] = skipped_padding_cycles
     return result

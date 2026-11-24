@@ -2759,3 +2759,60 @@ confirm the new/changed test actually fails, then restore.
 
 `make check`: 325 passed (up from 319), same 12 pre-existing unrelated
 failures. `make check-ace2`: passed, no fixture regeneration needed.
+
+## A later Copilot review (#6047910846) re-raised 3 of these -- 2 confirmed already resolved, 1 strengthened (2026-11-24)
+
+Re-ran against the commit above, this review still listed "Test raobs
+gates with both live and cached QC masks" and "Add independent
+radiosonde cost and gradient coverage" as open, alongside "Report
+missing archive cycles". Re-checked each against what was actually
+implemented, rather than assuming the automated review was either
+right or stale:
+
+- **Raobs gates with both masks**: re-read against the actual diff --
+  `install_raobs_bg_used`, the `'raobs_bg_check_live'` variant, and the
+  parametrized Taylor/checkpointing tests are all there and passing.
+  No further gap found; likely linked in Copilot's own judgment to the
+  next item, which did have a real one.
+- **Independent radiosonde cost and gradient coverage**: this one
+  *did* have a genuine remaining gap. Its "also cover q-error units/
+  table interpolation, the fractional/floored fallback" clause pointed
+  at `_build_raobs_traj`'s `default_error_q`, which is a hardcoded
+  `torch.full(..., 0.0005)` constant, never exercising the real
+  `q_error_rh_percent` table-interpolation-times-qsat mechanism.
+  Concluded this doesn't actually belong in this gradient-checking
+  file, though: the q-error value is a precomputed, static per-
+  observation weight, not a function of the control variable being
+  optimized, so there is no gradient to check -- it's already covered
+  by real unit tests (`test_default_q_error_rh_percent_times_static_
+  qsat`, etc. in `test_raobs_parquet.py`). The "fractional/floored
+  fallback" clause is stale: it refers to `RAOBS_Q_ERROR_G_KG`, the old
+  Desroziers-based mechanism removed entirely in the JEDI-only
+  simplification (`452a9db`) -- it no longer exists. The "background-
+  check acceptance/rejection with the check on and off" clause is
+  covered by the previous round's fix. No code change made here;
+  judged adequately addressed once the ask is read precisely.
+- **Report missing archive cycles**: genuinely strengthened, not just
+  re-confirmed. INFO was too passive for something meant to be
+  "detectable" -- bumped `cycle_directories`'s per-cycle log to
+  WARNING, and added an optional `skipped` list parameter (appended to
+  IN PLACE) so a caller can check programmatically instead of only
+  being able to watch logs. Threaded through `_profile_records`
+  (which now returns `(records, skipped_padding_cycles)` instead of
+  just `records`) into `load_raobs_parquet`'s own result dict
+  (`result['skipped_padding_cycles']`) -- empty unless `use_drift_time`
+  actually needed to widen partition discovery AND at least one of
+  those extra cycles was missing. `load_raobs_parquet` also logs one
+  aggregate WARNING summary when non-empty, in addition to
+  `cycle_directories`'s own per-cycle line (easy to miss a single line
+  among several if multiple cycles are missing at once). New test
+  `test_use_drift_time_reports_a_genuinely_missing_padding_cycle`:
+  writes only the 00Z cycle directory, confirms both padding-margin
+  cycles the widening reaches for (18Z the day before AND 06Z the same
+  day -- the margin pads both sides, not just one, confirmed by
+  running the test before assuming the geometry) show up in
+  `skipped_padding_cycles`. Mutation-tested (removed the `skipped.
+  append` call, confirmed the test fails) and restored.
+
+`make check`: 326 passed (up from 325), same 12 pre-existing unrelated
+failures. `make check-ace2`: passed.

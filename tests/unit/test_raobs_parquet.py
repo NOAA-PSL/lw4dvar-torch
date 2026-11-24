@@ -659,6 +659,23 @@ def test_use_drift_time_widens_partition_discovery_for_a_boundary_report(tmp_pat
     assert data['mask_t'][0][0, 0]
 
 
+def test_use_drift_time_reports_a_genuinely_missing_padding_cycle(tmp_path):
+    # Same widened-margin geometry as the test above (00Z's own 3h
+    # tolerance widens by use_drift_time's own extra margin on BOTH
+    # sides -- to the 18Z cycle the day before AND the 06Z cycle the
+    # same day), but this time neither padding directory is written at
+    # all -- a genuine gap, not a report that happens to need one of
+    # them. cycle_directories's allow_missing=True must still not
+    # raise, but the gap must be programmatically detectable, not just
+    # silently absorbed (PR #29's review, follow-up: a log line alone is
+    # still only as loud as whoever is watching logs).
+    t0 = datetime(2015, 1, 1, 0)
+    write_cycle(tmp_path, t0, [], [])  # only the 00Z cycle directory exists
+    data = load(tmp_path, [t0], {'t': [850.]}, ['t'], use_drift_time=True)
+    skipped = {(p.parent.name, p.name) for p in data['skipped_padding_cycles']}
+    assert skipped == {('2014-12-31', '18'), ('2015-01-01', '06')}
+
+
 def test_use_drift_time_anchors_to_cycle_time_not_report_time(tmp_path):
     # HRDR ('drift_time_hours') is cycle-relative, the SAME referent as
     # the report's own DHR -- a per-level REPLACEMENT for the report's
