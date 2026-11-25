@@ -351,10 +351,11 @@ _RAOBS_CONFIG_KEYS = {
 }
 # observations.<sensor> keys for every MW_SENSORS sensor, flattened to <sensor>_<key>
 _MW_CONFIG_KEYS = (
-    'path', 'bundle', 'assimilate_channels', 'monitor_channels', 'sigma_o_scale', 'sigma_o', 'bg_check', 'sat_alias',
+    'path', 'bundle', 'assimilate_channels', 'monitor_channels', 'monitor_only', 'sigma_o_scale', 'sigma_o', 'bg_check', 'sat_alias',
     'huber_c', 'water_frac_min', 'clw_max', 'lsm_max', 'detach_q_above_hpa', 'time_tolerance_hours',
     'capacity', 'scenes', 'emis_control', 'emis_channels', 'z_learn_rate', 'oberr_model', 'oberr_table',
-    'cloud_max', 'window_state_scenes', 'corr_r', 'corr_cond_max', 'corr_r_window', 'corr_r_masked',
+    'cloud_max', 'window_state_scenes', 'corr_r', 'corr_cond_max', 'corr_r_window', 'corr_r_masked', 'extra_bc', 'scene_bc',
+    'channel_scenes', 'detach_q_channels', 'si_screen',
 )
 
 
@@ -1393,9 +1394,10 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
             cache[date_str] = pd.read_parquet(f) if os.path.exists(f) else None
         return cache[date_str]
 
-    slots = []
+    slots, slot_days = [], []
     vdate = copy.copy(exp['date'])
     for j in range(n_obs):
+        slot_days.append(get_YYYYMMDDHH(vdate)[:8])
         parts = []
         for h in (-6, 0, 6):
             d = read_cycle(add_hours(vdate, h))
@@ -1443,7 +1445,10 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
         'withheld': torch.zeros((n_obs, capacity), dtype=torch.bool, device=device),
         'scene': torch.full((n_obs, capacity), -1, dtype=torch.int8, device=device),
     }
-    for name in _ATMS_OBS_INPUTS:
+    # cloud-aware decoders (H2, 2026-11-22) also take the obs's own clw retrieval; the operator clips it to [0, 3]
+    obs_inputs = _ATMS_OBS_INPUTS + (('clw_obs',) if 'clw_obs' in op.input_features else ())
+    atms_traj['obs_inputs'] = obs_inputs
+    for name in obs_inputs:
         atms_traj['obs_'+name] = torch.zeros((n_obs, capacity), **f32)
     ycols = [f'yobc_{c:02d}' for c in range(1, nch + 1)]
     for j, d in enumerate(slots):
@@ -1454,27 +1459,130 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
         atms_traj['valid'][j, :n] = True
         atms_traj['withheld'][j, :n] = torch.as_tensor(d['withheld'].to_numpy(copy=True), device=device)
         atms_traj['scene'][j, :n] = torch.as_tensor(d['scene'].to_numpy(copy=True), dtype=torch.int8, device=device)
-        for name in _ATMS_OBS_INPUTS:
+        for name in obs_inputs:
             atms_traj['obs_'+name][j, :n] = torch.as_tensor(d[name].to_numpy(copy=True), **f32)
+    if cfg('extra_bc'):
+        # decoder-bias table (a37tmp/strat_drift/make_extra_bc.py): y_o - BC - b(channel, lat band, day), with b the
+        # decoder's mean (y_o - BC) - H(x_ERA5); only the table's channels change
+        import json
+        with open(cfg('extra_bc')) as fh:
+            xb = json.load(fh)
+        k = 0
+        for j, day in enumerate(slot_days):
+            n = int(counts[j])
+            if n == 0:
+                continue
+            k = min(range(len(xb['days'])), key=lambda i: abs((datetime.strptime(xb['days'][i], '%Y%m%d')
+                                                              - datetime.strptime(day, '%Y%m%d')).days))
+            lat = atms_traj['lat'][j, :n]
+            for ib, (lo, hi) in enumerate(xb['bands']):
+                m = (lat >= lo) & ((lat < hi) | (hi >= 90))
+                for jc, c in enumerate(xb['channels']):
+                    atms_traj['y'][j, :n, c - 1] -= m.float() * float(xb['bc'][k][ib][jc])
+        logger.info(f"{sensor} extra_bc {cfg('extra_bc')}: channels {xb['channels']}, day "
+                    f"{xb['days'][k]} band biases {[round(b[0], 2) for b in xb['bc'][k]]} (ch {xb['channels'][0]})")
+    if cfg('scene_bc'):
+        # static per-scene decoder bias (scene_bc.py, fitted on 2015-16 ERA5 pairs by a37tmp/scene_bc/fit_scene_bc.py):
+        # y - b(scene, channel; clw_obs, scattering index, scan, latitude x season, satellite); obs-file predictors only
+        import scene_bc as sbc
+        tab = sbc.load(cfg('scene_bc'))
+        if tab['sensor'] != sensor or tab['beta'].shape[1] != nch:
+            raise ValueError(f"{sensor} scene_bc {cfg('scene_bc')}: table is for {tab['sensor']} with {tab['beta'].shape[1]} channels")
+        if tab.get('target', 'obsbc') != 'obsbc':
+            raise ValueError(f"{sensor} scene_bc: target {tab.get('target')} needs raw y, but the obs files hold y - BC (yobc_*)")
+        sums = np.zeros((len(sbc.SCENES), nch)); cnt = np.zeros(len(sbc.SCENES))
+        for j, d in enumerate(slots):
+            n = len(d)
+            if n == 0:
+                continue
+            clw = d['clw_obs'].to_numpy(np.float64) if 'clw_obs' in d else np.zeros(n)
+            sc = sbc.scene_codes(d['water_frac'].to_numpy(), d['ice_frac'].to_numpy(), d['snow_frac'].to_numpy(),
+                                 np.nan_to_num(clw, nan=0.0))
+            doy = datetime.strptime(slot_days[j], '%Y%m%d').timetuple().tm_yday
+            P = sbc.predictors(sensor, d['lat'].to_numpy(), d['Scan_Angle'].to_numpy(), d['sat_id'].to_numpy(),
+                               np.full(n, doy), clw=clw,
+                               tb89=d['yobc_16'].to_numpy() if sensor == 'atms' else None,
+                               tb165=d['yobc_17'].to_numpy() if sensor == 'atms' else None, opts=tab['options'])
+            b = sbc.apply(tab, sc, P)
+            atms_traj['y'][j, :n] -= torch.as_tensor(b, **f32)
+            for kk in range(len(sbc.SCENES)):
+                m = sc == kk
+                sums[kk] += b[m].sum(0); cnt[kk] += m.sum()
+        mb = sums / np.maximum(cnt, 1)[:, None]
+        logger.info(f"{sensor} scene_bc {cfg('scene_bc')}: mean bias removed (ch 5/6/7 or first 3) by scene "
+                    + ', '.join(f"{sn} {np.round(mb[kk, 4:7] if nch >= 7 else mb[kk, :3], 3).tolist()} (n {int(cnt[kk])})"
+                                for kk, sn in enumerate(sbc.SCENES)))
+
+    if cfg('si_screen'):
+        # scattering screen (2026-11-23, H2is): drop the listed channels where the observed scattering index
+        # SI = Tb(89 GHz, ch16) - Tb(165 GHz, ch17) >= si_max (deep convection: ice scattering cools 183 GHz and ATMS 5-7,
+        # which the decoder reads as humidity / warmth), equatorward of lat_max and in the listed scenes (snow and sea ice
+        # scatter too, with the opposite O-B sign, and are left alone). y := NaN, so the bg check rejects those channels.
+        ss = cfg('si_screen')
+        si_max, lat_max = float(ss.get('si_max', 10.0)), float(ss.get('lat_max', 50.0))
+        sc_ok = [ATMS_SCENES.index(x) for x in ss.get('scenes', ['ocean_clear', 'ocean_cloudy', 'land'])]
+        chi = [c - 1 for c in ss.get('channels', [5, 6, 7, 18, 19, 20, 21, 22])]
+        nscr = ntot = 0
+        for j, d in enumerate(slots):
+            n = len(d)
+            if n == 0:
+                continue
+            si = d['yobc_16'].to_numpy(np.float64) - d['yobc_17'].to_numpy(np.float64)
+            m = (np.nan_to_num(si, nan=-1e9) >= si_max) & (np.abs(d['lat'].to_numpy()) < lat_max) & np.isin(d['scene'].to_numpy(), sc_ok)
+            if m.any():
+                rows = torch.as_tensor(np.flatnonzero(m), device=atms_traj['y'].device)
+                for c in chi:
+                    atms_traj['y'][j, rows, c] = float('nan')
+            nscr += int(m.sum()); ntot += n
+        logger.info(f"{sensor} si_screen: SI >= {si_max} K, |lat| < {lat_max}, scenes {[ATMS_SCENES[k] for k in sc_ok]}: "
+                    f"channels {[c + 1 for c in chi]} removed for {nscr} of {ntot} obs ({100 * nscr / max(ntot, 1):.2f}%)")
 
     # model levels -> the operator's level order (top -> bottom); q is
     # detached (no Jo gradient) above atms_detach_q_above_hpa, where the
     # decoder's q sensitivity is a learned proxy, not physics
-    t_levels = [float(p) for p in model.pressure_levels('t')]
-    q_levels = [float(p) for p in model.pressure_levels('q')]
+    if getattr(op, 'layered', False):
+        # L3 decoders on D3 layers (2026-11-20): t/q straight from the model's layer families, pmid from sp and ak/bk;
+        # q detached above detach_q_above_hpa by the layer's nominal mid pressure (sp = 1000 hPa)
+        if not hasattr(model, '_layer_cols') or 't_ml' not in model._layer_cols:
+            raise ValueError(f'{sensor} bundle is on model layers (d3_layers) but the model has no layer families')
+        nl = len(model._layer_cols['t_ml'])
+        if max(op.t_layers + op.q_layers) >= nl or len(model._ak) != 38:
+            raise ValueError(f'{sensor} layer bundle needs the D3 37-layer model (model has {nl} layers)')
+        atms_traj['layered'] = True
+        atms_traj['t_order'], atms_traj['q_order'] = list(op.t_layers), list(op.q_layers)
+        ak, bk = model._ak.double(), model._bk.double()
+        atms_traj['ak_mid'] = (0.5 * (ak[1:] + ak[:-1])).float().to(device)
+        atms_traj['bk_mid'] = (0.5 * (bk[1:] + bk[:-1])).float().to(device)
+        p_nom = (atms_traj['ak_mid'] + atms_traj['bk_mid'] * 1.0e5) / 100.0
+        detach_above = cfg('detach_q_above_hpa', 250.)
+        atms_traj['q_detach'] = torch.as_tensor([float(p_nom[k]) < detach_above for k in op.q_layers], device=device)
+        missing = [k for k in op.surface_inputs.values() if _ATMS_OPERATOR_FIELDS[k] not in model._single_by_base]
+        if missing:
+            raise ValueError(f"{sensor} decoder needs model fields {missing} that this checkpoint doesn't have")
+    t_levels = [] if getattr(op, 'layered', False) else [float(p) for p in model.pressure_levels('t')]
+    q_levels = [] if getattr(op, 'layered', False) else [float(p) for p in model.pressure_levels('q')]
     # the operator fills the levels above the model's top q level (Bo's 10 hPa;
     # A1/A2's 1-50 hPa, diagnostic there) with its mean
     op_q_levels = [p for p in op.q_levels_hpa if p in q_levels]
-    if op_q_levels != op.q_levels_hpa[len(op.q_levels_hpa) - len(op_q_levels):]:
+    if not getattr(op, 'layered', False) and op_q_levels != op.q_levels_hpa[len(op.q_levels_hpa) - len(op_q_levels):]:
         raise ValueError(f"model q levels {q_levels} miss operator q levels below the top: {op.q_levels_hpa}")
     missing = [k for k in op.surface_inputs.values() if _ATMS_OPERATOR_FIELDS[k] not in model._single_by_base]
     if missing:
         raise ValueError(f"{sensor} decoder needs model fields {missing} that this checkpoint doesn't have")
-    atms_traj['t_order'] = [t_levels.index(p) for p in op.t_levels_hpa]
-    atms_traj['q_order'] = [q_levels.index(p) for p in op_q_levels]
-    detach_above = cfg('detach_q_above_hpa', 250.)
-    atms_traj['q_detach'] = torch.as_tensor([p < detach_above for p in op_q_levels], device=device)
+    if not getattr(op, 'layered', False):
+        atms_traj['t_order'] = [t_levels.index(p) for p in op.t_levels_hpa]
+        atms_traj['q_order'] = [q_levels.index(p) for p in op_q_levels]
+        detach_above = cfg('detach_q_above_hpa', 250.)
+        atms_traj['q_detach'] = torch.as_tensor([p < detach_above for p in op_q_levels], device=device)
 
+    # detach_q_channels (2026-11-23, H2b): channels whose decoder output is differentiated w.r.t. everything but q (the
+    # decoder's q inputs), so they constrain T only; values unchanged. For ATMS 6-7, whose CRTM q-Jacobian is ~1e-3 K
+    # while the decoder's is 2-8x too large.
+    dq = list(cfg('detach_q_channels', []) or [])
+    if dq:
+        atms_traj['detach_q_ch'] = torch.as_tensor([c in dq for c in range(1, op.nch + 1)], device=device)
+        atms_traj['q_input_cols'] = torch.as_tensor([f.startswith('spfh-') for f in op.input_features], device=device)
+        logger.info(f"{sensor}: channels {dq} detached from q (T-only gradient)")
     defaults = _MW_DEFAULT_CHANNELS[sensor]
     assimilate = list(cfg('assimilate_channels', defaults['assimilate']))
     monitor = [c for c in cfg('monitor_channels', defaults['monitor']) if c not in assimilate]
@@ -1503,6 +1611,18 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
     ws_idx = torch.as_tensor([ATMS_SCENES.index(sc) for sc in window_state], dtype=torch.long, device=device)
     atms_traj['window_state'] = atms_traj['valid'] & torch.isin(atms_traj['scene'].long(), ws_idx)
     atms_traj['window_state_scenes'] = window_state
+    # channel_scenes {channel: [scenes]} (2026-11-20, ATMS-over-snow test): the listed channels are used (Jo, 'used')
+    # only in the listed scenes; elsewhere they stay monitored (O-B / O-A still written). Other channels: all scenes.
+    ok = torch.ones(len(ATMS_SCENES), op.sigma_o.numel(), dtype=torch.bool, device=device)
+    for c, scs in (cfg('channel_scenes') or {}).items():
+        bad = [sc for sc in scs if sc not in ATMS_SCENES]
+        if bad:
+            raise ValueError(f"observations.{sensor}.channel_scenes[{c}]: unknown scenes {bad}; known {list(ATMS_SCENES)}")
+        ok[:, int(c) - 1] = False
+        ok[[ATMS_SCENES.index(sc) for sc in scs], int(c) - 1] = True
+    atms_traj['chan_scene_ok'] = ok
+    if cfg('channel_scenes'):
+        logger.info(f"{sensor} channel_scenes: " + str({int(c): list(v) for c, v in cfg('channel_scenes').items()}))
     # per-channel overrides {channel: K} (e.g. Desroziers estimates), then the global scale
     sigma_o = op.sigma_o.clone()
     for c, v in (cfg('sigma_o') or {}).items():
@@ -1513,6 +1633,8 @@ def get_atmsobs(exp, model, logger, grid_interp, psobs_traj, sensor='atms'):
     # |d| / sigma <= huber_c, linear beyond; None = plain quadratic
     huber_c = cfg('huber_c')
     atms_traj['huber_c'] = float(huber_c) if huber_c else None
+    # monitor_only: a hold-out sensor -- read, QC'd and scored (O-B, O-A) like an assimilated one, never in J
+    atms_traj['monitor_only'] = bool(cfg('monitor_only', False))
     # channels the decoder predicts (NaN y_mean = a channel without training
     # targets, e.g. AMSU-A 14): only these enter the finite-H(x) screen
     atms_traj['tb_ok_idx'] = torch.isfinite(op.y_mean).nonzero().flatten().tolist()
@@ -1774,18 +1896,26 @@ def _compute_atms_observation_diagnostics_at_time(model, decoded, atms_traj, gri
     op = atms_traj['op']
     idx = atms_traj['interp_idx'][oind]
     wts = atms_traj['interp_wts'][oind]
-    t = grid_interp.interp(idx, wts, decoded['t'][atms_traj['t_order']])
-    q = grid_interp.interp(idx, wts, decoded['q'][atms_traj['q_order']])
+    layered = atms_traj.get('layered', False)
+    t = grid_interp.interp(idx, wts, decoded['t_ml' if layered else 't'][atms_traj['t_order']])
+    q = grid_interp.interp(idx, wts, decoded['q_ml' if layered else 'q'][atms_traj['q_order']])
     q = torch.where(atms_traj['q_detach'][:, None], q.detach(), q)
     fields = {'t': t.float(), 'q': q.float()}
+    if layered:  # layer mid pressure (hPa) at the obs from the interpolated surface pressure
+        sp_o = grid_interp.interp(idx, wts, decoded['sp']).float()
+        fields['pmid'] = (atms_traj['ak_mid'][:, None] + atms_traj['bk_mid'][:, None] * sp_o[None]) / 100.0
     for name in op.surface_inputs.values():
         fields[name] = grid_interp.interp(idx, wts, decoded[_ATMS_OPERATOR_FIELDS[name]]).float()
-    obs = {name: atms_traj['obs_'+name][oind] for name in _ATMS_OBS_INPUTS}
+    obs = {name: atms_traj['obs_'+name][oind] for name in atms_traj.get('obs_inputs', _ATMS_OBS_INPUTS)}
     x = op.assemble(fields, obs)
     model_equivalent, _, log_sig = op(x, z)
     if z is None and atms_traj.get('zeta_eval') is not None:
         z = _atms_z(atms_traj, atms_traj['zeta_eval'], oind, log_sig)
         model_equivalent, _, _ = op(x, z)
+    if atms_traj.get('detach_q_ch') is not None and model_equivalent.requires_grad:
+        x_nq = torch.where(atms_traj['q_input_cols'], x.detach(), x)   # same values, no gradient through q
+        me_nq, _, _ = op(x_nq, z)
+        model_equivalent = torch.where(atms_traj['detach_q_ch'], me_nq, model_equivalent)
     innovation = atms_traj['y'][oind] - model_equivalent
 
     ocean = (atms_traj['scene'][oind] == 0) | (atms_traj['scene'][oind] == 4)
@@ -1797,6 +1927,8 @@ def _compute_atms_observation_diagnostics_at_time(model, decoded, atms_traj, gri
         screened = screened & atms_traj['cloud_ok'][oind]
     passed = (innovation.abs() <= atms_traj['bg_check'] * sigma).detach()
     used = screened[:, None] & passed & ~atms_traj['withheld'][oind][:, None]
+    if atms_traj.get('chan_scene_ok') is not None:
+        used = used & atms_traj['chan_scene_ok'][atms_traj['scene'][oind].long().clamp(min=0)]
     if return_inputs:
         return innovation, model_equivalent, screened, used, (x, log_sig)
     return innovation, model_equivalent, screened, used
@@ -2943,6 +3075,8 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         logger.info(f"weak constraint: {len(wc_hours)} model-error jumps at window hours {wc_hours}, "
                     f"lr {groups[-1]['lr']}, weight_decay {groups[-1]['weight_decay']} "
                     f"(window-start increment: lr {lr}, weight_decay {wd})")
+    # sensors in J: all but the monitor_only hold-outs (those are only evaluated in save_trajectory_diagnostics)
+    mw_loss = [m for m in (mw_trajs or []) if not m.get('monitor_only')] or None
     zeta_groups = []  # optimizer group indices of the zeta controls
     zeta = {}  # sensor -> per-ob emissivity control, one optimizer group each
     for mw_traj in mw_trajs or []:
@@ -3112,7 +3246,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
             wc = {'step_index': {s: k for k, s in enumerate(wc_steps)}, 'forcing': to_q(eta) / latent_scale,
                   'keep_mask': keep_mask, 'hydrostatic_z': bool(exp.get('hydrostatic_z'))}
         loss, all_loss = compute_loss_4dvar(model, to_b(increment), latent_scale, input_encoded, verif_ic, psobs_traj, epoch, exp, grid_interp, print_every, interp_specs, keep_mask, ref_state1, jc_ref, raobs_traj,
-                                            mw_trajs=mw_trajs, wc=wc)
+                                            mw_trajs=mw_loss, wc=wc)
         Jb = Jq = None
         if prior:
             Jb = (increment ** 2).sum()

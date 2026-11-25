@@ -79,6 +79,15 @@ def main():
         "sigma_o": torch.tensor(meta["sigma_o"], dtype=torch.float32),
         "channel_sets": CHANNEL_SETS[a.sensor],
     }
+    if any(f.startswith("pmid-") for f in fin):
+        # L3 decoders (2026-11-20): inputs on D3 model layers (k = layer index 00 top .. 36 bottom) plus the layer mid
+        # pressure pmid-k; the hPa labels above do not apply. AtmsOperator has no layer path yet, so no operator check.
+        bundle.update(vertical="d3_layers", t_layers=t_idx, q_layers=q_idx, t_levels_hpa=None, q_levels_hpa=None,
+                      p_layers=sorted(int(f[5:]) for f in fin if f.startswith("pmid-")))
+        torch.save(bundle, a.out)
+        print(f"wrote {a.out}: {a.sensor}, {nch} channels, {len(fin)} inputs (D3 layers), hidden {hidden}, K {model.K}; "
+              "operator check skipped: AtmsOperator has no layer inputs yet")
+        return
     torch.save(bundle, a.out)
     print(f"wrote {a.out}: {a.sensor}, {nch} channels, {len(fin)} inputs, hidden {hidden}, K {model.K}, {bundle['source']}")
 
@@ -88,7 +97,7 @@ def main():
     fields = {"t": torch.stack([col(f"tmp-{k}") for k in t_idx]),
               "q": torch.stack([col(f"spfh-{k}") for k in q_idx])}
     fields.update({k: col(c) for k, c in SURFACE.items() if c in fin})
-    x = op.assemble(fields, {c: col(c) for c in OBS})
+    x = op.assemble(fields, {c: col(c) for c in OBS + (("clw_obs",) if "clw_obs" in op.input_features else ())})
     raw = torch.tensor(d[fin].to_numpy(np.float32))
     print(f"{a.check}: {len(d)} obs; assemble vs file inputs max |diff| {float((x - raw).abs().max()):.3g}")
     has_target = torch.isfinite(bundle["y_mean"])

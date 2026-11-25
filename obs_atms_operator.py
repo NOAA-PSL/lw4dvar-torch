@@ -81,8 +81,16 @@ class AtmsOperator(torch.nn.Module):
         self.nch = int(bundle.get("nch", NCH))
         self.input_features = list(bundle["input_features"])
         self.n_sat = sum(f.startswith("sat-") for f in self.input_features)
-        self.t_levels_hpa = [float(p) for p in bundle["t_levels_hpa"]]
-        self.q_levels_hpa = [float(p) for p in bundle["q_levels_hpa"]]
+        # L3 decoders (2026-11-20, bundle["vertical"] == "d3_layers"): inputs on model layers (tmp-k, spfh-k, pmid-k,
+        # k = layer index) instead of pressure levels; the caller passes layer fields and the layer mid pressure
+        self.layered = bundle.get("vertical") == "d3_layers"
+        if self.layered:
+            self.t_layers = [int(k) for k in bundle["t_layers"]]
+            self.q_layers = [int(k) for k in bundle["q_layers"]]
+            self.t_levels_hpa, self.q_levels_hpa = [], []
+        else:
+            self.t_levels_hpa = [float(p) for p in bundle["t_levels_hpa"]]
+            self.q_levels_hpa = [float(p) for p in bundle["q_levels_hpa"]]
         # level k's feature suffix (tmp-<i>, above-<i>, spfh-<i>), top -> bottom: i = k for Bo's 14 levels and A1's
         # 37, an index into the 37 ERA5 levels when a decoder takes only some of them (A2: i = 5..36)
         self._t_ids = sorted(int(f[4:]) for f in self.input_features if f.startswith("tmp-"))
@@ -113,6 +121,8 @@ class AtmsOperator(torch.nn.Module):
     def assemble(self, fields, obs):
         """Stack the decoder inputs, in `input_features` order, physical units -> (n_obs, n_in)."""
         t, q, sp = fields["t"], fields["q"], fields["sp"]
+        if self.layered:
+            return self._assemble_layers(fields, obs)
         if t.shape[0] != len(self.t_levels_hpa):
             raise ValueError(f"t has {t.shape[0]} levels, expected {len(self.t_levels_hpa)} ({self.t_levels_hpa})")
         n_obs = sp.shape[0]
@@ -137,6 +147,36 @@ class AtmsOperator(torch.nn.Module):
         for name, default in _OBS_DEFAULT.items():
             v = obs.get(name, default)
             cols[name] = torch.as_tensor(v, dtype=t.dtype, device=t.device).expand(n_obs)
+        if "clw_obs" in self.input_features:   # optional obs-side input (cloud-aware decoders); clipped in forward()
+            cols["clw_obs"] = torch.as_tensor(obs["clw_obs"], dtype=t.dtype, device=t.device)
+        for k in range(self.n_sat):
+            cols[f"sat-{k}"] = (cols["sat_id"] == k).to(t.dtype)
+        return torch.stack([cols[f] for f in self.input_features], 1)
+
+    def _assemble_layers(self, fields, obs):
+        """Layer-input decoders: fields t (len(t_layers), n_obs), q (len(q_layers), n_obs), pmid (n_layers, n_obs, hPa,
+        indexed by layer), surface fields; same column conventions as assemble()."""
+        t, q, pmid = fields["t"], fields["q"], fields["pmid"]
+        if t.shape[0] != len(self.t_layers) or q.shape[0] != len(self.q_layers):
+            raise ValueError(f"t/q have {t.shape[0]}/{q.shape[0]} layers, expected {len(self.t_layers)}/{len(self.q_layers)}")
+        n_obs = t.shape[1]
+        cols = {}
+        for i, k in enumerate(self.t_layers):
+            cols[f"tmp-{k}"] = t[i]
+        for i, k in enumerate(self.q_layers):
+            cols[f"spfh-{k}"] = q[i]
+        for f in self.input_features:
+            if f.startswith("pmid-"):
+                cols[f] = pmid[int(f[5:])].to(t.dtype)
+        for name, key in self.surface_inputs.items():
+            cols[name] = fields[key]
+        for name in _OBS:
+            cols[name] = torch.as_tensor(obs[name], dtype=t.dtype, device=t.device)
+        for name, default in _OBS_DEFAULT.items():
+            v = obs.get(name, default)
+            cols[name] = torch.as_tensor(v, dtype=t.dtype, device=t.device).expand(n_obs)
+        if "clw_obs" in self.input_features:   # optional obs-side input (cloud-aware decoders); clipped in forward()
+            cols["clw_obs"] = torch.as_tensor(obs["clw_obs"], dtype=t.dtype, device=t.device)
         for k in range(self.n_sat):
             cols[f"sat-{k}"] = (cols["sat_id"] == k).to(t.dtype)
         return torch.stack([cols[f] for f in self.input_features], 1)
@@ -144,6 +184,10 @@ class AtmsOperator(torch.nn.Module):
     def forward(self, x, z=None):
         """x: (n_obs, n_in) physical units; z: (n_obs, K) or None (= 0).
         Returns Tb (n_obs, nch) in K, e_hat (n_obs, nch), log sigma_k (n_obs, K)."""
+        if "clw_obs" in self.input_features:   # obs-side cloud input (H2 decoders): clip as in training (1000 missing flag)
+            m = torch.zeros(x.shape[1], dtype=torch.bool, device=x.device)
+            m[self.input_features.index("clw_obs")] = True
+            x = torch.where(m, x.clamp(0.0, 3.0), x)
         xn = (x - self.x_mean) / self.x_std
         o = self.P(xn)
         e_hat = o[:, :self.nch] * self.e_sd + self.e_mu

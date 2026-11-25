@@ -38,7 +38,7 @@ from obs_atms_operator import AtmsOperator  # noqa: E402
 PRE = os.environ.get('PRE', '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/data/era5_pre_2015')
 BUNDLE = os.environ.get('BUNDLE', '/scratch4/BMC/gsienkf/Sergey.Frolov/atms/outputs/bo_twohead_s1/atms_twohead_bo_s1.pt')
 QFILL = [n for n in os.environ.get('QFILL', 'spfh-1').split(',') if n]
-OUT = 'figures/atms_oberr'
+OUT = os.environ.get('OUTDIR', 'figures/atms_oberr')
 NCYC = int(sys.argv[1]) if len(sys.argv) > 1 else 60
 TABLE = sys.argv[2] if len(sys.argv) > 2 else 'oberr_table.json'
 WINDOW = [1, 2, 3, 4, 16, 17] if os.environ.get('WINDOW') == '1' else []
