@@ -1,0 +1,53 @@
+exp:
+  # Stage 0 E2 (eagle/long-window/PLAN_levels_norm_capacity.md): fake-cycled free run, a2
+  model_backend: aifs
+  free_rollout: True
+  nhrs_back: 48
+  restart: False
+  rpath: './output/fr_a2/'
+  observations:
+    psobs:
+      path: '/scratch4/BMC/gsienkf/Sergey.Frolov/obs/prepbufr_to_parquet/data/prepbufr_parquet'
+      nobs_max: 15000
+      use_source_error: True
+    raobs:
+      enabled: False
+  ic_suffix: '6h_100it'
+  sdate: '2015-01-01T00'
+  n_init: 180
+  dt_init: 12
+  save_levs: [1000,925,850,700,500,300,250,100,50,10]
+  cycle: True
+  exp_name: 'fr_a2'
+  aifs37: True
+  model_name: 'inference-anemoi-by_epoch-epoch_065-step_260000.ckpt'
+  path_model: '/scratch4/BMC/gsienkf/Sergey.Frolov/eagle/long-window/EAGLE/run/aifs37-a2/training/outputs/checkpoint/4c9f9efb22fd4fdf960fb51876945282/'
+  aifs_config: 'backends/aifs/aifs_inference_aifs37.yaml'
+  ic_cache: './output/fr_a2/ic_cache_unused/'
+  reset_ocean_vars: [siconc]
+  device: 'cuda'
+  path_output: './output/'
+  print_every: 10
+  oberrstart: -1
+  oberrdeltaperday: 0
+  control_variables: [u, v, t, z, q, sp, msl, 2t, 2d, 10u, 10v, tcw]
+  checkpoint_stride: 0
+  aifs_attention: 'flex_sliding_window'
+  reset_skt_ocean: True
+  skt_ocean_lsm_threshold: 0.5
+
+windows:
+  '5':
+    n_verif: 1
+    dt_verif: 6
+    dt_obs: 6
+    learn_rate: 2.0e-3
+    weight_decay: 1.0e-3
+    max_epoch: 100
+    warmup_steps: 10
+    start_factor: 0.1
+    end_factor: 0.1
+    bg_check: 4.
+    zthresh: 500.
+    zconst: 0.003
+    suffix: ''
