@@ -83,7 +83,17 @@ def to_pressure_levels(
     lo = (k - 1).clamp(0, nlay - 1)
     hi = k.clamp(0, nlay - 1)
     x_lo, x_hi = torch.gather(lnp_mid, 0, lo), torch.gather(lnp_mid, 0, hi)
-    w = torch.where(hi > lo, (lnp_t - x_lo) / (x_hi - x_lo), torch.zeros_like(lnp_t))
+    # hi == lo (target at/below the lowest or at/above the highest
+    # mid-level) makes (x_hi - x_lo) == 0 -- torch.where's forward value
+    # correctly discards that branch, but autograd still backprops through
+    # BOTH branches, so the 0/0 NaN in the discarded one poisons the
+    # gradient of the whole expression whenever this is differentiated
+    # (same issue fixed in ace2_model.py's own copy of this derivation --
+    # see that fix's docstring for how it was found). Substituting a safe
+    # nonzero denominator in the discarded branch keeps that branch finite
+    # everywhere, so no NaN ever enters the graph.
+    safe_denom = torch.where(hi > lo, x_hi - x_lo, torch.ones_like(x_hi))
+    w = torch.where(hi > lo, (lnp_t - x_lo) / safe_denom, torch.zeros_like(lnp_t))
 
     def interp(f):
         return (1 - w) * torch.gather(f, 0, lo) + w * torch.gather(f, 0, hi)

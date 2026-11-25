@@ -80,9 +80,11 @@ network access, in a few seconds. `make check` runs:
   16-layer CRTM+land variables, SFNO embed_dim 64) on CPU, one 24 h window of
   ps obs (synthetic parquet psobs, see "Fixtures" below), 50 epochs through
   `src/long_window_4dvar.py`. Checks that it runs, writes its outputs, that
-  the cost falls by at least 40% (observed 55%), and that its outputs match
+  the cost falls by at least 40% (observed 47%), and that its outputs match
   the golden summary (below); not analysis quality (the model is far too
-  small). About a minute and a half of compute, pinned to one thread. Needs
+  small). About a minute and a half of compute, pinned to one thread and to
+  AVX2 code paths (`mini_ace2.ISA_ENV`), so every runner CPU gives the same
+  numbers. Needs
   fme and pyarrow: `pip install -r envs/requirements-ci-ace2.txt`. The run,
   its config and its summary are in `tests/ace2/mini_ace2.py`.
 
@@ -134,7 +136,10 @@ comparator and the mini-ACE2 tolerance routing have their own unit tests
   per quantity (`mini_ace2.tolerance`), set from running at 1 and at 4
   threads: everything from the background is bit-identical or within 1e-5,
   the cost agrees to ~5e-6 for the first epochs, and the minimization then
-  amplifies fp32 rounding to ~2e-3 by epoch 50. So the background, QC and
+  amplifies fp32 rounding to ~2e-3 by epoch 50. Different instruction sets
+  (AVX2 vs AVX-512) differ by more than that (background Jo ~1.6e-5), so the
+  run is pinned to AVX2: an AVX-512 machine then reproduces an AVX2-only
+  one exactly, and the golden file can be regenerated on either. So the background, QC and
   the first five epochs are checked tightly (1e-5 / 1e-4), later epochs
   and the analysis to 1e-2. Checked against planted changes: `bg_check`
   4 -> 3.5 moves 76 values (first-epoch Jo by 4-14%), `jc_ps_weight`

@@ -1,370 +1,237 @@
-# Parquet observations, starting with surface pressure (ps)
+# Parquet observations: surface pressure (ps) and radiosondes (raobs)
 
-Currently covers one observation type -- surface pressure, read from a
-normalized PREPBUFR parquet archive -- but the config schema and the
-`exp.observations` loading mechanism (see "Config schema" below) are the
-same ones a future parquet-backed observation type (radiosondes, aircraft,
-AMV, GPSRO, ...) would extend, which is why this doc is named for the
-general case rather than just `psobs`.
+Covers two observation types read from the same normalized PREPBUFR parquet
+archive -- surface pressure and radiosonde (temperature/wind/humidity)
+profiles. The config schema and the `exp.observations` loading mechanism
+(see "Config schema" below) are the same ones a future parquet-backed
+observation type (aircraft, AMV, GPSRO, ...) would extend.
 
-Read this when working on: the ps-obs parquet reader (`src/psobs_parquet.py`,
-`src/prepbufr_parquet_common.py`), `get_psobs`, the `exp.observations.psobs.*`
-config schema (or adding a new observation type to `exp.observations`), the
-mini-ACE2 CI fixture's synthetic obs, or the `pyarrow` dependency this
-introduces.
+Read this when working on: the ps-obs parquet reader (`src/psobs_parquet.py`),
+the radiosonde (raobs) parquet reader (`src/raobs_parquet.py`), their shared
+`src/prepbufr_parquet_common.py`, `get_psobs`/`get_raobs`, the
+`exp.observations.psobs.*`/`exp.observations.raobs.*` config schema (or
+adding a new observation type to `exp.observations`), the mini-ACE2 CI
+fixture's synthetic obs, or the `pyarrow` dependency this introduces.
 
-## Status: parquet-only, ported from a sibling repo's draft (2026-11-10)
+This is a **current-state summary**, not a changelog -- it describes what's
+implemented today, not how it got there. For the detailed round-by-round
+history (every review response, every GSI-matching mechanism tried and
+later superseded by a JEDI-consistent one, every investigation that
+confirmed or disproved a specific concern), see
+`docs/integrate_multiple_parquetobs_history.md`. If the two ever disagree,
+this doc and the actual code win.
 
-`get_psobs` used to read the legacy per-hour-binned `.txt` files
-(`psobs1_<YYYYMMDDHH>.txt`, one file per `dt_obs` slot) from
-`/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs`. It now reads surface pressure
-unconditionally from a normalized, cycle-partitioned PREPBUFR parquet
-archive -- no `.txt` path left, by design (see "Why parquet-only" below).
+## Architecture
 
-The reader (`src/psobs_parquet.py`, `src/prepbufr_parquet_common.py`) is ported
-near-verbatim from a sibling working copy
-(`/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/
-add-raobs-parquet/lw4dvar-torch`, branch `add-raobs-parquet`, which also adds
-radiosonde (raobs) observations -- NOT ported here; this repo stays ps-only).
-That branch itself ports from `greg-long-window-4dvar`'s JAX/NeuralGCM
-reference implementation (`prepbufr_parquet.py`); see that repo's own
-`integrate_prepbufr_obs.md` for the full archive-layout writeup and the
-raobs design this repo doesn't need.
+Both readers pull from the same normalized, cycle-partitioned PREPBUFR
+parquet archive: `<path>/<YYYY-MM-DD>/<HH>/{reports,levels,events}/<CLASS>/
+part-00000.parquet`, Hive-partitioned by PREPBUFR class (`ADPSFC`/`SFCSHP`
+for psobs; `ADPUPA` for raobs). `reports` is one row per BUFR
+subset/report; `levels` holds each level's current (top-of-stack) values;
+`events` holds the complete PREPBUFR correction-event stack per
+(report, level) -- used only for recovering sensible temperature where
+VIRTMP was applied (see "QC check" below). Only `src/psobs_parquet.py`,
+`src/raobs_parquet.py`, and `src/prepbufr_parquet_common.py` import
+`pyarrow` (lazily), so nothing else in the solver needs it installed.
 
-## What changed
+`src/prepbufr_parquet_common.py` holds what both readers share: cycle-
+directory resolution, parquet-partition reads, station-key/quality-mark
+helpers, and `sensible_temperature` (used by raobs only). `get_psobs`/
+`get_raobs` (`src/long_window_4dvar_utils.py`) call the readers and build
+each observation type's own trajectory dict (`psobs_traj`/`raobs_traj`)
+for `compute_loss_4dvar`/`compute_optimal`.
 
-- **New files** (`src/`, only these import `pyarrow`, lazily):
-  `src/prepbufr_parquet_common.py` (cycle-directory resolution, parquet-partition
-  reads, station-key/QC helpers) and `src/psobs_parquet.py`
-  (`load_psobs_parquet`: join `reports`/`levels` on `report_id` per 6-hourly
-  cycle directory, keep `level_index == 0`, PREPBUFR-quality-mark QC,
-  ADPSFC/SFCSHP class de-duplication by quality-then-report-type preference,
-  plus a single-nearest-report-per-station-per-slot collapse so one slot
-  gets at most one observation per station -- matching what the legacy
-  per-hour `.txt` files actually contained; the archive otherwise keeps
-  every report within `time_tolerance_hours`, which would inflate counts
-  2-6x at a 6h-spaced, 3h-tolerance slot).
-- **`get_psobs`** (`src/long_window_4dvar_utils.py`): calls `load_psobs_parquet`
-  directly in place of the old `psobs1_<YYYYMMDDHH>.txt` read; everything
-  downstream (padding to `nobs_max`, `oberrstart`/`oberrdeltaperday`,
-  `step_lo`/`alpha` time-bracketing, k-NN `grid_interp` precompute) is
-  unchanged. `nobs_max`, if present in the config, is still an upper bound
-  -- `get_psobs` now raises `ValueError` instead of silently growing past it
-  (the old reader scanned every file first to compute the true max; the
-  parquet reader already has every slot's count in hand from one pass).
-- **Config schema**: observation settings live under a new
-  `exp.observations` block, one sub-block per observation type --
-  `exp.observations.psobs` for now. `load_config` resolves it into the same
-  flat internal keys `get_psobs` already read (`obspath`, `nobs_max`, etc.)
-  via `_resolve_observations_config`; see "Config schema" below for the
-  mechanism and how a future observation type extends it.
-  `observations.psobs.path` is required and means the parquet archive ROOT
-  (`<path>/<YYYY-MM-DD>/<HH>/{reports,levels}/<CLASS>/part-00000.parquet`),
-  not a `.txt` directory. All other `observations.psobs` keys are optional
-  (documented in `configs/config.yml.template`): `time_tolerance_hours` (default
-  `0.5`) and `quality_mark_max` (default `4`) match the legacy `psobs1_*.txt`
-  archive's actual generator (`/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs/
-  read_ps_prepbufr1.py`: `halfwindow = 1800` seconds, `psqm <= 4`) -- found
-  2026-11-11 while setting up a txt-vs-parquet cycling comparison; until then
-  both defaults (`dt_obs/2`, `3`) were never actually derived from this
-  archive, just carried over from the ported reference repo's own
-  (unrelated) defaults. `prepbufr_classes` (default `ADPSFC`, `SFCSHP`),
-  `report_types` (default `180, 181, 187` -- confirmed empirically to
-  match the legacy `.txt` network: counting obtype codes across a full day
-  of those files gives exactly `{181: 4208, 187: 3584, 180: 1317, 120: 3}`,
-  i.e. ADPSFC fixed-land/mesonet and SFCSHP ship/buoy, with 3 stray ADPUPA
-  rows as noise; the archive also carries 183/281/282/284/287 for the same
-  two classes, excluded by default since that's a network *expansion*, not
-  a like-for-like repeat), `error_std_hpa`
-  (default 1.0 hPa, matching the legacy files' constant assigned error),
-  `use_source_error` (default `False`), `nobs_max` (optional upper bound).
-- **`oberrstart` semantics changed for `oberrstart <= 0`** (including the
-  conventional `-1`, and the default `0` when unset): it used to mean "read
-  each report's own error from the `.txt` file's column 7"; now it means
-  "use `observations.psobs.error_std_hpa` (flat, default 1.0 hPa) unless
-  `observations.psobs.use_source_error: True`, in which case use the
-  report's own `pressure_error_mb` from the parquet archive instead."
-  **Every tracked config whose `oberrstart` was `<= 0` or unset got an
-  explicit `observations.psobs.use_source_error: True` added**, to preserve
-  its old behavior rather than silently switching it to the flat default:
-  `configs/config_test_aifs.yml`, `configs/config_test_aifs1.yml`,
-  `configs/config_test_aifs2-1.0deg-v1.0.yml`, `configs/config_test_aifs3.yml`,
-  `configs/config_test_ace2.yml`, `configs/config_test_ace2_polaris.yml`,
-  `configs/config_test_fcn3.yml`. Configs with a positive fixed `oberrstart`
-  (`configs/config_test_aurora.yml`, `configs/config_test_sfno.yml`,
-  `configs/config_test_sfno_ps.yml`) are unaffected either way, since a positive
-  `oberrstart` always overrides the file/archive value in both the old and
-  new code paths.
-- **Archive location and coverage**: every migrated `configs/config_test_*.yml`'s
-  `observations.psobs.path` now points at
-  `/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/
-  prepbufr_to_parquet/data/prepbufr_parquet` (the account's own copy;
-  confirmed group-readable at every level, including the per-cycle-hour
-  subdirectories -- see "Known blocker" below for why this matters), which
-  as of this writing covers `2015-01-01` through `2015-07-18`. Reading a
-  known cycle (`2015-01-01` 00/06/12Z) from this copy reproduces the exact
-  per-slot obs counts validated in the sibling repo's own writeup (10645,
-  10626, 10271), confirming the copy is intact. `configs/config_test_ace2_polaris.yml`
-  is a documented **TODO, not done**: Polaris has no access to any
-  `scratch4` path at all (`docs/running_at_alcf.md`), so it needs its own archive
-  copy under Eagle (`/lus/eagle/projects/moonshot-reanalysis/jwhitaker/`,
-  replacing the old `.txt` psobs dir there) before it can actually run;
-  until then its `observations.psobs.path` is a placeholder pointing at a path that doesn't
-  exist yet.
-- **Deliberately not using Sergey.Frolov's shared archive copy**
-  (`/scratch4/BMC/gsienkf/Sergey.Frolov/obs/prepbufr_to_parquet/data/
-  prepbufr_parquet/`): its per-cycle-hour directories deny this account read
-  access even though the account is in the `gsienkf` group and the
-  top-level directories list fine. Rather than chase that permissions gap,
-  this account maintains and extends its own copy (above) directly --
-  re-download/convert further dates into it as needed, the same way the
-  current `2015-01-01`-`2015-07-18` coverage was produced.
-- **`pyarrow` dependency**: added to every backend's `envs/*-requirements.txt`
-  that didn't already have it (`aifs1`, `aifs2`, `fcn3`, `aurora`, `ace2`
-  -- `aifs2-1.0deg-v1.0` and `aifs3` already had it via an unrelated
-  dependency chain), and to `envs/requirements-ci.txt` (so `envs/requirements-ci-ace2.txt`,
-  which includes it, picks it up too). Each production env needs
-  `pyarrow==25.0.1` actually installed before this will run --
-  `pip install` into the shared, not-group-writable conda envs under
-  `/scratch4/BMC/gsienkf/whitaker/conda/envs/` needs that account's
-  cooperation (or a per-account `pip install --user pyarrow`, which only
-  helps the installing account -- see the sibling repo's own
-  `integrate_prepbufr_obs.md` "What changed in this port" for how that was
-  done there).
-
-## Obs-count gap vs. the legacy `.txt` reader (found/fixed 2026-11-12)
-
-While setting up a txt-vs-parquet cycling comparison (four jobs: aifs/ace2 x
-`main`-branch-txt-reader/this-repo's-parquet-reader, all on the
-`-longcyc-obsint-1hour` configs), the parquet reader's per-cycle total
-assimilated ps obs count ran consistently **3-7% lower** than the legacy
-`.txt` reader's, with the gap concentrated in ocean-heavy regions (Tropics,
-SH) more than NH.
-
-**Root cause**: PREPBUFR writes two generic placeholder station ids that are
-NOT unique per physical platform -- `MASKSTID` (restricted/proprietary
-mesonet feeds whose true identity is masked) and `SHIP` (vessels with no
-assigned call sign). `prepbufr_parquet_common.py`'s `station_key()` treated
-any non-empty `station_id` as a real identity, so `load_psobs_parquet`'s
-per-station/per-slot nearest-report dedup (`psobs_parquet.py`, see its own
-docstring) collapsed hundreds of genuinely distinct SFCSHP reports sharing
-one of these placeholders down to effectively one per slot. Confirmed
-against the real archive: one 2015-01-01 00Z cycle alone has 2556 of 19653
-raw SFCSHP reports sharing the literal id `'MASKSTID'`, at clearly different
-lat/lon each. The legacy generator
-(`/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs/read_ps_prepbufr1.py`) does no
-station-level dedup at all -- it prints every BUFR subset that passes its
-own QC/type/time filters, so this loss has no equivalent on that side.
-
-**Fix**: `station_key()` now routes `{'MASKSTID', 'SHIP'}` to the same
-lat/lon-derived fallback key already used for a blank `station_id`, instead
-of `'sid:'+station_id`. Checked for a better per-platform identity field
-first (`restriction_flag`/`restriction_expiration_hours` are entirely
-unpopulated in this archive; `report_sequence_number`/`process_number` are
-batch metadata, only 12-120 distinct values across thousands of reports) --
-lat/lon is the best signal actually available.
-
-**Validation**: before/after comparison of `load_psobs_parquet`'s count
-against the legacy `.txt` file's line count, across 28 cycle-hours (00/06/
-12/18Z x 7 sample days spanning 2015-01-01 through 2015-01-29, the dev jobs'
-actual cycling range): mean gap **-3.30% (std 0.20%) before -> -0.56% (std
-0.06%) after**, stable across the whole range, not a single-day fluke. The
-small residual is attributed to a minor time-tolerance boundary difference
-(legacy's half-open `[center-0.5h, center+0.5h)` vs. this reader's closed
-`abs_delta <= tolerance_seconds`) and a small number of coincidental lat/lon
-collisions among distinct `MASKSTID`/`SHIP` platforms (this archive reports
-ship/buoy positions to only ~0.01 deg, ~1 km, resolution) -- not something
-further QC-parameter tuning can close.
-
-**Checked and ruled out** as contributors (zero affected rows in the real
-archive for the dates checked, so no code change made): the legacy
-generator's extra observation-error sanity check (drops a report if its
-`POE`/`pressure_error_mb` is NaN or >= 9.99 hPa; this reader never applies
-that, falling back to the flat default instead when missing) and its
-single-level-only requirement (`obs.shape[1] == 1`, vs. this reader's
-`level_index == 0`). Noted here since they're still real, latent differences
-from the legacy logic that could matter on a different date range or once
-the archive itself changes.
-
-**Testing**: `test_generic_placeholder_station_id_not_deduped` added to
-`tests/unit/test_psobs_parquet.py` (two `MASKSTID` reports at different
-locations must both survive the per-slot dedup).
-
-**Re-run**: the four original `-longcyc-obsint-1hour` jobs predate this fix
-and were not resubmitted (their saved diagnostics still reflect the old
-dedup). A fresh pair, `-t1` suffixed so they don't overwrite that output --
-`configs/config_test_ace2-longcyc-obsint-1hour-t1.yml` /
-`configs/config_test_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-t1.yml`,
-`slurm/run_ace2-longcyc-obsint-1hour-t1.sh` /
-`slurm/run_aifs2-1.0deg-v1.0-longcyc-obsint-1hour-t1.sh` (otherwise identical
-configs, 5h walltime instead of the original 1-day) -- was submitted
-2026-11-12 to confirm the fix end to end through the real solver path (jobs
-26262652 ace2, 26262653 aifs).
-
-## Off-cycle-hour slots and cycle-boundary duplication (found/fixed 2026-11-16)
-
-**Bug** (PR #26 review): `prepbufr_parquet_common.py`'s `cycle_directories`
-picked a cycle directory by checking whether the directory's *own nominal
-hour* fell inside `[verification_time - tolerance, verification_time +
-tolerance]`, not whether the directory could actually *contain* a report in
-that range. For any verification time that isn't itself a 00/06/12/18Z
-cycle hour (e.g. `dt_obs: 1`/`2`/`3` instead of `6`), this returned **zero
-cycle directories -- and silently zero observations** -- even when the
-correct 00Z partition had a report timestamped e.g. 01Z sitting right
-there on disk. None of this repo's tracked configs hit it (all use
-`dt_obs: 6`, so every slot already lands exactly on a cycle hour -- the
-`-longcyc-obsint-1hour-*` configs' name describes `time_tolerance_hours`,
-the width of the per-slot acceptance window, not `dt_obs`), so no past run's
-results are affected.
-
-**Fix**: `cycle_directories` now rounds each tolerance-window endpoint to
-the *nearest* 6-hourly cycle (`_nearest_cycle`), reflecting that a cycle
-directory's reports span its own nominal hour +/- 3h, not just the hour
-itself. Exactly on the 3h midpoint between two cycles, the tie breaks
-toward the verification time's own cycle, so a query centered exactly on a
-cycle hour doesn't spuriously demand a neighboring directory that may not
-exist. `tests/unit/test_psobs_parquet.py::test_off_cycle_slot_finds_report_in_earlier_cycle_partition`
-covers the off-cycle-hour case directly.
-
-**Cycle partitions genuinely overlap at their shared boundary -- but only
-for some PREPBUFR classes.** Checked against this account's real archive
-copy (`/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/
-prepbufr_to_parquet/`) and its generator (`convert_prepbufr_to_parquet.py`:
-`observation_time = cycle_time + timedelta(hours=dhr)`, `dhr` taken straight
-from the raw PREPBUFR `DHR` field, itself cut to `[-3, +3]` by NCEP's
-operational dump upstream of this repo's archive entirely):
-
-- `AIRCAR`/`AIRCFT` (aircraft, continuous reporting, not read by this
-  repo): genuinely duplicated at the boundary -- e.g. 2015-01-01, reports
-  timestamped exactly `03:00` appear **identically** (same station +
-  lat/lon) in both the `00Z` partition (`397` `AIRCAR` + `92` `AIRCFT`
-  rows, its own `+3h` edge) and the `06Z` partition (same `397`+`92`, its
-  own `-3h` edge) -- a closed `[cycle-3h, cycle+3h]` window on both sides.
-- **`ADPSFC`/`SFCSHP` (what `psobs_parquet.py` actually reads): no
-  duplication.** Checked across all 201 days available locally, 57.5M
-  surface-level rows: the observed offset range is `[-3.0h, +3.0h)` --
-  closed at `-3h`, but the exact `+3.0h` offset never occurs in either
-  partition (verified at three independent boundaries: 2015-01-01's 00Z/06Z
-  and 12Z/18Z seams). A surface report exactly at a boundary instant (e.g.
-  `03:00`) lives **only** in the later cycle's file (`06Z`, as its `-3h`
-  edge) -- `00Z`'s own file has zero rows at its nominal `+3h` edge. So
-  surface pressure is already a clean, non-overlapping `[cycle-3h,
-  cycle+3h)` partition of time; nothing needed changing in the generator
-  for this obs type.
-- `ADPUPA` (radiosondes, not read by this repo; see "raobs design this
-  repo doesn't need" above): concentrated tightly around each launch's own
-  nominal hour (2015-01-01: 863 of 1252 `00Z` reports at exactly `+0.0h`
-  offset; observed range only `-2.5h` to `+2.0h` across all four cycles) --
-  nowhere near the `+-3h` boundary, so no overlap either way. Worth
-  re-checking on whatever archive the raobs port (`add-raobs-parquet`
-  branch) ends up using, rather than assuming this holds everywhere.
-
-**Residual edge case, not exercised by any current config**: because
-`ADPSFC`/`SFCSHP` partitions are clean (not duplicated), the fix's
-midpoint tie-break has one narrow blind spot -- a query with
-`time_tolerance_hours` exactly `3.0` centered exactly on a cycle hour
-(`center=00:00`, window `[21:00, 03:00]` closed) resolves toward its own
-cycle (`00Z`) and never opens the neighbor (`06Z`), so a surface report
-timestamped exactly at the far edge (`03:00`, which lives only in `06Z`)
-would be missed rather than double-counted. No tracked config uses
-anything but the `0.5` default, so this is purely a documented limitation,
-not a live bug.
+Raobs is only validated for `model_backend` in `aifs`, `aurora`, `ace2`,
+`ngcm`, `neuralgcm`, `graphcast` (`RAOBS_SUPPORTED_BACKENDS`) -- the
+`'t'`/`'u'`/`'v'`/`'q'` base-name forward operator has not been checked
+for `fcn3`/`sfno`.
 
 ## Config schema: `exp.observations`, extensible to future obs types
 
-Observation settings are grouped under `exp.observations.<type>` on disk
-(`psobs` is the only type so far), each with its own `path` -- rather than
-flat, per-type-prefixed keys directly on `exp` -- specifically so a future
-observation type (radiosondes, aircraft, AMV, GPSRO, ...) can be added
-without renaming anything already here. This mirrors a convention already
-worked out and in active use on a sibling branch,
-`/scratch4/BMC/gsienkf/Bo.Huang/expCodes/ML/lw4dvar-torch-dev/
-add-amv-gpsro/lw4dvar-torch` (branch `add-amv-gpsro`), which has `raobs`,
-`aircraft`, `amv`, and `gpsro` blocks alongside `psobs` -- see that branch's
-`config_test_ace2_ps_raobs_aircraft_t3.yml` for a worked example with five
-types enabled at once, and its own `integrate_prepbufr_obs.md` for the
-per-type key tables and design notes on raobs/aircraft/amv/gpsro
-specifically (vertical matching, thinning, bias correction, etc. -- none of
-which apply to psobs and aren't duplicated here).
+Observation settings are grouped under `exp.observations.<type>` (`psobs`
+and `raobs` so far), each with its own `path`, rather than flat,
+per-type-prefixed keys directly on `exp` -- so a future observation type
+can be added without renaming anything already here.
+`_PSOBS_CONFIG_KEYS`/`_RAOBS_CONFIG_KEYS` (`{nested_key: flat_exp_key}`
+tables in `src/long_window_4dvar_utils.py`) and `_resolve_observations_config`
+(called from `load_config`) do the translation -- `observations.psobs.path`
+becomes `exp['obspath']`, `observations.raobs.variables` becomes
+`exp['raobs_variables']`, and so on, raising `ValueError` on any
+unrecognized key. **Everything downstream of `load_config` -- `get_psobs`/
+`get_raobs` included -- reads only the flat keys**; this translation is
+the *only* place the nested schema exists. Adding a new type means adding
+its own `_<TYPE>_CONFIG_KEYS` table and a corresponding block in
+`_resolve_observations_config` (copy the `raobs` block's pattern).
 
-`src/long_window_4dvar_utils.py`'s `_PSOBS_CONFIG_KEYS` (a `{nested_key:
-flat_exp_key}` table) and `_resolve_observations_config` (called from
-`load_config`, right after `path_output` is resolved) do the actual
-translation: `exp.observations.psobs.path` becomes `exp['obspath']`,
-`exp.observations.psobs.use_source_error` becomes
-`exp['psobs_use_source_error']`, and so on, raising `ValueError` on any key
-`_PSOBS_CONFIG_KEYS` doesn't recognize or on a missing `path`. **Everything
-downstream of `load_config` -- `get_psobs` included -- still reads the
-flat keys it always has**; this translation is the *only* place the nested
-schema exists. Adding a new type means adding its own `_<TYPE>_CONFIG_KEYS`
-table and a corresponding block in `_resolve_observations_config` (almost
-certainly with its own `enabled` flag, since unlike psobs a new type would
-normally be optional) -- copy the pattern from the sibling branch above
-rather than re-deriving it, and extend `_resolve_observations_config`'s
-`unknown = set(observations) - {'psobs'}` check to admit the new top-level
-key.
+`observations.psobs.path` is required (the parquet archive root).
+`observations.raobs.path` defaults to psobs's own path (same archive,
+`ADPUPA` class) if omitted. An absent/omitted `raobs` block, or
+`enabled: False`, assimilates surface pressure only.
 
-## Why parquet-only (no `.txt`/parquet config switch)
+All defaults below are current as of this writing -- check
+`configs/config.yml.template` (the authoritative, always-current
+reference) if this doc and the template ever disagree.
 
-The sibling repo's draft made this same unconditional-replacement call, but
-could afford to because it predates any CI test depending on the `.txt`
-reader. This repo's `main` has since grown `make check`/`make check-ace2`
-(see `tests/README.md`), and `tests/ace2/test_ace2_mini.py` drives the real
-solver end to end against a committed `.txt` obs fixture
-(`tests/data/mini_ace2/psobs/psobs1_*.txt`) -- which an unconditional switch
-would simply break.
+## Observation error
 
-Decided to keep the port's "no dead code, one reader" design anyway, and
-rebuild the CI fixture itself as a synthetic parquet archive instead of
-threading a `psobs_source: 'txt'|'parquet'` switch through `get_psobs` (the
-user's explicit choice -- a config-switchable reader was considered and
-rejected in favor of matching this repo's existing single-reader design
-once the fixture itself no longer needs to be `.txt`).
+- **psobs**: a flat `error_std_hpa` (default `1.0` hPa) applied to every
+  observation, or `use_source_error: True` to use each report's own
+  archived `pressure_error_mb` value instead.
+- **raobs t/u/v**: `error_std` -- GSI's real `prepobs_errtable.global`
+  table by default (one `{hPa: value}` table per variable, ln(p)-
+  interpolated between entries, held constant beyond the table's range;
+  u and v share one table, GSI's wind error being one vector quantity).
+  Overridable per variable with a flat scalar or a custom table.
+- **raobs q**: `q_error_rh_percent` -- a `{hPa: percent}` RH-error table
+  (GSI's real table by default), converted to kg/kg via saturation
+  specific humidity (qsat) computed from the archive's own static
+  `background_temperature_c`/`background_pressure_mb` -- the same
+  RH-error-table-times-qsat-from-background mechanism as UFO's
+  `ObsErrorModelHumidity` (not a flat per-level guess, not a fraction of
+  the observed value).
 
-### The CI fixture: synthetic, not a real-obs subsample
+## QC check
 
-`tests/make_fixtures.py`'s `_write_psobs_parquet` generates a tiny
-normalized-PREPBUFR-parquet archive (ADPSFC/SFCSHP partitions per cycle,
-only the columns `src/psobs_parquet.py` actually reads) entirely in-process --
-globally-scattered synthetic lat/lon, pressure ~1013 hPa + N(0, 4) hPa
-noise, quality marks 0-3, per-ob error ~N(0.5, 0.15) hPa, fixed seed. This
-replaces the old fixture's approach (subsample 2000 real reports per time
-from the live `.txt` obs directory, Ursa-only) with something that rebuilds
-anywhere `pip install pyarrow` reaches, with no dependency on any obs
-archive, real or synthetic-upstream.
+Three layers, applied in this order:
 
-**This did require retuning `tests/ace2/test_ace2_mini.py`'s cost-drop
-threshold** (`MAX_FINAL_TO_FIRST`): the old fixture's real obs, pulled from
-an actual synoptic analysis, gave the tiny model's Jo term a much stronger,
-more structured gradient signal than first-draft synthetic noise (~1013 +/-
-12 hPa, uncorrelated across stations) did -- the first draft only reached a
-33% cost reduction in 50 epochs against the existing 40%-reduction
-threshold. Tightening the synthetic noise (12 -> 4 hPa) and per-ob error
-(~1.0 -> ~0.5 hPa, i.e. a stronger pull per observation) recovered a 55%
-reduction, comparable to the old fixture's observed 59%. This is a
-legitimate recalibration against a deliberately-changed fixture, not a
-loosened assertion against unchanged code -- the threshold itself
-(`MAX_FINAL_TO_FIRST = 0.6`) did not move, only the documented "observed"
-comment did.
+1. **Read-time QC** (`raobs_parquet.py`, always applied, not configurable
+   away except via the specific knobs below): PREPBUFR `quality_mark_max`
+   (psobs default `4`, raobs default `3`); for raobs, a physical height
+   range (`height_min_m`/`height_max_m`), a below-station-elevation
+   tolerance (`below_station_tolerance_m`), and a non-monotonic-height-
+   with-pressure check computed once per COMPLETE source profile (every
+   raw level the archive has for that report, regardless of which slot or
+   model-level bucket it's assigned to) -- an inversion anywhere in the
+   real profile rejects the whole variable for that profile. A per-
+   variable physical sanity bound (`physical_bounds`, UFO's real sonde
+   `Bounds Check` numbers by default: T 195-327 K, q 1e-8-0.035 kg/kg,
+   |u|,|v| <= 130 m/s) is always applied, independent of the background/
+   model state.
+2. **Background (gross) check** (`bg_check` for raobs, evaluated at the
+   current/background state, per variable): reject `|O-B| > threshold *
+   qc_error`, OR (if given) `|O-B| > an absolute limit` regardless of
+   `qc_error` -- UFO's real per-variable sonde QC config values by
+   default (T: `{threshold: 7.0, absolute: 9.0}`, wind: `{threshold: 6.0,
+   absolute: 19.0}`, q: `{threshold: 8.0}`, no absolute). This is the
+   ONLY background-check mechanism for raobs -- no separate flat-scalar
+   fallback. A variable not listed in a configured override keeps the
+   full default dict for that variable; a variable set to `null`
+   disables its check entirely. psobs has its own pre-existing,
+   independent `bg_check`/`zthresh`/`zconst` orography-aware check
+   (unrelated to raobs's mechanism, not covered by this doc).
+3. **Frozen vs. live QC** (`frozen_qc`, independently configurable for
+   `observations.psobs`/`observations.raobs`, both default **False** --
+   live QC): if `True`, the background/gross check above is evaluated
+   ONCE against the uncorrected background before optimization and held
+   fixed for the whole minimization; if `False` (default), it's
+   recomputed from the live, still-optimizing state every epoch, matching
+   GSI's own practice of re-evaluating QC every outer loop. Live QC has a
+   known, accepted tradeoff: the optimizer can lower Jo by pushing an
+   observation's live O-A far enough to fail the gross check (dropping it
+   from the loss) instead of fitting it -- see
+   `tests/unit/test_solver_helpers.py::
+   test_raobs_frozen_qc_prevents_gaming_the_gross_check` for a concrete
+   adversarial example. Set `frozen_qc: True` to close that off for a
+   given run.
+
+**VIRTMP handling** (raobs temperature only): the archive's current TOB
+is virtual temperature wherever moisture was reported. `sensible_temperature`
+(`prepbufr_parquet_common.py`) recovers sensible temperature from the
+PREPBUFR event stack by anchoring on VIRTMP's own `event_index` and
+excluding every event at or above that position (not just the literal
+VIRTMP-tagged one -- a later, value-preserving event can sit above VIRTMP
+in the stack). A level whose only TOB event is VIRTMP has no recoverable
+sensible value and is excluded like any other missing observation. GSI's
+own Tv-operator path (assimilating virtual temperature directly where
+it's available) is not implemented -- levels with no recoverable sensible
+value are dropped instead of being assimilated as Tv.
+
+## Balloon drift: time and position
+
+- `use_drift_time` (default **True**): assign each LEVEL to its own
+  nearest obs slot using the archive's own balloon-drift-corrected
+  `drift_time_hours` (near 0 at the surface, growing smoothly with
+  altitude for a deep sounding), instead of every level of a profile
+  sharing the report's single launch time. Falls back to the launch time
+  wherever `drift_time_hours` is missing for a level.
+- `use_drift_position` (default **True**), independent of `use_drift_time`:
+  compare each level against the model at that level's own balloon-
+  drift-corrected horizontal position (`drift_longitude`/`drift_latitude`),
+  instead of every level sharing the station's single launch position.
+  Falls back to the launch position wherever missing.
+- Both are read-time-graceful: an archive partition with neither drift
+  column at all (predating when the archive started recording them)
+  falls back to launch time/position for every level, rather than raising.
+
+## Vertical interpolation
+
+`vertical_interpolation` controls how a raobs level is matched to the
+model's own pressure levels:
+
+- `'exact'` (default): mandatory-level matching -- a level is kept only
+  if within `pressure_match_tolerance_hpa` (default `0.05` hPa) of a
+  model level; everything else discarded. No vertical interpolation.
+- `'nearest'`: every level kept, snapped to its nearest model level by
+  raw hPa distance regardless of how far (no discard) -- so a coarse
+  model still gets an observation at every one of its levels. Still no
+  vertical correction (the comparison pretends the ob sits exactly on
+  that level). Confirmed consistent with JEDI's own `nearest-neighbor`
+  `VertInterp` method (read directly from the real `ufo` source): JEDI's
+  nearest-neighbor also uses raw, un-logged distance -- ln(p) is a
+  `log-linear`-specific step in JEDI, not a general convention this mode
+  falls short of.
+- `'log-linear'`: same relaxed matching as `'nearest'`, PLUS a vertical
+  correction -- the model is log-linearly interpolated between the
+  assigned level and its adjacent neighbor to the observation's own real
+  pressure, including JEDI's own boundary rule (clamp-extrapolate to the
+  edge level, never reject for being out of the model's vertical range).
+  A direct port of JEDI's `vert_interp_weights` bracket-and-clamp logic.
+
+## Raobs Jo weighting
+
+Raobs's cost term (`_raobs_term`) is a straight sum of `(innovation /
+effective_error) ** 2` over every used (variable, level, station) cell --
+**no area or obs-density weighting**, unlike psobs's optional
+`obs_density_box_deg` (which rescales ps Jo so its weights sum to the
+number of used ps obs, countering a documented ps-obs clustering
+problem). This means the ps/raobs Jo balance depends on how many levels
+and variables each sounding happens to contribute, not just on how well
+either fits. Deliberately left this way rather than given a speculative
+weight: there's no evidence yet that raobs's lack of an equivalent
+mechanism causes a real imbalance in practice (raobs soundings are far
+sparser and more uniform in per-level/variable count than psobs reports).
+Revisit with a real weight only if a validation run shows it's needed.
+
+## Other settings
+
+- `variables` (raobs, default all four -- `temperature`,
+  `u_component_of_wind`, `v_component_of_wind`, `specific_humidity`):
+  which variables to assimilate. **`model_backend: ace2` should drop
+  `specific_humidity`** -- ACE2's `'q'` is specific *total water*
+  (vapor + cloud condensate), not pure water-vapor specific humidity, a
+  confirmed non-negligible bias with no way to subtract out.
+- `prepbufr_classes`: which PREPBUFR classes to read (psobs default
+  `['ADPSFC', 'SFCSHP']`; raobs default `['ADPUPA']`).
+  `report_types` (psobs only, default `[180, 181, 187]`): PREPBUFR
+  report-type codes kept, `null` to disable the filter.
+- `time_tolerance_hours`: max `|report time - slot time|` accepted.
+  psobs defaults to a flat `0.5` h (matching the legacy `.txt` reader,
+  independent of `dt_obs`); raobs defaults to `dt_obs/2` (tiles the
+  window edge to edge with no gaps for any `dt_obs`).
+- `humidity_min_pressure_hpa` (raobs, default `300.`): mask `'q'` at any
+  matched level with pressure below this (radiosonde humidity sensors
+  are unreliable in the upper troposphere); `null` disables the floor.
+- `station_capacity` (raobs): fixed per-slot padding size; by default
+  sized to the largest slot actually read, set explicitly only if a
+  stable shape across configs/runs is needed.
 
 ## Testing
 
-- `tests/unit/test_psobs_parquet.py`: `load_psobs_parquet` against tiny,
-  hand-crafted parquet archives (not the mini-ACE2 fixture), one behavior
-  per test -- acceptance within/outside time tolerance, report-type and
-  quality-mark filtering, the non-surface-level skip, longitude wrapping,
-  the single-nearest-report-per-station dedup and its quality-mark
-  tie-break, flat-vs-source error, multiple independent slots, and the
-  missing-cycle-directory/invalid-error-std error paths.
-- `tests/unit/test_config.py`: `_resolve_observations_config`'s validation
-  (unknown `observations`/`observations.psobs` keys, missing
-  `observations.psobs.path`) and that a representative set of nested keys
-  resolve to the expected flat `exp` keys
-  (`test_observations_psobs_resolved_to_flat_keys`).
-- `tests/ace2/test_ace2_mini.py` (`make check-ace2`): now reads the
-  synthetic parquet fixture via the real `get_psobs` path, with
-  `observations.psobs.use_source_error: True` added to its config to
-  exercise that branch too (matching the production configs that needed
-  it, above).
-- All pass locally with a from-scratch `.venv-ci` (`rdhpcs-python/3.12` +
-  `envs/requirements-ci.txt`/`envs/requirements-ci-ace2.txt`) as of this writing.
+- `tests/unit/test_psobs_parquet.py` / `tests/unit/test_raobs_parquet.py`:
+  each reader against tiny, hand-crafted parquet archives (not the
+  mini-ACE2 fixture), one behavior per test.
+- `tests/unit/test_config.py`: `_resolve_observations_config`'s
+  validation and flat-key resolution.
+- `tests/ace2/test_ace2_mini.py` (`make check-ace2`): the real solver
+  end to end against a synthetic parquet archive (`tests/make_fixtures.py`),
+  both psobs and raobs (temperature/u/v) enabled.

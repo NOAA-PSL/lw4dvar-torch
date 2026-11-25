@@ -17,6 +17,16 @@ one 24 h window from 2015-01-02T00 with a 6 h spin-up, on the 2.5 deg
       (see src/psobs_parquet.py/docs/integrate_multiple_parquetobs.md for the schema),
       ~2000 ps obs per cycle, globally scattered, fixed seed -- entirely
       generated in-process, no real obs archive needed to rebuild this fixture
+  data/mini_ace2/raobs/<YYYY-MM-DD>/<HH>/{reports,levels,events}/ADPUPA/
+      part-00000.parquet  a radiosonde (ADPUPA) archive (see
+      src/raobs_parquet.py), 50 globally-scattered fixed-seed stations per
+      cycle at ACE2's own 13 pressure levels (MINI_ACE2_RAOBS_PLEVS) --
+      unlike psobs's pure synthetic noise, t/u/v are the REAL mini-ACE2
+      checkpoint's own background (sampled at each station's nearest
+      native grid point, see _ace2_background_profiles) plus a small
+      Gaussian perturbation, so there's a real, reducible O-B signal for
+      tests/ace2/test_ace2_mini.py's cost-drop check to find (needs the
+      full ace2 env -- fme/torch -- not just pyarrow, unlike psobs)
   data/mini_ace2/manifest.json  provenance and the checkpoint asset's sha256
 --weights_out writes the weights-only checkpoint (the `stepper` config,
 dataset_info and step state; no training history). torch.save is not
@@ -68,8 +78,16 @@ MINI_ACE2 = {
     'spinup_h': 6,
     'window_h': 24,
     'nobs': 2000,
+    'nobs_raobs': 50,
     'seed': 0,
 }
+
+# ACE2Model's own pressure levels (backends/ace2/ace2_model.py's
+# DEFAULT_PLEVS) -- the mandatory-level match in raobs_parquet.py needs the
+# synthetic reports' pressure_mb to land exactly on these, since ACE2
+# returns the same 13-level axis for every derived base ('t'/'u'/'v'/'q').
+# If ACE2Model's own levels ever change, this fixture needs regenerating.
+MINI_ACE2_RAOBS_PLEVS = (1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50)
 
 
 def _sha256(path):
@@ -134,14 +152,154 @@ def _write_psobs_parquet(root, cycle_times, rng, nobs):
                 pq.write_table(table, out_path)
 
 
+def _ace2_background_profiles(checkpoint, forcing_dir, ic_cache_dir, t_ic, spinup_h, window, plevs, station_lat, station_lon):
+    """Sample the REAL mini-ACE2 background trajectory's own 't'/'u'/'v' at
+    `plevs` (its own pressure levels -- see MINI_ACE2_RAOBS_PLEVS) and at
+    each synthetic station's nearest native grid point, at every time in
+    `window`. Runs the real checkpoint forward from the same IC/forcing
+    files `mini_ace2` already wrote (`ace2_ic.build_input_state`, same as
+    `get_input`'s own ACE2 branch), under `torch.no_grad()` -- this is
+    sampling the background, not training.
+
+    Returns `{time: {'t': (n_levels, n_stations), 'u': ..., 'v': ...}}`
+    (K, m/s, m/s) -- a small Gaussian perturbation around THIS, rather than
+    independent standard-atmosphere climatology, is what makes the
+    synthetic raobs mismatch something a few epochs of latent-increment
+    optimization can actually reduce (see
+    docs/integrate_multiple_parquetobs_history.md's "Adding radiosonde
+    (raobs) observations" section -- the same lesson the psobs fixture's
+    own noise-tightening already drew).
+    """
+    import torch
+
+    sys.path.insert(0, os.path.join(REPO_ROOT, 'src'))  # ace2_model imports forecast_model flatly
+    sys.path.insert(0, os.path.join(REPO_ROOT, 'backends', 'ace2'))
+    import ace2_ic
+    import ace2_model
+
+    model = ace2_model.ACE2Model(checkpoint_path=checkpoint, forcing_dir=forcing_dir, device='cpu')
+    input_state = ace2_ic.build_input_state(t_ic, ic_cache_dir)
+    with torch.no_grad():
+        state = model.prepare_initial_state(input_state, t_ic)
+        spinup_steps = int(round(spinup_h / (model.timestep.total_seconds() / 3600)))
+        state = model.advance(state, steps=spinup_steps, use_checkpoint=False)
+
+        lat_idx = np.argmin(
+            (model.lats[None, :] - station_lat[:, None]) ** 2
+            + (np.mod(model.lons[None, :] - station_lon[:, None] + 180., 360.) - 180.) ** 2,
+            axis=1,
+        )
+        result = {}
+        for i, t in enumerate(window):
+            decoded = model.decode_state(state, only=['t', 'u', 'v'])
+            result[t] = {
+                base: decoded[base].detach().cpu().numpy()[:, lat_idx] for base in ('t', 'u', 'v')
+            }
+            if i < len(window) - 1:  # no forcing past the last window time
+                state = model.advance(state, steps=1, use_checkpoint=False)
+    return result
+
+
+def _write_raobs_parquet(root, cycle_times, rng, station_lat, station_lon, background, plevs=MINI_ACE2_RAOBS_PLEVS, noise_std=None):
+    """Write a synthetic normalized-PREPBUFR-parquet ADPUPA archive (the
+    schema src/raobs_parquet.py/src/prepbufr_parquet_common.py read) under
+    `root`, one cycle directory per entry in `cycle_times`, one profile per
+    `station_lat`/`station_lon` entry, reporting temperature/wind at every
+    pressure in `plevs` (one `levels` row per (station, level)) --
+    `background[t]['t'/'u'/'v']` (from `_ace2_background_profiles`, shape
+    `(len(plevs), n_stations)`) plus a small Gaussian perturbation
+    (`noise_std`), so there's a real, reducible O-B signal (see that
+    function's docstring). Humidity still uses independent standard-
+    atmosphere climatology (no equally cheap real-q background to sample
+    here) -- fine since `tests/ace2/test_ace2_mini.py` doesn't enable it.
+    Heights follow the barometric formula so they
+    increase monotonically with altitude (required by raobs_parquet.py's
+    non-monotonic-height QC) and land in a physically sane range. `events`
+    is written empty -- common.sensible_temperature then falls back to the
+    `temperature_c` column unchanged, which is fine here since this fixture
+    has no virtual-temperature distinction to make.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    noise_std = noise_std or {'t': 1.0, 'u': 2.0, 'v': 2.0}
+    plevs = np.asarray(plevs, dtype=np.float64)
+    n_levels = plevs.size
+    nstations = station_lat.size
+    # Standard-atmosphere barometric height (m) for each level -- only
+    # needs to be monotonically increasing as pressure drops, not exact.
+    height_by_level = 44331.0 * (1.0 - (plevs / 1013.25) ** 0.1903)
+
+    for t in cycle_times:
+        cycle_dir = os.path.join(root, f'{t:%Y-%m-%d}', f'{t:%H}')
+        report_id = np.arange(nstations, dtype=np.int64)
+        station_elev = rng.uniform(0., 300., nstations)
+        reports = pa.table({
+            'report_id': pa.array(report_id),
+            'observation_time': pa.array([t] * nstations, type=pa.timestamp('s')),
+            'station_id': pa.array([f'RB{i:06d}' for i in report_id]),
+            'latitude': pa.array(station_lat),
+            'longitude': pa.array(station_lon),
+            'elevation_m': pa.array(station_elev),
+            'report_type': pa.array(np.full(nstations, 120, dtype=np.int32)),
+        })
+
+        level_report_id = np.repeat(report_id, n_levels)
+        level_index = np.tile(np.arange(n_levels, dtype=np.int32), nstations)
+        pressure = np.tile(plevs, nstations)
+        height = np.tile(height_by_level, nstations) + rng.normal(0., 10., nstations * n_levels)
+        # background[t][base] is (n_levels, n_stations); flatten to match
+        # level_report_id's (station-major, then level) ordering, i.e.
+        # transpose to (n_stations, n_levels) before ravel.
+        temperature_c = (
+            background[t]['t'].T.ravel() - 273.15 + rng.normal(0., noise_std['t'], nstations * n_levels)
+        )
+        u = background[t]['u'].T.ravel() + rng.normal(0., noise_std['u'], nstations * n_levels)
+        v = background[t]['v'].T.ravel() + rng.normal(0., noise_std['v'], nstations * n_levels)
+        q_mg_kg = np.clip(
+            12000. * np.exp(-np.tile(height_by_level, nstations) / 2500.)
+            + rng.normal(0., 200., nstations * n_levels),
+            50., None,
+        )
+        levels = pa.table({
+            'report_id': pa.array(level_report_id),
+            'level_index': pa.array(level_index),
+            'category': pa.array(np.ones(nstations * n_levels, dtype=np.int16)),
+            'pressure_mb': pa.array(pressure),
+            'height_m': pa.array(height),
+            'height_quality': pa.array(np.ones(nstations * n_levels)),
+            'temperature_c': pa.array(temperature_c),
+            'temperature_quality': pa.array(np.ones(nstations * n_levels)),
+            'u_wind_ms': pa.array(u),
+            'wind_quality': pa.array(np.ones(nstations * n_levels)),
+            'v_wind_ms': pa.array(v),
+            'specific_humidity_mg_kg': pa.array(q_mg_kg),
+            'humidity_quality': pa.array(np.ones(nstations * n_levels)),
+        })
+        events = pa.table({
+            'report_id': pa.array([], type=pa.int64()),
+            'level_index': pa.array([], type=pa.int64()),
+            'value_mnemonic': pa.array([], type=pa.string()),
+            'event_index': pa.array([], type=pa.int64()),
+            'value': pa.array([], type=pa.float64()),
+            'program_code': pa.array([], type=pa.int64()),
+        })
+        for table_name, table in (('reports', reports), ('levels', levels), ('events', events)):
+            out_path = os.path.join(cycle_dir, table_name, 'ADPUPA', 'part-00000.parquet')
+            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            pq.write_table(table, out_path)
+
+
 def mini_ace2(args):
     sys.path.insert(0, os.path.join(REPO_ROOT, 'backends', 'ace2'))
     import ace2_inference_files as aif
 
     c = dict(MINI_ACE2)
     out = os.path.join(HERE, 'data', 'mini_ace2')
-    fdir, idir, odir = (os.path.join(out, d) for d in ('forcing_data', 'ic_cache', 'psobs'))
-    for d in (fdir, idir, odir):
+    fdir, idir, odir, odir_raobs = (
+        os.path.join(out, d) for d in ('forcing_data', 'ic_cache', 'psobs', 'raobs')
+    )
+    for d in (fdir, idir, odir, odir_raobs):
         os.makedirs(d, exist_ok=True)
 
     t0 = datetime.datetime.fromisoformat(c['sdate'])
@@ -176,8 +334,14 @@ def mini_ace2(args):
 
     rng = np.random.default_rng(c['seed'])
     _write_psobs_parquet(odir, window, rng, c['nobs'])
+    station_lat = rng.uniform(-80., 80., c['nobs_raobs'])
+    station_lon = rng.uniform(0., 360., c['nobs_raobs'])
+    background = _ace2_background_profiles(
+        c['checkpoint'], fdir, idir, t_ic, c['spinup_h'], window, MINI_ACE2_RAOBS_PLEVS, station_lat, station_lon,
+    )
+    _write_raobs_parquet(odir_raobs, window, rng, station_lat, station_lon, background)
 
-    manifest = {k: c[k] for k in ('sdate', 'spinup_h', 'window_h', 'nobs', 'seed', 'dataset')}
+    manifest = {k: c[k] for k in ('sdate', 'spinup_h', 'window_h', 'nobs', 'nobs_raobs', 'seed', 'dataset')}
     manifest['checkpoint'] = {'source': c['checkpoint'], 'release': c['release'], 'name': c['asset_name'], 'url': c['url']}
     if args.weights_out:
         strip_checkpoint(c['checkpoint'], args.weights_out)

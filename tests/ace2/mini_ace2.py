@@ -9,8 +9,16 @@ running at 1 and at 4 threads (different reduction order, as on a different
 machine): everything computed from the background is bit-identical; the
 cost agrees to ~5e-6 at the first epochs, then fp32 rounding is amplified by
 the minimization to ~2e-3 by epoch 50 and ~3e-4 in the analysis O-A. The
-run is pinned to one thread anyway, so the core count does not matter. The
-tight checks -- background and QC exactly or to 1e-5, the first epochs to
+run is pinned to one thread anyway, so the core count does not matter.
+
+The instruction set does matter: torch's CPU kernels (ATen), MKL (matmuls,
+FFTs) and oneDNN each pick a code path for the CPU they find, and AVX-512
+and AVX2 paths round differently. GitHub's runner fleet mixes AVX2-only and
+AVX-512 machines, and the background Jo differed between them by ~1.6e-5
+relative, enough to fail the 1e-5 check and, after 50 epochs of AdamW, the
+late-epoch ones. So the run is pinned to AVX2, which every x86-64 runner has
+(`ISA_ENV`); with it an AVX-512 machine reproduces an AVX2-only runner's
+numbers exactly. The tight checks -- background and QC exactly or to 1e-5, the first epochs to
 1e-4 -- catch a changed setting, input or operator; the loose ones catch a
 minimization that goes somewhere else. The toy model's golden runs
 (tests/golden/) are the precise check on the minimization itself.
@@ -55,6 +63,9 @@ def tolerance(path):
     if path.startswith('/analysis_forecast'):
         return 1e-3, 0.0
     return 1e-2, 0.0           # jo_per_slot_last, analysis O-A rms
+# The CPU code paths, pinned to AVX2 (see the docstring): ATen's kernel
+# dispatch, MKL's conditional numerical reproducibility branch, oneDNN's ISA.
+ISA_ENV = {'ATEN_CPU_CAPABILITY': 'avx2', 'MKL_CBWR': 'AVX2', 'ONEDNN_MAX_CPU_ISA': 'AVX2'}
 # fields of the analysis forecast summarized at each output time
 FORECAST_FIELDS = ['h500', 'TMP850', 'PRESsfc']
 
@@ -100,9 +111,36 @@ def config(tmp_path, ckpt):
         'model_name': os.path.basename(ckpt),
         'forcing_dir': os.path.join(DATA, 'forcing_data') + '/',
         'ic_cache': os.path.join(DATA, 'ic_cache') + '/',
-        'observations': {'psobs': {
-            'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
-        }},
+        'observations': {
+            'psobs': {
+                'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
+            },
+            'raobs': {
+                'enabled': True, 'path': os.path.join(DATA, 'raobs'),
+                'variables': ['temperature', 'u_component_of_wind', 'v_component_of_wind'],
+                # The synthetic fixture's t/u/v aren't tied to this tiny
+                # model's own background climatology (unlike the psobs
+                # fixture, which is loose Gaussian noise around a plausible
+                # ps value) -- a larger, flat error than the default
+                # per-level JEDI/UFO table (RAOBS_TUV_ERROR_STD,
+                # long_window_4dvar_utils.py) keeps raobs Jo from swamping
+                # ps Jo + Jc.
+                'error_std': {'t': 5.0, 'u': 8.0, 'v': 8.0},
+                # Explicit False: this fixture's reports are all zero-
+                # jitter (observation_time exactly on the cycle hour) and
+                # the archive has no drift_time_hours/drift_longitude/
+                # drift_latitude columns at all -- the drift corrections'
+                # own mechanics are covered by tests/unit/
+                # test_raobs_parquet.py instead. Both now default to True
+                # in code (PR #29's review); raobs_parquet.py's reader
+                # falls back gracefully on a missing-column archive like
+                # this one (PR #29's review, second round), so this isn't
+                # strictly required to avoid a crash any more -- kept
+                # explicit anyway, since it documents this fixture's own
+                # intent rather than relying on that fallback silently.
+                'use_drift_time': False, 'use_drift_position': False,
+            },
+        },
         'path_output': os.path.join(str(tmp_path), 'output') + '/',
         'exp_name': 'test_ace2_mini',
         'rpath': os.path.join(str(tmp_path), 'unused') + '/',
@@ -136,8 +174,9 @@ def run(tmp_path, ckpt):
     """Run the solver on the mini ACE2. Returns (returncode, log, exp,
     windows, output directory)."""
     cfg, exp, windows = config(tmp_path, ckpt)
-    # one thread: the result must not depend on the machine's core count
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    # one thread and one instruction set: the result must not depend on the
+    # machine's core count or CPU generation
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', **ISA_ENV)
     proc = subprocess.run([sys.executable, '-u', 'src/long_window_4dvar.py', cfg], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=1800)
     out = os.path.join(exp['path_output'], exp['exp_name'])

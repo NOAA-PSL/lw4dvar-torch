@@ -4,6 +4,7 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   check:
@@ -27,7 +28,9 @@ jobs:
   # The solver end to end with a real (tiny) model: tests/ace2/test_ace2_mini.py.
   # Separate job: it needs fme (envs/requirements-ci-ace2.txt) and a 22 MB
   # checkpoint, a release asset pinned in tests/data/mini_ace2/manifest.json
-  # and cached between runs under its sha256.
+  # and cached between runs under its sha256. The run is pinned to AVX2
+  # (mini_ace2.ISA_ENV), so its golden numbers are the same on every runner
+  # CPU type; the CPU step records which one ran, for a failure that differs.
   ace2-mini:
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -52,4 +55,9 @@ jobs:
           path: .fixture-cache
           key: mini-ace2-${{ steps.ckpt.outputs.sha }}
       - run: pip install -r envs/requirements-ci-ace2.txt
+      - name: CPU
+        run: |
+          lscpu | grep 'Model name'
+          echo "ISA: $(grep -o -w -E 'avx2|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+          python -c "import torch; print('torch', torch.__version__, 'default ATen capability', torch.backends.cpu.get_cpu_capability())"
       - run: make check-ace2
