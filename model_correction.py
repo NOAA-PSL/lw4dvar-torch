@@ -83,3 +83,37 @@ class ColumnCorrection(nn.Module):
         g = cls.for_model(model, **ck['hparams'])
         g.load_state_dict(ck['state_dict'])
         return g
+
+
+class StaticCorrection(nn.Module):
+    """Fixed per-point, per-variable increment added every step: x_{k+1} = M(x_k) + c (offline mean tendency
+    correction; a37tmp/strat_drift/tend_corr.py writes the npz: names (n_var,), mean (n_points, n_var), physical
+    units of ERA5(t+6h) - M(ERA5)(t+6h)). Config:
+        exp:
+          model_correction: {static: output/strat_tend/t1_2014jfm.npz, vars: [t], scale: 1.0}
+    `vars` keeps only those bases (t -> t_1000..t_1; sp, 2t, ... by full name); default all in the file."""
+
+    def __init__(self, var_to_idx, names, field, vars=None, scale=1.0):
+        super().__init__()
+        def base(n):
+            b, _, lev = n.rpartition('_')
+            return b if b and lev.isdigit() else n
+        keep = [i for i, n in enumerate(names) if vars is None or base(n) in vars or n in vars]
+        if not keep:
+            raise ValueError(f'StaticCorrection: no variables left for vars={vars}')
+        self.out_names = [names[i] for i in keep]
+        missing = [n for n in self.out_names if n not in var_to_idx]
+        if missing:
+            raise ValueError(f'StaticCorrection: variables not in the model input: {missing}')
+        self.register_buffer('out_idx', torch.as_tensor([var_to_idx[n] for n in self.out_names], dtype=torch.long))
+        self.register_buffer('field', torch.as_tensor(field[:, keep], dtype=torch.float32) * float(scale))
+
+    def forward(self, x):
+        """x: (..., n_points, n_input_vars) -> (..., n_points, n_out), independent of x"""
+        return self.field.expand(*x.shape[:-1], self.field.shape[-1])
+
+    @classmethod
+    def load(cls, path, model, vars=None, scale=1.0):
+        import numpy as np
+        d = np.load(path)
+        return cls(model.var_to_idx, [str(n) for n in d['names']], d['mean'], vars, scale).to(model.device)

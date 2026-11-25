@@ -680,11 +680,18 @@ def get_model(exp):
             # learned model correction g_theta (model_correction.py, notes/colearn_plan.md)
             if not hasattr(model, 'model_correction'):
                 raise ValueError('exp.model_correction is implemented for the aifs37 backend only')
-            from model_correction import ColumnCorrection
-            model.model_correction = ColumnCorrection.load(mc['path'], model).eval()
+            from model_correction import ColumnCorrection, StaticCorrection
+            if 'static' in mc:   # offline mean tendency correction (a37tmp/strat_drift/tend_corr.py)
+                model.model_correction = StaticCorrection.load(mc['static'], model, mc.get('vars'),
+                                                               mc.get('scale', 1.0)).eval()
+                logging.getLogger(__name__).warning(
+                    f"EXPERIMENTAL static tendency correction ON ({mc['static']}): every model step is altered; "
+                    "use only in runs named *_tc_* (strat drift step (b))")
+            else:
+                model.model_correction = ColumnCorrection.load(mc['path'], model).eval()
             for prm in model.model_correction.parameters():
                 prm.requires_grad_(False)
-            logging.getLogger(__name__).info(f"model_correction: {mc['path']}")
+            logging.getLogger(__name__).info(f"model_correction: {mc}")
         return model
     elif backend == 'fcn3':
         _ensure_backend_on_path('fcn3')
@@ -977,7 +984,7 @@ def get_verif(exp, model, logger, date_override=None):
     return verif_ic
 
 
-def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5, extra_vars=(), logger=None):
+def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5, extra_vars=(), logger=None, all_vars=()):
     """AIFS and Aurora only -- never called for FCN3 (load_config rejects
     `reset_skt_ocean: True` under `model_backend: 'fcn3'` up front, since
     FCN3 has no `skt`/`lsm` decode_state field at all).
@@ -1028,7 +1035,116 @@ def reset_skt_over_ocean(model, model_state, verif_ic, lsm_threshold=0.5, extra_
             if logger is not None:
                 logger.warning(f'reset_ocean_vars: {var} not reset ({err!r})')
             continue
+        if logger is not None:
+            d = (vals - state[0, -1, :, idx])[ocean_mask]
+            logger.info(f'reset_ocean_vars: {var} reset from ERA5 at ocean points (mean change {d.mean().item():+.4g}, '
+                        f'mean |change| {d.abs().mean().item():.4g})')
         state[0, :, :, idx] = torch.where(ocean_mask, vals, state[0, :, :, idx])
+    # Optional (exp.reset_all_vars, e.g. [sd], 2026-11-20 snow/ice experiments): the same ERA5 reset at every grid
+    # point (land fields such as snow depth). A field the model or verif_ic lacks is skipped with a warning.
+    for var in all_vars:
+        try:
+            idx = model.resolve_columns(var)[0]
+            vals = verif_ic[var].to(device=state.device, dtype=state.dtype)
+        except (KeyError, IndexError, ValueError) as err:
+            if logger is not None:
+                logger.warning(f'reset_all_vars: {var} not reset ({err!r})')
+            continue
+        if logger is not None:
+            d = vals - state[0, -1, :, idx]
+            logger.info(f'reset_all_vars: {var} reset from ERA5 everywhere (mean change {d.mean().item():+.4g}, '
+                        f'mean |change| {d.abs().mean().item():.4g})')
+        state[0, :, :, idx] = vals.expand_as(state[0, :, :, idx])
+    return model.wrap_state(state, model_state.date)
+
+
+def _strat_clim(model, path):
+    """exp.strat_relax climatology (a37tmp/strat_drift/make_strat_clim.py), cached on the model."""
+    c = getattr(model, '_strat_clim_cache', None)
+    if c is None or c['path'] != path:
+        z = np.load(path)
+        c = {'path': path, 'clim': torch.as_tensor(z['clim'], device=model.device),   # (12, var, lev, points)
+             'vars': [str(v) for v in z['vars']], 'levels': [int(p) for p in z['levels']]}
+        model._strat_clim_cache = c
+    return c
+
+
+def relax_to_climatology(model, model_state, exp, logger=None, verif_ic=None):
+    """exp.strat_relax: Newtonian relaxation (nudging) of the upper stratosphere toward a target, applied once per
+    cycle to the background at the new window start (after the hand-off advance), as
+        x <- x + a(p) (x_target - x),  a(p) = (1 - exp(-dt_init / tau_hours)) * taper(p),
+    taper = 1 at p <= p_full, 0 at p >= p_zero, linear in ln p between. target 'era5' (default): ERA5 at the window
+    start (`verif_ic`, the same read reset_skt_ocean uses); 'clim': the monthly climatology in `clim`
+    (a37tmp/strat_drift/make_strat_clim.py; mid-month means, linear in time). The increment is computed on the newest
+    time level and added to both lagged levels (the model's own 6-h tendency is kept). Variables `vars` (t, u, v);
+    z (z_mode 'hydrostatic', default) gets the hydrostatic response to the t increment integrated up from below
+    p_zero, so thickness stays consistent with t; z_mode 'target' nudges z like the others, 'none' leaves it.
+    AIFS family only."""
+    cfg = exp['strat_relax']
+    V = model.var_to_idx
+    tau = float(cfg.get('tau_hours', 168.0))
+    p_full, p_zero = float(cfg.get('p_full', 10.0)), float(cfg.get('p_zero', 30.0))
+    a0 = 1.0 - np.exp(-float(exp['dt_init']) / tau)
+    kind = cfg.get('target', 'era5')
+    if kind == 'era5':
+        if verif_ic is None:
+            raise ValueError('strat_relax.target era5 needs verif_ic')
+        lv = {b: [p for p, _ in model._levels_by_base[b]] for b in ('t', 'u', 'v', 'z')}
+        target = lambda v, p: verif_ic[v][lv[v].index(p)].to(device=model_state.state.device)  # noqa: E731
+        has = lambda p: True  # noqa: E731
+    elif kind == 'clim':
+        c = _strat_clim(model, cfg['clim'])
+        d = model_state.date.replace(tzinfo=None)
+        dim = (datetime(d.year + d.month // 12, d.month % 12 + 1, 1) - datetime(d.year, d.month, 1)).days
+        f = d.month - 1 + (d.day - 1 + d.hour / 24.0) / dim - 0.5
+        m0 = int(np.floor(f)); w = f - m0
+        clim = (1 - w) * c['clim'][m0 % 12] + w * c['clim'][(m0 + 1) % 12]       # (var, lev, points)
+        target = lambda v, p: clim[c['vars'].index(v), c['levels'].index(p)]  # noqa: E731
+        has = lambda p: p in c['levels']  # noqa: E731
+    else:
+        raise ValueError(f'strat_relax.target {kind!r}: era5 | clim')
+    state = model_state.state.clone()
+    x = state[0, -1].clone()                                                    # (points, n_vars), newest level
+    levs = sorted({int(k.split('_')[1]) for k in V if k.startswith('t_') and k.split('_')[1].isdigit()})
+
+    def taper(p):
+        return 1.0 if p <= p_full else 0.0 if p >= p_zero else float(np.log(p_zero / p) / np.log(p_zero / p_full))
+
+    act = [p for p in levs if taper(p) > 0]
+    missing = [p for p in act if not has(p)]
+    if missing:
+        raise ValueError(f'strat_relax: target {kind} lacks levels {missing}')
+    zmode = cfg.get('z_mode', 'hydrostatic')
+    if zmode not in ('hydrostatic', 'target', 'none'):
+        raise ValueError(f'strat_relax.z_mode {zmode!r}: hydrostatic | target | none')
+    rvars = list(cfg.get('vars', ['t', 'u', 'v'])) + (['z'] if zmode == 'target' else [])
+    inc = torch.zeros_like(x)
+    for v in rvars:
+        for p in act:
+            i = V[f'{v}_{p}']
+            inc[:, i] = a0 * taper(p) * (target(v, p) - x[:, i])
+    if zmode == 'hydrostatic':
+        # every level with t and z (not _hz_spec, which needs q and stops below the stratosphere); q where carried
+        zl = sorted([p for p in levs if f'z_{p}' in V], reverse=True)          # highest pressure first
+        ti = [V[f't_{p}'] for p in zl]
+        fq = torch.stack([1 + 0.608 * x[:, V[f'q_{p}']] if f'q_{p}' in V else torch.ones_like(x[:, 0]) for p in zl], -1)
+        dtv = inc[:, ti] * fq
+        lnr = torch.as_tensor(np.log(np.array(zl[:-1], float) / np.array(zl[1:], float)), device=x.device, dtype=x.dtype)
+        dphi = RD * 0.5 * (dtv[:, 1:] + dtv[:, :-1]) * lnr
+        inc[:, [V[f'z_{p}'] for p in zl[1:]]] = torch.cumsum(dphi, -1)
+    state[0] = state[0] + inc[None]
+    if logger is not None:
+        aw = torch.as_tensor(model.area_weights, dtype=x.dtype, device=x.device)
+        rms = lambda y: float(torch.sqrt((aw * y * y).sum() / aw.sum()))  # noqa: E731
+        msg = []
+        for p in (1, 10, 30):
+            if f't_{p}' in V and has(p):
+                i = V[f't_{p}']
+                msg.append(f't{p}: |x-{kind}| {rms(x[:, i] - target("t", p)):.2f} K inc {rms(inc[:, i]):.3f} K')
+        if 'z_10' in V:
+            msg.append(f'z10 inc {rms(inc[:, V["z_10"]]) / GRAV:.1f} m')
+        logger.info(f'strat_relax (to {kind}, a={a0:.3f}, p<={p_full:g} full, 0 at {p_zero:g} hPa, z {zmode}): '
+                    + '; '.join(msg))
     return model.wrap_state(state, model_state.date)
 
 
@@ -2379,18 +2495,58 @@ def _resolve_weak_constraint(exp, n_steps, timestep_h):
     (`exp.weak_constraint.every_hours`: one every N h, first at N h, last
     before the window end), or [] for strong constraint. A jump at hour h is
     a latent increment injected on the h -> h + 6 h step, exactly like the
-    window-start increment on the 0 -> 6 h step."""
-    every = int((exp.get('weak_constraint') or {}).get('every_hours', 0) or 0)
+    window-start increment on the 0 -> 6 h step -- or, under
+    `weak_constraint.warm_handoff`, on the h - 6 -> h step (see `_wc_steps`)."""
+    wc = exp.get('weak_constraint') or {}
+    every = int(wc.get('every_hours', 0) or 0)
     if every <= 0:
         return []
     if every % timestep_h:
         raise ValueError(f'weak_constraint.every_hours ({every}) must be a multiple of the {timestep_h} h model step')
-    # the next cycle's background is this analysis advanced to +dt_init; a
-    # restart from the saved +dt_verif state advances it without jumps, so
-    # no jump may fall before dt_init
-    if every < int(exp.get('dt_init', 0)):
+    # the next cycle's background is this analysis advanced to +dt_init. Without
+    # warm_handoff a restart from the saved +dt_verif state advances it without
+    # jumps, so no jump may fall before dt_init; with it, the jumps up to +dt_init
+    # are applied on both paths (driver cycling branch and load_handoff_wc_state)
+    if not wc.get('warm_handoff') and every < int(exp.get('dt_init', 0)):
         raise ValueError(f"weak_constraint.every_hours ({every}) must be >= dt_init ({exp.get('dt_init')})")
     return list(range(every, n_steps * timestep_h, every))
+
+
+def _wc_steps(exp, wc_hours, timestep_h):
+    """Window steps (1-based, step s arrives at hour s * timestep_h) on which the
+    jumps at `wc_hours` are injected. Default: hour h on the h -> h + 6 h step
+    (s = h / 6 + 1), so the state at hour h has not seen it. Under
+    `weak_constraint.warm_handoff`: on the h - 6 -> h step (s = h / 6), so the
+    analysis state at hour h includes the jump, and with every_hours dividing
+    dt_init the next cycle's initial condition (this analysis at +dt_init) carries
+    the jump at dt_init -- the weak-constraint correction is handed off."""
+    off = 0 if (exp.get('weak_constraint') or {}).get('warm_handoff') else 1
+    return [h // timestep_h + off for h in wc_hours]
+
+
+def load_handoff_wc_state(exp, model, date, state, logger):
+    """`exp['wc_state']` rebuilt from the saved `<date>_wc_forcing_*.pt` of the
+    cycle at `date`, for a restart under `weak_constraint.warm_handoff`: the
+    driver then advances the saved +dt_verif analysis to the next cycle's start
+    WITH the jumps, exactly as the in-process cycling branch does. `state`: the
+    restart analysis (sizes the control mask)."""
+    f = _wc_file(exp, date, exp['max_epoch'])
+    if not os.path.exists(f):
+        raise FileNotFoundError(f'weak_constraint.warm_handoff restart: no jumps file {f}')
+    st = torch.load(f, map_location='cpu', weights_only=False)
+    timestep_h = int(round(model.timestep.total_seconds() / 3600))
+    steps = _wc_steps(exp, list(st['hours']), timestep_h)
+    if list(st.get('steps', steps)) != steps:
+        raise ValueError(f'{f}: jumps on steps {st["steps"]}, warm_handoff expects {steps} '
+                         '(written by a run without warm_handoff?)')
+    device = state.state.device
+    n_vars = state.state.shape[1] if model.state_layout == 'channels_first' else state.state.shape[-1]
+    wc_state = {'hours': list(st['hours']), 'steps': steps, 'step_index': {s: k for k, s in enumerate(steps)},
+                'forcing': st['forcing'].float().to(device) / float(st.get('latent_scale', 1.0)),
+                'keep_mask': _resolve_control_mask(model, exp, n_vars, device),
+                'hydrostatic_z': bool(exp.get('hydrostatic_z')), 'date': date, 'controls': st.get('controls')}
+    logger.info(f'weak_constraint.warm_handoff: restart jumps from {f} on steps {steps}')
+    return wc_state
 
 
 def _hz_spec(model):
@@ -2881,7 +3037,7 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
     # increment per jump hour, each injected like the window-start one
     timestep_h = int(round(model.timestep.total_seconds() / 3600))
     wc_hours = _resolve_weak_constraint(exp, exp['n_verif'] * exp['dt_verif'] // timestep_h, timestep_h)
-    wc_steps = [h // timestep_h + 1 for h in wc_hours]
+    wc_steps = _wc_steps(exp, wc_hours, timestep_h)
     prev_wc_state = exp.get('wc_state')
     exp['wc_state'] = None
     exp['wc_prior_state'] = None
@@ -2970,8 +3126,10 @@ def compute_optimal(exp, model, input_encoded, verif_ic, psobs_traj, grid_interp
         from_q = lambda t: from_q0(t / S)  # noqa: E731
         logger.info(f"weak_constraint.node_scale: {ns['path']} on {len(states)} jumps")
     if eta is not None and (wc_cfg0.get('warm_start') or wc_cfg0.get('prior_dir')):
-        if not prior:
-            raise ValueError('weak_constraint.warm_start / prior_dir need control_prior (a prior mean for the jumps)')
+        # warm_start without control_prior (2026-11-19): the previous cycle's jumps (shifted) are only the first
+        # guess, in the M3 controls' own units; the optimizer's weight decay still pulls toward 0, no Jq term
+        if not prior and wc_cfg0.get('prior_dir'):
+            raise ValueError('weak_constraint.prior_dir needs control_prior (a prior mean for the jumps)')
         prev = None
         if wc_cfg0.get('prior_dir'):
             pf = os.path.join(wc_cfg0['prior_dir'], f"{exp['date']}_nudges.pt")

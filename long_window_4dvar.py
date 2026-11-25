@@ -146,6 +146,7 @@ for k in range(exp_config['n_init']):
             if exp_config.get('opt_resume'):
                 input_encoded = utils.load_optstate_background(exp_config, model, input_encoded, logger)
             # if we just read an optimal IC file (restart), advance the state
+            from_forecast = bool(exp_config['restart'])
             if exp_config['restart']:
                 logger.info('making prior from a forecast initialized with the RESTART optimal...')
                 # The saved analysis is dated +dt_verif past its filename date
@@ -163,7 +164,14 @@ for k in range(exp_config['n_init']):
                         f"dt_init ({exp_config['dt_init']}h) must be >= the restart analysis's shift past its "
                         f"filename date ({shift_hours}h, the latent +dt_verif shift) to cycle"
                     )
-                input_encoded = model.advance(input_encoded, steps=steps_for_hours(max(remaining_hours, 0.0)))
+                if (exp_config.get('weak_constraint') or {}).get('warm_handoff'):
+                    # hand the restart cycle's jumps up to +dt_init on, as the cycling branch below does
+                    exp_config['wc_state'] = utils.load_handoff_wc_state(exp_config, model, date, input_encoded, logger)
+                    input_encoded = utils.advance_with_jumps(
+                        model, input_encoded, steps_for_hours(shift_hours),
+                        steps_for_hours(max(remaining_hours, 0.0)), exp_config['wc_state'])
+                else:
+                    input_encoded = model.advance(input_encoded, steps=steps_for_hours(max(remaining_hours, 0.0)))
                 # advance init time to reflect the forecast
                 date = utils.add_hours(date, exp_config['dt_init'])
                 exp_config['date'] = date
@@ -195,12 +203,15 @@ for k in range(exp_config['n_init']):
                     f"({shift_hours}h, the latent +dt_verif shift) to cycle"
                 )
             # weak constraint: the previous window's jumps up to the new start (none, as
-            # every_hours >= dt_init -- see utils._resolve_weak_constraint)
+            # every_hours >= dt_init -- see utils._resolve_weak_constraint -- unless
+            # weak_constraint.warm_handoff, whose jump at +dt_init lands on the step
+            # arriving at the new start: utils._wc_steps)
             input_encoded = utils.advance_with_jumps(
                 model, analysis_state, steps_for_hours(shift_hours), steps_for_hours(max(remaining_hours, 0.0)),
                 exp_config.get('wc_state'),
             )
             is_new_analysis_time = True
+            from_forecast = True
         else:
             # window-to-window within one cycle -- analysis_state is already
             # a fully valid dated state, no forecast-forward step needed, and
@@ -210,6 +221,7 @@ for k in range(exp_config['n_init']):
             logger.info('using optimal from previous window...')
             input_encoded = analysis_state
             is_new_analysis_time = False
+            from_forecast = False
         # get verification at start of window (including ERA5 orography)
         verif_ic = utils.get_verif(exp_config, model, logger)
         logger.info('get verif_ic...')
@@ -221,7 +233,11 @@ for k in range(exp_config['n_init']):
             input_encoded = utils.reset_skt_over_ocean(
                 model, input_encoded, verif_ic, lsm_threshold=exp_config.get('skt_ocean_lsm_threshold', 0.5),
                 extra_vars=exp_config.get('reset_ocean_vars', ()), logger=logger,
+                all_vars=exp_config.get('reset_all_vars', ()),
             )
+        # strat_relax: nudge the cycled background's upper stratosphere toward ERA5 (or a climatology); not an ERA5 IC
+        if is_new_analysis_time and from_forecast and (exp_config.get('strat_relax') or {}).get('enabled'):
+            input_encoded = utils.relax_to_climatology(model, input_encoded, exp_config, logger=logger, verif_ic=verif_ic)
         # get real ps observations
         logger.info('reading observations...')
         psobs_traj = utils.get_psobs(exp_config, model, logger, grid_interp)
