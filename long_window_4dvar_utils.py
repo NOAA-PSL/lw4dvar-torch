@@ -644,6 +644,9 @@ def get_model(exp):
         if exp.get('aifsml', False):
             # hybrid-layer checkpoints (aifs-r2-l2): AIFS37Model + layers -> 37 pressure levels
             import aifsml_model
+            if exp.get('aifsml_zarr'):  # the layer store (default D1, 32 layers; L3: D3, 37 layers)
+                aifsml_model.ZARR_ML = exp['aifsml_zarr']
+            aifsml_model.DROP_BOUNDING = tuple(exp.get('aifsml_drop_bounding', ()))
             cls = aifsml_model.AIFSMLModel
         elif exp.get('aifs37', False):
             # 37-level A1/A2 checkpoints (anemoi-dev env; notes/integrate_aifs37_models.md)

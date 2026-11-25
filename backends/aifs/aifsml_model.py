@@ -36,8 +36,22 @@ ZARR_ML32 = ("/scratch4/BMC/gsienkf/Sergey.Frolov/era5_o96_ml32/chunks/"
              "era5-o96-ml32-1979-01-01T00-2023-12-31T18.zarr")
 PLEVS37 = (1000, 975, 950, 925, 900, 875, 850, 825, 800, 775, 750, 700, 650, 600, 550, 500, 450, 400, 350, 300,
            250, 225, 200, 175, 150, 125, 100, 70, 50, 30, 20, 10, 7, 5, 3, 2, 1)
+# ERA5 SST on O96 (2026-11-22; ACE surface recipe, L3S forcing). Joined only once its build is finished
+# (set_resolution.py writes the resolution attr last), so a half-built store never feeds a run.
+ZARR_SST = ("/scratch4/BMC/gsienkf/Sergey.Frolov/era5_o96_37lev/chunks/"
+            "era5-o96-sst-1979-01-01T00-2023-12-31T18.zarr")
+ZARR_ML = ZARR_ML32   # the layer store; exp.aifsml_zarr overrides it (L3: D3, era5_o96_ml37, 37 layers, no cw)
+DROP_BOUNDING = ()   # exp.aifsml_drop_bounding: output-bounding classes removed at inference (diagnostics, e.g. the dry-mass fixer)
 LAYER_FAMILIES = ("t", "q", "u", "v", "cw")
 _DERIVED = ("t", "q", "u", "v")
+
+
+def _sst_ready() -> bool:
+    import os
+    import zarr
+    if not os.path.isdir(ZARR_SST):
+        return False
+    return str(zarr.open(ZARR_SST, "r").attrs.get("resolution", "")).lower() == "o96"
 
 
 class ERA5ZarrML(aifs37_model.ERA5Zarr):
@@ -51,13 +65,16 @@ class ERA5ZarrML(aifs37_model.ERA5Zarr):
         # later sources override earlier ones: D1 last, but only its layers, sp and orog (its 14-level
         # diagnostics must not override the 37-level ERA5 truth, and L2 took 2t/msl/... from v8)
         d1_keep = lambda n: n in ("sp", "orog") or any(n.startswith(f + "_ml") for f in LAYER_FAMILIES)  # noqa: E731
-        for path, keep in ((ZARR_V8, None), (ZARR_37, None), (ZARR_STL1, None), (ZARR_ML32, d1_keep)):
+        srcs = [(ZARR_V8, None), (ZARR_37, None), (ZARR_STL1, None), (ZARR_ML, d1_keep)]
+        if _sst_ready():
+            srcs.insert(3, (ZARR_SST, None))
+        for path, keep in srcs:
             z = zarr.open(path, "r")
             names = list(z.attrs["variables"])
             idx = np.array([i for i, n in enumerate(names) if keep is None or keep(n)])
             start = datetime.datetime.fromisoformat(str(z["dates"][0]).replace("T", " ")[:19])
             self._src.append((z["data"], [names[i] for i in idx], idx, start))
-        d1 = zarr.open(ZARR_ML32, "r")
+        d1 = zarr.open(ZARR_ML, "r")
         self.ak = np.asarray(d1.attrs["ak_interfaces"], dtype=np.float64)
         self.bk = np.asarray(d1.attrs["bk_interfaces"], dtype=np.float64)
         self.latitudes = np.asarray(zarr.open(ZARR_V8, "r")["latitudes"][:])
@@ -152,6 +169,13 @@ class AIFSMLModel(aifs37_model.AIFS37Model):
         self._bk = torch.as_tensor(self.era5.bk, dtype=torch.float32, device=self.device)
         self._orog_col = self.var_to_idx["orog"]
         self._sp_col = self.var_to_idx["sp"]
+        if DROP_BOUNDING:   # opt-in inference diagnostic: run the checkpoint without these output boundings
+            m = self.interface.model
+            for ds, mods in m.boundings.items():
+                keep = [b for b in mods if type(b).__name__ not in DROP_BOUNDING]
+                dropped = [type(b).__name__ for b in mods if type(b).__name__ in DROP_BOUNDING]
+                m.boundings[ds] = type(mods)(keep)
+                print(f"aifsml: dropped boundings {dropped} from dataset {ds}", flush=True)
 
     def resolve_columns(self, name: str) -> list[int]:
         if name in self._layer_cols:
