@@ -2385,10 +2385,52 @@ earlier checkpoints' fixer does.
   checkpoint's default Triton attention kernel is CUDA-only): a real
   `model.advance(encoded, steps=1)` call now completes end to end, where
   it previously crashed with the same `KeyError`.
-- **Not yet done**: a real GPU cycled run (CPU-verified through one
-  `advance()` step only, not a full differentiable rollout or a multi-day
-  cycle); `learn_rate`/`latent_scale` are carried over untuned from
-  `aifs2-1deg-ic1` (same 10944-node hidden mesh size, otherwise unrelated);
-  whether the built-in `GlobalDryMassFixer` actually holds `sp` stable under
-  real cycling, the way the earlier checkpoints needed the hand-added fixer
-  for.
+- **First real GPU cycled runs (2026-11-24)**: six SLURM jobs, 5h walltime
+  each, all `-longcyc-obsint-1hour` (6h DA cycle, 5-day/120h window, 100
+  outer iterations, 1-hour obs interval), comparing `aifs-r2-t1` against
+  `aifs2-1deg-v1.0` and ps-only against ps+raobs (`exact` vs `log-linear`
+  vertical matching -- see the raobs doc's own "vertical interpolation"
+  section):
+
+  | job | config | cycles reached (of 300) |
+  |---|---|---|
+  | 27343120 | `aifs-r2-t1`, ps-only | 44 |
+  | 27343121 | `aifs-r2-t1`, ps+raobs (exact) | 39 |
+  | 27343122 | `aifs-r2-t1`, ps+raobs (log-linear) | 22 |
+  | 27343123 | `aifs2-1.0deg-v1.0`, ps-only | 50 |
+  | 27343124 | `aifs2-1.0deg-v1.0`, ps+raobs (exact) | 44 |
+  | 27343125 | `aifs2-1.0deg-v1.0`, ps+raobs (log-linear) | 32 |
+
+  All six hit `TIMEOUT` cleanly at the full 5h limit (confirmed via
+  `sacct`) -- no crash, no traceback in any of the six logs. This is the
+  real-world confirmation the `_patch_coupled_forcings` fix above needed:
+  it holds up under sustained cycling, not just the one CPU-verified
+  `advance()` step. The `log-linear` variants ran markedly fewer cycles
+  than their `exact` counterparts (22 vs 39, 32 vs 44) -- expected, since
+  `log-linear` keeps far more raobs levels per profile (every significant
+  level, not just mandatory ones), so each cycle does more work.
+
+  Scored with `add-aifs-t1/plots/z500err_ts_txt_vs_parquet_cycle_compare.py`
+  (and its library module `z500err_window_oneleadtime.py`, both forked
+  2026-11-24 from the `add-parquet-raobs-dev` branch's own AIFS-vs-ACE2
+  version): `z500err_window_oneleadtime.py` gained a third truth source,
+  `backend='aifs_zarr'` (calls `aifs_zarr_ic._read_fields` directly, no
+  model/runner needed), since `aifs-r2-t1` has no ERA5 GRIB `ic_cache` at
+  all; its `_REPO_ROOT` was re-pointed at this branch's own checkout
+  (the only one with `aifs_zarr_ic.py`). Early read from the plot (lead
+  24h, not yet a real conclusion with 300 cycles): `aifs-r2-t1` tracks
+  lower Z500 RMS error than `aifs2-1.0deg-v1.0` across all four regions;
+  raobs assimilation clearly separates below ps-only for `aifs-r2-t1`
+  (both `exact` and `log-linear`); the raobs benefit looks smaller for
+  `aifs2-1.0deg-v1.0`.
+
+- **Not yet done**: none of the six runs above reached the full
+  300-cycle/1-month target -- continuing them needs `-1rst` restart
+  config/script pairs (`restart: True`, `sdate`/`rpath` advanced to each
+  run's last cycle with a full `optimal_inputs.pkl`, same pattern already
+  used for the `aifs2-1.0deg-v1.0`/ACE2 longcyc series in
+  `add-parquet-raobs-dev`); `learn_rate`/`latent_scale` are still carried
+  over untuned from `aifs2-1deg-ic1` (same 10944-node hidden mesh size,
+  otherwise unrelated); whether the built-in `GlobalDryMassFixer` actually
+  holds `sp` stable under real cycling hasn't been checked directly (no
+  `sp`/dry-mass diagnostic pulled from these six runs yet, only Z500).
