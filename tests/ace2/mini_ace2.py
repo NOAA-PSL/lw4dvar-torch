@@ -100,9 +100,36 @@ def config(tmp_path, ckpt):
         'model_name': os.path.basename(ckpt),
         'forcing_dir': os.path.join(DATA, 'forcing_data') + '/',
         'ic_cache': os.path.join(DATA, 'ic_cache') + '/',
-        'observations': {'psobs': {
-            'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
-        }},
+        'observations': {
+            'psobs': {
+                'path': os.path.join(DATA, 'psobs'), 'nobs_max': 15000, 'use_source_error': True,
+            },
+            'raobs': {
+                'enabled': True, 'path': os.path.join(DATA, 'raobs'),
+                'variables': ['temperature', 'u_component_of_wind', 'v_component_of_wind'],
+                # The synthetic fixture's t/u/v aren't tied to this tiny
+                # model's own background climatology (unlike the psobs
+                # fixture, which is loose Gaussian noise around a plausible
+                # ps value) -- a larger, flat error than the default
+                # per-level JEDI/UFO table (RAOBS_TUV_ERROR_STD,
+                # long_window_4dvar_utils.py) keeps raobs Jo from swamping
+                # ps Jo + Jc.
+                'error_std': {'t': 5.0, 'u': 8.0, 'v': 8.0},
+                # Explicit False: this fixture's reports are all zero-
+                # jitter (observation_time exactly on the cycle hour) and
+                # the archive has no drift_time_hours/drift_longitude/
+                # drift_latitude columns at all -- the drift corrections'
+                # own mechanics are covered by tests/unit/
+                # test_raobs_parquet.py instead. Both now default to True
+                # in code (PR #29's review); raobs_parquet.py's reader
+                # falls back gracefully on a missing-column archive like
+                # this one (PR #29's review, second round), so this isn't
+                # strictly required to avoid a crash any more -- kept
+                # explicit anyway, since it documents this fixture's own
+                # intent rather than relying on that fallback silently.
+                'use_drift_time': False, 'use_drift_position': False,
+            },
+        },
         'path_output': os.path.join(str(tmp_path), 'output') + '/',
         'exp_name': 'test_ace2_mini',
         'rpath': os.path.join(str(tmp_path), 'unused') + '/',

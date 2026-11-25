@@ -24,6 +24,29 @@ VARIANTS = {
     'jc_z_weight': {'jc_z_weight': 20.0},
     'all': {'control_variables': ['z', 't', 'sp'], 'jc_ps_weight': 30.0,
             'obs_density_box_deg': 10.0, 'jc_z_weight': 20.0, 'checkpoint_stride': 2},
+    # A toy t/q radiosonde trajectory (Problem._build_raobs_traj), sharing
+    # psobs's own obs-slot grid so it includes a between-step slot for
+    # free -- independent finite-difference coverage of the raobs cost
+    # term through the real compute_loss_4dvar path, not just the
+    # isolated unit tests of _compute_raobs_observation_diagnostics_
+    # at_time in tests/unit/test_solver_helpers.py. 'raobs' has no
+    # background check at all (bg_check=None -- frozen vs. live QC is
+    # moot, there's no state-dependent threshold either way). The other
+    # two both DO have a real, state-dependent 3-sigma threshold, so
+    # frozen vs. live actually matters for them:
+    # 'raobs_bg_check' (frozen -- matches this module's own already-
+    # validated behavior, Problem's own default, NOT production's own
+    # default) attaches 'bg_used' from the SAME compute_ps_observation_hx
+    # call compute_optimal itself makes for observations.raobs.
+    # frozen_qc: True.
+    # 'raobs_bg_check_live' (install_raobs_bg_used=False) instead leaves
+    # 'bg_used' unset, exercising the LIVE-recompute QC branch --
+    # production's own default (observations.raobs.frozen_qc: False,
+    # PR #29's review) -- which nothing here covered before this
+    # variant existed.
+    'raobs': {'raobs': True},
+    'raobs_bg_check': {'raobs': True, 'raobs_bg_check': 3.0},
+    'raobs_bg_check_live': {'raobs': True, 'raobs_bg_check': 3.0, 'install_raobs_bg_used': False},
 }
 
 
@@ -72,6 +95,41 @@ def test_checkpointing_does_not_change_the_gradient(stride, x0):
     J, g = Problem(checkpoint_stride=stride).cost_and_grad(x0)
     assert float(J) == float(J0)
     torch.testing.assert_close(g, g0, rtol=1e-12, atol=0)
+
+
+@pytest.mark.parametrize('frozen_qc', [True, False])
+def test_raobs_taylor_remainder_is_second_order(frozen_qc, x0):
+    # Both the cached (production opt-in) and live-recompute (production
+    # default) background-check masks get their own Taylor check -- see
+    # VARIANTS['raobs_bg_check']/['raobs_bg_check_live']'s own comment for
+    # why this only matters with a real bg_check threshold (PR #29's
+    # review).
+    p = Problem(raobs=True, raobs_bg_check=3.0, install_raobs_bg_used=frozen_qc, checkpoint_stride=2)
+    assert taylor_order(p.cost_and_grad, p.cost, x0) > 1.9
+
+
+@pytest.mark.parametrize('stride', [1, 2, 3])
+@pytest.mark.parametrize('frozen_qc', [True, False])
+def test_raobs_checkpointing_does_not_change_the_gradient(frozen_qc, stride, x0):
+    # A real bg_check threshold (3.0), unlike the plain 'raobs' VARIANTS
+    # entry -- otherwise this gate would never exercise any gross-check/
+    # checkpointing interaction at all, with either mask (PR #29's
+    # review).
+    J0, g0 = Problem(
+        raobs=True, raobs_bg_check=3.0, install_raobs_bg_used=frozen_qc, checkpoint_stride=0).cost_and_grad(x0)
+    J, g = Problem(
+        raobs=True, raobs_bg_check=3.0, install_raobs_bg_used=frozen_qc, checkpoint_stride=stride).cost_and_grad(x0)
+    assert float(J) == float(J0)
+    torch.testing.assert_close(g, g0, rtol=1e-12, atol=0)
+
+
+def test_raobs_adds_a_nonzero_cost(x0):
+    # Confirms the raobs trajectory actually contributes to J (not just
+    # that its gradient is correct if it did) -- same sanity check
+    # test_cost_is_nonlinear makes for the psobs-only cost.
+    with_raobs = float(Problem(raobs=True).cost(x0))
+    without = float(Problem().cost(x0))
+    assert with_raobs > without + 1.0  # well above float64 noise
 
 
 def test_cost_is_nonlinear(x0):
@@ -179,7 +237,7 @@ def test_first_step_penalties_reject_too_short_windows(at_start, n_steps, ok):
 def test_jc_z_diagnostic_with_no_obs(x0, capsys):
     # an empty window makes the penalty's factor 0: the printed rms must not divide by it
     p = Problem(**VARIANTS['jc_z_weight'])
-    J, _ = utils.compute_loss_4dvar(
+    J, _, _ = utils.compute_loss_4dvar(
         p.model, x0, 1.0, p.state, p.verif_ic, p.psobs_traj, 1, p.exp, p.grid_interp, 1,
         p.interp_specs, jcz_ref=(p.jcz_ref[0], 0.0))
     assert 'Jz = 0.0' in capsys.readouterr().out

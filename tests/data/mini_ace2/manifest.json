@@ -3,9 +3,9 @@
   "spinup_h": 6,
   "window_h": 24,
   "nobs": 2000,
+  "nobs_raobs": 50,
   "seed": 0,
   "dataset": "/scratch4/BMC/gsienkf/whitaker/ace2_era5_2p5deg_16layer",
-  "obspath": "/scratch3/NCEPDEV/da/Jeffrey.Whitaker/psobs",
   "checkpoint": {
     "source": "/scratch4/BMC/gsienkf/whitaker/ace2_training/mini-ace2-crtm-land-16layer-2p5deg-e64-l8/training_checkpoints/best_inference_ckpt.tar",
     "release": "ci-fixtures-v1",
