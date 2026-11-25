@@ -51,7 +51,7 @@ if [[ -n "$last" ]]; then
         ""|PENDING|RUNNING|COMPLETING|REQUEUED|RESIZING|SUSPENDED)
             exit 0 ;;  # sacct not caught up yet
         *)  echo "$(now) job $last ended $st before epoch ${MAX_EPOCHS}; not resubmitting ($STOP)"
-            echo "$last $st" > $STOP; exit 0 ;;
+            echo "$last $st" > $STOP; rm -f $STATE; exit 0 ;;
     esac
 fi
 
