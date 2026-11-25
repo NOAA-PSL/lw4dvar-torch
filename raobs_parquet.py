@@ -74,8 +74,12 @@ def _profile_records(
     prepbufr_classes,
     quality_mark_max,
     pressure_match_tolerance_hpa,
+    t_bias=None,
 ):
     """Return {(slot_index, station_key): record} before fixed-shape padding.
+
+    `t_bias`: optional raob_tbias.RaobTBias; its correction (K) for the report's station, latitude band, solar
+    elevation class and level is subtracted from every temperature (static ERA5-anchored RICH/RISE-like adjustment).
 
     `levels_hpa`: {model_base_name: 1D array of exact pressures (hPa) to
     match} -- a level row is kept only when its `pressure_mb` is within
@@ -187,6 +191,9 @@ def _profile_records(
                     convert = _VARIABLE_UNIT_CONVERT.get(variable)
                     if convert is not None:
                         value = convert(value)
+                    if variable == 't' and t_bias is not None:
+                        value = value - t_bias(station_ids[report_row], lat, lon, report_time,
+                                               float(variable_levels[level_index]))
                     quality = level_quality[variable][level_row]
                     existing_quality = record['quality'].get((variable, level_index), np.inf)
                     if (
@@ -218,8 +225,12 @@ def load_raobs_parquet(
     humidity_min_pressure_hpa=None,
     station_capacity=None,
     logger=None,
+    t_bias_table=None,
 ):
     """Read mandatory-level radiosonde profiles into fixed per-slot arrays.
+
+    `t_bias_table`: optional path of a raob_tbias.py table; when set, every temperature has its static bias
+    estimate removed (see raob_tbias.py).
 
     Returns a dict: 'lat'/'lon'/'elev' (per-slot 1D float32 arrays, one
     station per entry) and, for each requested `variable` (a model base
@@ -240,10 +251,16 @@ def load_raobs_parquet(
     """
     variables = tuple(variables)
     levels_hpa = {v: np.asarray(levels_hpa[v], dtype=np.float64) for v in variables}
+    t_bias = None
+    if t_bias_table:
+        from raob_tbias import RaobTBias
+        t_bias = RaobTBias(t_bias_table)
     records = _profile_records(
         directory, verification_times, levels_hpa, variables, time_tolerance_hours,
-        prepbufr_classes, quality_mark_max, pressure_match_tolerance_hpa,
+        prepbufr_classes, quality_mark_max, pressure_match_tolerance_hpa, t_bias=t_bias,
     )
+    if t_bias is not None and logger is not None:
+        logger.info(t_bias.summary())
 
     by_slot = {}
     for (slot_index, station_key), record in records.items():

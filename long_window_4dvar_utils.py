@@ -339,6 +339,7 @@ _RAOBS_CONFIG_KEYS = {
     'height_min_m': 'raobs_height_min_m',
     'height_max_m': 'raobs_height_max_m',
     'below_station_tolerance_m': 'raobs_below_station_tolerance_m',
+    't_bias_table': 'raobs_t_bias_table',
     'error_std': 'raobs_error_std',
     'q_error_fraction': 'raobs_q_error_fraction',
     'q_error_floor_kg_kg': 'raobs_q_error_floor_kg_kg',
@@ -1213,6 +1214,7 @@ def get_raobs(exp, model, logger, grid_interp, psobs_traj):
         pressure_match_tolerance_hpa=exp.get('raobs_pressure_match_tolerance_hpa', 0.05),
         humidity_min_pressure_hpa=exp.get('raobs_humidity_min_pressure_hpa', 300.),
         logger=logger,
+        t_bias_table=exp.get('raobs_t_bias_table'),
     )
 
     device = model.device
