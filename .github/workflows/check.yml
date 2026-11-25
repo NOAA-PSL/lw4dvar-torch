@@ -8,7 +8,6 @@ on:
 
 jobs:
   check:
-    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -29,9 +28,10 @@ jobs:
   # The solver end to end with a real (tiny) model: tests/ace2/test_ace2_mini.py.
   # Separate job: it needs fme (envs/requirements-ci-ace2.txt) and a 22 MB
   # checkpoint, a release asset pinned in tests/data/mini_ace2/manifest.json
-  # and cached between runs under its sha256.
+  # and cached between runs under its sha256. The run is pinned to AVX2
+  # (mini_ace2.ISA_ENV), so its golden numbers are the same on every runner
+  # CPU type; the CPU step records which one ran, for a failure that differs.
   ace2-mini:
-    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -55,65 +55,9 @@ jobs:
           path: .fixture-cache
           key: mini-ace2-${{ steps.ckpt.outputs.sha }}
       - run: pip install -r envs/requirements-ci-ace2.txt
-      # Retried, not given a looser tolerance: the golden-fixture compare
-      # occasionally drifts by more than float32 noise across GitHub's
-      # shared runner fleet (confirmed non-deterministic, not a real
-      # regression -- OMP_NUM_THREADS/MKL_NUM_THREADS are already pinned
-      # to 1 in mini_ace2.py, and the control variable starts at
-      # torch.zeros, so neither thread-count nor RNG explain it; the
-      # remaining candidate is CPU-dispatch differences -- AVX2 vs.
-      # AVX-512/FMA -- between whichever physical machine in the fleet
-      # picks up the job, which 49 epochs of AdamW is enough to compound
-      # into a visible difference by a late slot). Confirmed by re-running
-      # the identical failed commit unchanged and getting a clean pass.
-      # Loosening the tolerance to absorb this would also hide a real
-      # regression of similar size; retrying absorbs the environmental
-      # noise without touching what the test actually checks.
-      - run: |
-          for attempt in 1 2; do
-            if make check-ace2; then
-              exit 0
-            fi
-            echo "::warning::make check-ace2 failed on attempt $attempt/2 -- retrying once (known cross-machine float32 flakiness, see this job's own comment)"
-          done
-          exit 1
-
-  # Manual-only (workflow_dispatch): regenerates tests/data/golden/*.json
-  # on THIS runner's own image, then uploads them as a build artifact for
-  # a maintainer to download and commit. Golden values are float32/64
-  # machine-dependent (mini_ace2.py's own docstring), so a fixture baked
-  # on a different machine (a local workstation, an HPC node) can miss
-  # this runner's own tolerance band by a hair even when the underlying
-  # code is correct -- see the ace2-mini job's own comment above for the
-  # specific cross-machine flakiness this and its retry both exist for.
-  # Trigger from the Actions tab (Run workflow) or `gh workflow run check.yml`.
-  regenerate-golden:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      LW4DVAR_FIXTURE_CACHE: ${{ github.workspace }}/.fixture-cache
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: false
-          lfs: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: |
-            envs/requirements-ci.txt
-            envs/requirements-ci-ace2.txt
-      - id: ckpt
-        run: echo "sha=$(python -c "import json; print(json.load(open('tests/data/mini_ace2/manifest.json'))['checkpoint']['sha256'])")" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache@v4
-        with:
-          path: .fixture-cache
-          key: mini-ace2-${{ steps.ckpt.outputs.sha }}
-      - run: pip install -r envs/requirements-ci-ace2.txt
-      - run: python tests/make_fixtures.py golden --ace2
-      - uses: actions/upload-artifact@v4
-        with:
-          name: golden-fixtures
-          path: tests/data/golden/*.json
+      - name: CPU
+        run: |
+          lscpu | grep 'Model name'
+          echo "ISA: $(grep -o -w -E 'avx2|avx512f' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+          python -c "import torch; print('torch', torch.__version__, 'default ATen capability', torch.backends.cpu.get_cpu_capability())"
+      - run: make check-ace2

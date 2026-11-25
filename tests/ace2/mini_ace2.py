@@ -9,8 +9,16 @@ running at 1 and at 4 threads (different reduction order, as on a different
 machine): everything computed from the background is bit-identical; the
 cost agrees to ~5e-6 at the first epochs, then fp32 rounding is amplified by
 the minimization to ~2e-3 by epoch 50 and ~3e-4 in the analysis O-A. The
-run is pinned to one thread anyway, so the core count does not matter. The
-tight checks -- background and QC exactly or to 1e-5, the first epochs to
+run is pinned to one thread anyway, so the core count does not matter.
+
+The instruction set does matter: torch's CPU kernels (ATen), MKL (matmuls,
+FFTs) and oneDNN each pick a code path for the CPU they find, and AVX-512
+and AVX2 paths round differently. GitHub's runner fleet mixes AVX2-only and
+AVX-512 machines, and the background Jo differed between them by ~1.6e-5
+relative, enough to fail the 1e-5 check and, after 50 epochs of AdamW, the
+late-epoch ones. So the run is pinned to AVX2, which every x86-64 runner has
+(`ISA_ENV`); with it an AVX-512 machine reproduces an AVX2-only runner's
+numbers exactly. The tight checks -- background and QC exactly or to 1e-5, the first epochs to
 1e-4 -- catch a changed setting, input or operator; the loose ones catch a
 minimization that goes somewhere else. The toy model's golden runs
 (tests/golden/) are the precise check on the minimization itself.
@@ -55,6 +63,9 @@ def tolerance(path):
     if path.startswith('/analysis_forecast'):
         return 1e-3, 0.0
     return 1e-2, 0.0           # jo_per_slot_last, analysis O-A rms
+# The CPU code paths, pinned to AVX2 (see the docstring): ATen's kernel
+# dispatch, MKL's conditional numerical reproducibility branch, oneDNN's ISA.
+ISA_ENV = {'ATEN_CPU_CAPABILITY': 'avx2', 'MKL_CBWR': 'AVX2', 'ONEDNN_MAX_CPU_ISA': 'AVX2'}
 # fields of the analysis forecast summarized at each output time
 FORECAST_FIELDS = ['h500', 'TMP850', 'PRESsfc']
 
@@ -163,8 +174,9 @@ def run(tmp_path, ckpt):
     """Run the solver on the mini ACE2. Returns (returncode, log, exp,
     windows, output directory)."""
     cfg, exp, windows = config(tmp_path, ckpt)
-    # one thread: the result must not depend on the machine's core count
-    env = dict(os.environ, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1')
+    # one thread and one instruction set: the result must not depend on the
+    # machine's core count or CPU generation
+    env = dict(os.environ, CUDA_VISIBLE_DEVICES='', OMP_NUM_THREADS='1', MKL_NUM_THREADS='1', **ISA_ENV)
     proc = subprocess.run([sys.executable, '-u', 'src/long_window_4dvar.py', cfg], cwd=REPO_ROOT, env=env,
                           capture_output=True, text=True, timeout=1800)
     out = os.path.join(exp['path_output'], exp['exp_name'])
