@@ -108,7 +108,7 @@ train_loader:
           start_time: '2016-01-01T00:00:00'
           stop_time: '2025-12-31T06:00:00'
 validation_loader:
-  batch_size: 128
+  batch_size: 32  # global; 128 (32/GPU on 4 GH200) OOMs
   num_data_workers: 8
   prefetch_factor: 4
   dataset:

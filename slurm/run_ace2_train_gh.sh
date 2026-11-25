@@ -40,9 +40,13 @@ NNODES=${SLURM_JOB_NUM_NODES}
 MASTER=$(scontrol show hostnames ${SLURM_JOB_NODELIST} | head -n 1)
 echo "ace2_train_gh: ${NNODES} node(s): $(scontrol show hostnames ${SLURM_JOB_NODELIST} | paste -sd' ')"
 
+# The node's "213 GB" is 121 GB LPDDR (NUMA node 0) + the GPU's 97 GB HBM
+# (NUMA node 1): without --membind=0 the kernel spills loader-worker memory
+# and page cache into HBM, and training OOMs the GPU (job 25152329).
+# cudaMalloc is not subject to the NUMA policy.
 # fme_train.py = fme.ace.train with non-reentrant SFNO gradient checkpointing.
 srun --ntasks-per-node=1 --cpus-per-task=72 --kill-on-bad-exit=1 \
-    torchrun --nnodes ${NNODES} --nproc_per_node 1 \
+    numactl --cpunodebind=0 --membind=0 torchrun --nnodes ${NNODES} --nproc_per_node 1 \
         --rdzv_id ${SLURM_JOB_ID} --rdzv_backend c10d --rdzv_endpoint ${MASTER}:29400 \
         backends/ace2/training/fme_train.py \
         ${CONFIG:-backends/ace2/training/ace2-crtm-32layer-e512-train-config-ursa.yaml} \
